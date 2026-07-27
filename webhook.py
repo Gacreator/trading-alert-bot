@@ -1,5 +1,6 @@
 from flask import Flask, request
 import os
+import re
 import psycopg2
 import requests
 
@@ -14,6 +15,9 @@ TRACKED_WALLETS = set(
     w.strip() for w in os.environ.get("TRACKED_WALLETS", "").split(",") if w.strip()
 )
 
+MIN_LIQUIDITY_USD = 3000
+WSOL_MINT = "So11111111111111111111111111111111111111112"
+
 QUEEN_SYSTEM_PROMPT = (
     "You are 'Queen' — the user's witty, confident friend who happens to run a Solana trading "
     "alert bot. You talk to the user like a close friend, not a subject or servant — no 'my loyal "
@@ -23,6 +27,11 @@ QUEEN_SYSTEM_PROMPT = (
     "since this is a Telegram chat. Never break character, but stay strictly accurate to any facts "
     "given to you — never invent usernames, links, or data that wasn't provided."
 )
+
+SOLANA_ADDRESS_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
+
+def looks_like_solana_address(text):
+    return bool(SOLANA_ADDRESS_RE.match(text.strip()))
 
 # ---------- DB ----------
 
@@ -38,6 +47,9 @@ def init_db():
             token_mint TEXT,
             first_seen_at TIMESTAMP DEFAULT NOW(),
             buy_count INTEGER,
+            price_at_first_buy NUMERIC,
+            pumped_3x_alerted BOOLEAN DEFAULT FALSE,
+            momentum_alerted BOOLEAN DEFAULT FALSE,
             PRIMARY KEY (wallet, token_mint)
         )
     """)
@@ -96,7 +108,6 @@ def ask_queen(user_message, extra_context=""):
 # ---------- Token data sources ----------
 
 def get_pumpfun_data(mint):
-    """Try pump.fun's own API for the real creator-written description/socials."""
     try:
         url = f"https://frontend-api.pump.fun/coins/{mint}"
         resp = requests.get(url, timeout=5, headers={"User-Agent": "Mozilla/5.0"})
@@ -117,7 +128,7 @@ def get_pumpfun_data(mint):
         print(f"pump.fun API error: {e}")
         return None
 
-def get_dexscreener_data(mint):
+def get_dexscreener_full(mint):
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
         resp = requests.get(url, timeout=5)
@@ -126,33 +137,47 @@ def get_dexscreener_data(mint):
         if not pairs:
             return None
         pair = max(pairs, key=lambda p: p.get("liquidity", {}).get("usd", 0) or 0)
-        base = pair.get("baseToken", {})
-        info = pair.get("info", {})
-        socials = info.get("socials", [])
-        websites = info.get("websites", [])
-
-        real_links = []
-        for w in websites:
-            if w.get("url"):
-                real_links.append(w["url"])
-        for s in socials:
-            if s.get("url"):
-                real_links.append(s["url"])
-
-        return {
-            "name": base.get("name"),
-            "symbol": base.get("symbol"),
-            "price": pair.get("priceUsd"),
-            "liquidity": pair.get("liquidity", {}).get("usd", 0),
-            "market_cap": pair.get("fdv", 0),
-            "links": real_links,
-        }
+        return pair
     except Exception as e:
         print(f"DexScreener error: {e}")
         return None
 
+def get_dexscreener_data(mint):
+    pair = get_dexscreener_full(mint)
+    if not pair:
+        return None
+    base = pair.get("baseToken", {})
+    info = pair.get("info", {})
+    socials = info.get("socials", [])
+    websites = info.get("websites", [])
+
+    real_links = []
+    for w in websites:
+        if w.get("url"):
+            real_links.append(w["url"])
+    for s in socials:
+        if s.get("url"):
+            real_links.append(s["url"])
+
+    return {
+        "name": base.get("name"),
+        "symbol": base.get("symbol"),
+        "price": pair.get("priceUsd"),
+        "liquidity": pair.get("liquidity", {}).get("usd", 0),
+        "market_cap": pair.get("fdv", 0),
+        "links": real_links,
+    }
+
+def get_current_price(mint):
+    pair = get_dexscreener_full(mint)
+    if pair and pair.get("priceUsd"):
+        try:
+            return float(pair["priceUsd"])
+        except (TypeError, ValueError):
+            return None
+    return None
+
 def get_token_context(mint):
-    """Combine pump.fun (real description) + DexScreener (real market data)."""
     pf = get_pumpfun_data(mint)
     ds = get_dexscreener_data(mint)
 
@@ -186,6 +211,99 @@ def get_token_context(mint):
 
     return " ".join(context_parts), links
 
+def handle_lore_request(mint, chat_id):
+    context, links = get_token_context(mint)
+    if not context:
+        send_telegram_alert(
+            f"I've got nothing on <code>{mint}</code> yet — too fresh, or too obscure. Check back later.",
+            chat_id
+        )
+    else:
+        prompt = (
+            f"Give me a short, fun 2-3 sentence 'lore' summary based ONLY on this confirmed data: {context}. "
+            f"If a creator description is included, lean on that for the actual story/meme. "
+            f"Do NOT invent usernames, social handles, links, or any facts not given here."
+        )
+        reply = ask_queen(prompt)
+        if links:
+            links_text = "\n\n🔗 Real links:\n" + "\n".join(links)
+        else:
+            links_text = "\n\n🔗 No social links found."
+        send_telegram_alert(f"🔮 <b>The lore:</b>\n{reply}{links_text}", chat_id)
+
+# ---------- Momentum scoring ----------
+
+def score_momentum(pair):
+    score = 0
+    details = {}
+
+    liquidity = pair.get("liquidity", {}).get("usd", 0) or 0
+    details["liquidity"] = liquidity
+    if liquidity < MIN_LIQUIDITY_USD:
+        return 0, details
+
+    liquidity_score = min(20, (liquidity / MIN_LIQUIDITY_USD) * 10)
+    score += liquidity_score
+
+    volume = pair.get("volume", {}) or {}
+    vol_5m = volume.get("m5", 0) or 0
+    vol_h1 = volume.get("h1", 0) or 0
+    avg_5m_from_hour = vol_h1 / 12 if vol_h1 else 0
+    details["vol_5m"] = vol_5m
+    details["vol_h1"] = vol_h1
+    if avg_5m_from_hour > 0 and vol_5m > avg_5m_from_hour * 1.5:
+        score += 30
+    elif vol_5m > 0:
+        score += 10
+
+    price_change = pair.get("priceChange", {}) or {}
+    pc_5m = price_change.get("m5", 0) or 0
+    pc_h1 = price_change.get("h1", 0) or 0
+    pc_h6 = price_change.get("h6", 0) or 0
+    details["pc_5m"] = pc_5m
+    details["pc_h1"] = pc_h1
+    details["pc_h6"] = pc_h6
+    positive_windows = sum(1 for x in [pc_5m, pc_h1, pc_h6] if x and x > 0)
+    score += positive_windows * (25 / 3)
+
+    txns = pair.get("txns", {}) or {}
+    m5 = txns.get("m5", {}) or {}
+    buys = m5.get("buys", 0) or 0
+    sells = m5.get("sells", 0) or 0
+    details["buys_5m"] = buys
+    details["sells_5m"] = sells
+    if buys + sells > 0:
+        ratio = buys / (buys + sells)
+        score += ratio * 25
+
+    return round(score), details
+
+# ---------- Wallet buy detection (balance-change based, handles multi-hop) ----------
+
+def extract_wallet_buys(tx, wallet):
+    """
+    Returns a list of mints the wallet's balance INCREASED for in this transaction,
+    using accountData.tokenBalanceChanges. This correctly handles multi-hop swaps
+    (e.g. USDT -> WSOL -> target token) where per-leg toUserAccount doesn't reflect
+    the true beneficial owner.
+    """
+    mints_bought = []
+    account_data = tx.get("accountData", []) or []
+    for acc in account_data:
+        if acc.get("account") != wallet:
+            continue
+        for change in acc.get("tokenBalanceChanges", []) or []:
+            mint = change.get("mint")
+            raw = change.get("rawTokenAmount", {}) or {}
+            amount = raw.get("tokenAmount")
+            try:
+                amount_val = float(amount)
+            except (TypeError, ValueError):
+                continue
+            if amount_val > 0 and mint and mint != WSOL_MINT:
+                mints_bought.append(mint)
+    return mints_bought
+
 # ---------- Wallet monitoring webhook (Helius) ----------
 
 @app.route("/webhook", methods=["POST"])
@@ -197,13 +315,10 @@ def webhook():
     transactions = data if isinstance(data, list) else [data]
 
     for tx in transactions:
-        token_transfers = tx.get("tokenTransfers", [])
-        for transfer in token_transfers:
-            to_wallet = transfer.get("toUserAccount")
-            mint = transfer.get("mint")
-
-            if to_wallet in TRACKED_WALLETS and mint:
-                check_and_record_buy(to_wallet, mint)
+        for wallet in TRACKED_WALLETS:
+            mints = extract_wallet_buys(tx, wallet)
+            for mint in mints:
+                check_and_record_buy(wallet, mint)
 
     return "ok", 200
 
@@ -211,23 +326,24 @@ def check_and_record_buy(wallet, mint):
     conn = get_conn()
     c = conn.cursor()
     c.execute(
-        "SELECT buy_count FROM wallet_token_history WHERE wallet=%s AND token_mint=%s",
+        "SELECT buy_count, price_at_first_buy FROM wallet_token_history WHERE wallet=%s AND token_mint=%s",
         (wallet, mint)
     )
     row = c.fetchone()
 
+    pump_fun_url = f"https://pump.fun/{mint}"
+    dexscreener_url = f"https://dexscreener.com/solana/{mint}"
+    jupiter_url = f"https://jup.ag/swap/SOL-{mint}"
+    x_search_url = f"https://x.com/search?q={mint}&src=typed_query&f=live"
+
     if row is None:
+        price = get_current_price(mint)
         c.execute(
-            "INSERT INTO wallet_token_history (wallet, token_mint, buy_count) VALUES (%s, %s, 1)",
-            (wallet, mint)
+            "INSERT INTO wallet_token_history (wallet, token_mint, buy_count, price_at_first_buy) VALUES (%s, %s, 1, %s)",
+            (wallet, mint, price)
         )
         conn.commit()
-        print(f"🟢 FIRST BUY DETECTED: wallet={wallet} token={mint}")
-
-        pump_fun_url = f"https://pump.fun/{mint}"
-        dexscreener_url = f"https://dexscreener.com/solana/{mint}"
-        jupiter_url = f"https://jup.ag/swap/SOL-{mint}"
-        x_search_url = f"https://x.com/search?q={mint}&src=typed_query&f=live"
+        print(f"🟢 FIRST BUY DETECTED: wallet={wallet} token={mint} price={price}")
 
         send_telegram_alert(
             f"🟢 First buy detected!\n"
@@ -240,15 +356,97 @@ def check_and_record_buy(wallet, mint):
             f"👉 Type <code>/lore {mint}</code> and I'll tell you the story."
         )
     else:
+        buy_count, price_at_first_buy = row
+        new_count = buy_count + 1
         c.execute(
-            "UPDATE wallet_token_history SET buy_count = buy_count + 1 WHERE wallet=%s AND token_mint=%s",
-            (wallet, mint)
+            "UPDATE wallet_token_history SET buy_count = %s WHERE wallet=%s AND token_mint=%s",
+            (new_count, wallet, mint)
         )
         conn.commit()
-        print(f"🔁 Repeat buy (DCA), skipping alert: wallet={wallet} token={mint}, total buys={row[0]+1}")
+        print(f"🔁 Repeat buy #{new_count}: wallet={wallet} token={mint}")
+
+        if new_count == 2:
+            send_telegram_alert(
+                f"🔥 Doubling down!\n"
+                f"Wallet: <code>{wallet}</code>\n"
+                f"Token: <code>{mint}</code>\n\n"
+                f"This is buy #2 on this token — wallet's showing real interest.\n"
+                f"📊 DexScreener: {dexscreener_url}\n"
+                f"🪐 Jupiter: {jupiter_url}"
+            )
 
     c.close()
     conn.close()
+
+# ---------- Periodic pump/momentum check (called by external cron) ----------
+
+@app.route("/check-pumps", methods=["GET", "POST"])
+def check_pumps():
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+        SELECT wallet, token_mint, price_at_first_buy, pumped_3x_alerted, momentum_alerted
+        FROM wallet_token_history
+        WHERE first_seen_at > NOW() - INTERVAL '24 hours'
+        AND (pumped_3x_alerted = FALSE OR momentum_alerted = FALSE)
+    """)
+    rows = c.fetchall()
+    print(f"Checking {len(rows)} tokens for pumps/momentum...")
+
+    checked = 0
+    for wallet, mint, price_at_first_buy, pumped_alerted, momentum_alerted in rows:
+        pair = get_dexscreener_full(mint)
+        if not pair:
+            continue
+        checked += 1
+        current_price = None
+        try:
+            current_price = float(pair.get("priceUsd"))
+        except (TypeError, ValueError):
+            pass
+
+        dexscreener_url = f"https://dexscreener.com/solana/{mint}"
+
+        if not pumped_alerted and price_at_first_buy and current_price:
+            multiplier = current_price / float(price_at_first_buy)
+            if multiplier >= 3:
+                send_telegram_alert(
+                    f"🎯 PUMP ALERT — {multiplier:.1f}x!\n"
+                    f"Wallet: <code>{wallet}</code>\n"
+                    f"Token: <code>{mint}</code>\n"
+                    f"Price then: ${price_at_first_buy} → now: ${current_price}\n\n"
+                    f"📊 DexScreener: {dexscreener_url}"
+                )
+                c.execute(
+                    "UPDATE wallet_token_history SET pumped_3x_alerted = TRUE WHERE wallet=%s AND token_mint=%s",
+                    (wallet, mint)
+                )
+                conn.commit()
+                continue
+
+        if not momentum_alerted:
+            score, details = score_momentum(pair)
+            if score >= 70:
+                send_telegram_alert(
+                    f"🚀 Heating up (score {score}/100)\n"
+                    f"Wallet: <code>{wallet}</code>\n"
+                    f"Token: <code>{mint}</code>\n\n"
+                    f"Liquidity: ${details.get('liquidity', 0):.0f}\n"
+                    f"5m volume: ${details.get('vol_5m', 0):.0f} (1h: ${details.get('vol_h1', 0):.0f})\n"
+                    f"Price change 5m/1h/6h: {details.get('pc_5m')}% / {details.get('pc_h1')}% / {details.get('pc_h6')}%\n"
+                    f"Buys vs sells (5m): {details.get('buys_5m')} / {details.get('sells_5m')}\n\n"
+                    f"📊 DexScreener: {dexscreener_url}\n\n"
+                    f"Not a guarantee — DYOR, but the signals are lining up."
+                )
+                c.execute(
+                    "UPDATE wallet_token_history SET momentum_alerted = TRUE WHERE wallet=%s AND token_mint=%s",
+                    (wallet, mint)
+                )
+                conn.commit()
+
+    c.close()
+    conn.close()
+    return f"checked {checked} tokens", 200
 
 # ---------- Telegram incoming messages webhook ----------
 
@@ -264,36 +462,23 @@ def telegram_webhook():
     if not chat_id or not text:
         return "ok", 200
 
-    if text.startswith("/start"):
+    stripped = text.strip()
+
+    if stripped.lower().startswith("/start"):
         reply = ("👑 Hey, it's Queen. I watch the chain, I know the tea, and I'll tell you when "
-                 "something's actually worth your attention. Try /lore <token_address> on any "
-                 "token, or just talk to me.")
+                 "something's actually worth your attention. Drop me any token address (or use "
+                 "/lore <address>) and I'll give you the story, or just talk to me.")
         send_telegram_alert(reply, chat_id)
 
-    elif text.startswith("/lore"):
-        parts = text.split(maxsplit=1)
+    elif stripped.lower().startswith("/lore"):
+        parts = stripped.split(maxsplit=1)
         if len(parts) < 2:
             send_telegram_alert("Give me a token address: <code>/lore &lt;mint_address&gt;</code>", chat_id)
         else:
-            mint = parts[1].strip()
-            context, links = get_token_context(mint)
-            if not context:
-                send_telegram_alert(
-                    f"I've got nothing on <code>{mint}</code> yet — too fresh, or too obscure. Check back later.",
-                    chat_id
-                )
-            else:
-                prompt = (
-                    f"Give me a short, fun 2-3 sentence 'lore' summary based ONLY on this confirmed data: {context}. "
-                    f"If a creator description is included, lean on that for the actual story/meme. "
-                    f"Do NOT invent usernames, social handles, links, or any facts not given here."
-                )
-                reply = ask_queen(prompt)
-                if links:
-                    links_text = "\n\n🔗 Real links:\n" + "\n".join(links)
-                else:
-                    links_text = "\n\n🔗 No social links found."
-                send_telegram_alert(f"🔮 <b>The lore:</b>\n{reply}{links_text}", chat_id)
+            handle_lore_request(parts[1].strip(), chat_id)
+
+    elif looks_like_solana_address(stripped):
+        handle_lore_request(stripped, chat_id)
 
     else:
         reply = ask_queen(text)
