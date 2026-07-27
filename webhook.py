@@ -10,6 +10,10 @@ DB_PATH = "wallet_history.db"
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
+TRACKED_WALLETS = {
+    "AfHNjAnXJKkQ4yrBDop77A3UaLZgFmGKhaSDZC4Msrvk",
+}
+
 def send_telegram_alert(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
@@ -34,10 +38,6 @@ def init_db():
     conn.close()
 
 init_db()
-
-TRACKED_WALLETS = {
-    "AfHNjAnXJKkQ4yrBDop77A3UaLZgFmGKhaSDZC4Msrvk",
-}
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -74,8 +74,16 @@ def check_and_record_buy(wallet, mint):
         )
         conn.commit()
         print(f"🟢 FIRST BUY DETECTED: wallet={wallet} token={mint}")
+
+        pump_fun_url = f"https://pump.fun/{mint}"
+        x_search_url = f"https://x.com/search?q={mint}&src=typed_query&f=live"
+
         send_telegram_alert(
-            f"🟢 First buy detected!\nWallet: {wallet}\nToken: {mint}"
+            f"🟢 First buy detected!\n"
+            f"Wallet: {wallet}\n"
+            f"Token: {mint}\n\n"
+            f"🔍 Check X: {x_search_url}\n"
+            f"🚀 Pump.fun: {pump_fun_url}"
         )
     else:
         c.execute(
