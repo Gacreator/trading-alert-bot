@@ -22,10 +22,12 @@ def send_telegram_alert(message):
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
-        "parse_mode": "Markdown"
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
     }
     try:
-        requests.post(url, data=payload, timeout=5)
+        resp = requests.post(url, data=payload, timeout=5)
+        print(f"Telegram response: {resp.status_code} {resp.text}")
     except Exception as e:
         print(f"Failed to send Telegram alert: {e}")
 
@@ -88,8 +90,8 @@ def check_and_record_buy(wallet, mint):
 
         send_telegram_alert(
             f"🟢 First buy detected!\n"
-            f"Wallet: `{wallet}`\n"
-            f"Token: `{mint}`\n\n"
+            f"Wallet: <code>{wallet}</code>\n"
+            f"Token: <code>{mint}</code>\n\n"
             f"🔍 Check X: {x_search_url}\n"
             f"🚀 Pump.fun: {pump_fun_url}"
         )
