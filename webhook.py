@@ -1,10 +1,22 @@
 from flask import Flask, request
 import os
 import sqlite3
+import requests
 
 app = Flask(__name__)
 
 DB_PATH = "wallet_history.db"
+
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+def send_telegram_alert(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+    try:
+        requests.post(url, data=payload, timeout=5)
+    except Exception as e:
+        print(f"Failed to send Telegram alert: {e}")
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -62,6 +74,9 @@ def check_and_record_buy(wallet, mint):
         )
         conn.commit()
         print(f"🟢 FIRST BUY DETECTED: wallet={wallet} token={mint}")
+        send_telegram_alert(
+            f"🟢 First buy detected!\nWallet: {wallet}\nToken: {mint}"
+        )
     else:
         c.execute(
             "UPDATE wallet_token_history SET buy_count = buy_count + 1 WHERE wallet=? AND token_mint=?",
