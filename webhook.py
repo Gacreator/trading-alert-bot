@@ -19,7 +19,11 @@ def get_conn():
 
 def send_telegram_alert(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown"
+    }
     try:
         requests.post(url, data=payload, timeout=5)
     except Exception as e:
@@ -84,8 +88,8 @@ def check_and_record_buy(wallet, mint):
 
         send_telegram_alert(
             f"🟢 First buy detected!\n"
-            f"Wallet: {wallet}\n"
-            f"Token: {mint}\n\n"
+            f"Wallet: `{wallet}`\n"
+            f"Token: `{mint}`\n\n"
             f"🔍 Check X: {x_search_url}\n"
             f"🚀 Pump.fun: {pump_fun_url}"
         )
