@@ -1,11 +1,11 @@
 from flask import Flask, request
 import os
-import sqlite3
+import psycopg2
 import requests
 
 app = Flask(__name__)
 
-DB_PATH = "wallet_history.db"
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -13,6 +13,9 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 TRACKED_WALLETS = {
     "AfHNjAnXJKkQ4yrBDop77A3UaLZgFmGKhaSDZC4Msrvk",
 }
+
+def get_conn():
+    return psycopg2.connect(DATABASE_URL)
 
 def send_telegram_alert(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -23,18 +26,19 @@ def send_telegram_alert(message):
         print(f"Failed to send Telegram alert: {e}")
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS wallet_token_history (
             wallet TEXT,
             token_mint TEXT,
-            first_seen_at TEXT,
+            first_seen_at TIMESTAMP DEFAULT NOW(),
             buy_count INTEGER,
             PRIMARY KEY (wallet, token_mint)
         )
     """)
     conn.commit()
+    c.close()
     conn.close()
 
 init_db()
@@ -59,17 +63,17 @@ def webhook():
     return "ok", 200
 
 def check_and_record_buy(wallet, mint):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute(
-        "SELECT buy_count FROM wallet_token_history WHERE wallet=? AND token_mint=?",
+        "SELECT buy_count FROM wallet_token_history WHERE wallet=%s AND token_mint=%s",
         (wallet, mint)
     )
     row = c.fetchone()
 
     if row is None:
         c.execute(
-            "INSERT INTO wallet_token_history (wallet, token_mint, first_seen_at, buy_count) VALUES (?, ?, datetime('now'), 1)",
+            "INSERT INTO wallet_token_history (wallet, token_mint, buy_count) VALUES (%s, %s, 1)",
             (wallet, mint)
         )
         conn.commit()
@@ -87,12 +91,13 @@ def check_and_record_buy(wallet, mint):
         )
     else:
         c.execute(
-            "UPDATE wallet_token_history SET buy_count = buy_count + 1 WHERE wallet=? AND token_mint=?",
+            "UPDATE wallet_token_history SET buy_count = buy_count + 1 WHERE wallet=%s AND token_mint=%s",
             (wallet, mint)
         )
         conn.commit()
         print(f"🔁 Repeat buy (DCA), skipping alert: wallet={wallet} token={mint}, total buys={row[0]+1}")
 
+    c.close()
     conn.close()
 
 @app.route("/")
