@@ -30,38 +30,51 @@ QUEEN_SYSTEM_PROMPT = (
 
 SOLANA_ADDRESS_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 
+
 def looks_like_solana_address(text):
     return bool(SOLANA_ADDRESS_RE.match(text.strip()))
+
 
 # ---------- DB ----------
 
 def get_conn():
     return psycopg2.connect(DATABASE_URL)
 
+
 def init_db():
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS wallet_token_history (
-            wallet TEXT,
-            token_mint TEXT,
-            first_seen_at TIMESTAMP DEFAULT NOW(),
-            buy_count INTEGER,
-            price_at_first_buy NUMERIC,
-            pumped_3x_alerted BOOLEAN DEFAULT FALSE,
-            momentum_alerted BOOLEAN DEFAULT FALSE,
-            PRIMARY KEY (wallet, token_mint)
-        )
-    """)
-    conn.commit()
-    c.close()
-    conn.close()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS wallet_token_history (
+                wallet TEXT,
+                token_mint TEXT,
+                first_seen_at TIMESTAMP DEFAULT NOW(),
+                buy_count INTEGER,
+                price_at_first_buy NUMERIC,
+                pumped_3x_alerted BOOLEAN DEFAULT FALSE,
+                momentum_alerted BOOLEAN DEFAULT FALSE,
+                PRIMARY KEY (wallet, token_mint)
+            )
+        """)
+        conn.commit()
+        c.close()
+    finally:
+        conn.close()
+
 
 init_db()
+
 
 # ---------- Telegram helpers ----------
 
 def send_telegram_alert(message, chat_id=None):
+    """
+    FIX 1: Changed data= to json= so that booleans and other types
+    are serialized correctly, and Content-Type is set to application/json.
+    Previously, data= sent form-encoded strings, causing Telegram to reject
+    the disable_web_page_preview field and sometimes the entire request.
+    """
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": chat_id or TELEGRAM_CHAT_ID,
@@ -70,10 +83,11 @@ def send_telegram_alert(message, chat_id=None):
         "disable_web_page_preview": True
     }
     try:
-        resp = requests.post(url, data=payload, timeout=5)
+        resp = requests.post(url, json=payload, timeout=5)  # ✅ FIX 1: was data=payload
         print(f"Telegram response: {resp.status_code} {resp.text}")
     except Exception as e:
         print(f"Failed to send Telegram alert: {e}")
+
 
 # ---------- Groq (Queen brain) ----------
 
@@ -105,6 +119,7 @@ def ask_queen(user_message, extra_context=""):
         print(f"Groq error: {e}")
         return "Ugh, brain fog moment — try me again in a sec."
 
+
 # ---------- Token data sources ----------
 
 def get_pumpfun_data(mint):
@@ -128,6 +143,7 @@ def get_pumpfun_data(mint):
         print(f"pump.fun API error: {e}")
         return None
 
+
 def get_dexscreener_full(mint):
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
@@ -141,6 +157,7 @@ def get_dexscreener_full(mint):
     except Exception as e:
         print(f"DexScreener error: {e}")
         return None
+
 
 def get_dexscreener_data(mint):
     pair = get_dexscreener_full(mint)
@@ -168,6 +185,7 @@ def get_dexscreener_data(mint):
         "links": real_links,
     }
 
+
 def get_current_price(mint):
     pair = get_dexscreener_full(mint)
     if pair and pair.get("priceUsd"):
@@ -176,6 +194,7 @@ def get_current_price(mint):
         except (TypeError, ValueError):
             return None
     return None
+
 
 def get_token_context(mint):
     pf = get_pumpfun_data(mint)
@@ -211,6 +230,7 @@ def get_token_context(mint):
 
     return " ".join(context_parts), links
 
+
 def handle_lore_request(mint, chat_id):
     context, links = get_token_context(mint)
     if not context:
@@ -230,6 +250,7 @@ def handle_lore_request(mint, chat_id):
         else:
             links_text = "\n\n🔗 No social links found."
         send_telegram_alert(f"🔮 <b>The lore:</b>\n{reply}{links_text}", chat_id)
+
 
 # ---------- Momentum scoring ----------
 
@@ -278,6 +299,7 @@ def score_momentum(pair):
 
     return round(score), details
 
+
 # ---------- Wallet buy detection (balance-change based, handles multi-hop) ----------
 
 def extract_wallet_buys(tx, wallet):
@@ -304,17 +326,31 @@ def extract_wallet_buys(tx, wallet):
                 mints_bought.append(mint)
     return mints_bought
 
+
 # ---------- Wallet monitoring webhook (Helius) ----------
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    """
+    FIX 2: Guard against None/empty body. If Helius sends a request with
+    an unexpected Content-Type or empty body, request.json returns None,
+    causing a TypeError crash that returned a 500 before any alert fired.
+    """
     data = request.json
+
+    # ✅ FIX 2: was missing — None body caused AttributeError crash downstream
+    if not data:
+        print("Webhook received empty or non-JSON body")
+        return "no data", 400
+
     print("🔔 New event received:")
     print(data)
 
     transactions = data if isinstance(data, list) else [data]
 
     for tx in transactions:
+        if not isinstance(tx, dict):
+            continue
         for wallet in TRACKED_WALLETS:
             mints = extract_wallet_buys(tx, wallet)
             for mint in mints:
@@ -322,131 +358,152 @@ def webhook():
 
     return "ok", 200
 
+
 def check_and_record_buy(wallet, mint):
     conn = get_conn()
-    c = conn.cursor()
-    c.execute(
-        "SELECT buy_count, price_at_first_buy FROM wallet_token_history WHERE wallet=%s AND token_mint=%s",
-        (wallet, mint)
-    )
-    row = c.fetchone()
-
-    pump_fun_url = f"https://pump.fun/{mint}"
-    dexscreener_url = f"https://dexscreener.com/solana/{mint}"
-    jupiter_url = f"https://jup.ag/swap/SOL-{mint}"
-    x_search_url = f"https://x.com/search?q={mint}&src=typed_query&f=live"
-
-    if row is None:
-        price = get_current_price(mint)
+    try:
+        c = conn.cursor()
         c.execute(
-            "INSERT INTO wallet_token_history (wallet, token_mint, buy_count, price_at_first_buy) VALUES (%s, %s, 1, %s)",
-            (wallet, mint, price)
+            "SELECT buy_count, price_at_first_buy FROM wallet_token_history WHERE wallet=%s AND token_mint=%s",
+            (wallet, mint)
         )
-        conn.commit()
-        print(f"🟢 FIRST BUY DETECTED: wallet={wallet} token={mint} price={price}")
+        row = c.fetchone()
 
-        send_telegram_alert(
-            f"🟢 First buy detected!\n"
-            f"Wallet: <code>{wallet}</code>\n"
-            f"Token: <code>{mint}</code>\n\n"
-            f"🔍 X: {x_search_url}\n"
-            f"📊 DexScreener: {dexscreener_url}\n"
-            f"🪐 Jupiter: {jupiter_url}\n"
-            f"🚀 Pump.fun: {pump_fun_url}\n\n"
-            f"👉 Type <code>/lore {mint}</code> and I'll tell you the story."
-        )
-    else:
-        buy_count, price_at_first_buy = row
-        new_count = buy_count + 1
-        c.execute(
-            "UPDATE wallet_token_history SET buy_count = %s WHERE wallet=%s AND token_mint=%s",
-            (new_count, wallet, mint)
-        )
-        conn.commit()
-        print(f"🔁 Repeat buy #{new_count}: wallet={wallet} token={mint}")
+        pump_fun_url = f"https://pump.fun/{mint}"
+        dexscreener_url = f"https://dexscreener.com/solana/{mint}"
+        jupiter_url = f"https://jup.ag/swap/SOL-{mint}"
+        x_search_url = f"https://x.com/search?q={mint}&src=typed_query&f=live"
 
-        if new_count == 2:
+        if row is None:
+            price = get_current_price(mint)
+            c.execute(
+                "INSERT INTO wallet_token_history (wallet, token_mint, buy_count, price_at_first_buy) VALUES (%s, %s, 1, %s)",
+                (wallet, mint, price)
+            )
+            conn.commit()
+            print(f"🟢 FIRST BUY DETECTED: wallet={wallet} token={mint} price={price}")
+
             send_telegram_alert(
-                f"🔥 Doubling down!\n"
+                f"🟢 First buy detected!\n"
                 f"Wallet: <code>{wallet}</code>\n"
                 f"Token: <code>{mint}</code>\n\n"
-                f"This is buy #2 on this token — wallet's showing real interest.\n"
+                f"🔍 X: {x_search_url}\n"
                 f"📊 DexScreener: {dexscreener_url}\n"
-                f"🪐 Jupiter: {jupiter_url}"
+                f"🪐 Jupiter: {jupiter_url}\n"
+                f"🚀 Pump.fun: {pump_fun_url}\n\n"
+                f"👉 Type <code>/lore {mint}</code> and I'll tell you the story."
             )
+        else:
+            buy_count, price_at_first_buy = row
+            new_count = buy_count + 1
+            c.execute(
+                "UPDATE wallet_token_history SET buy_count = %s WHERE wallet=%s AND token_mint=%s",
+                (new_count, wallet, mint)
+            )
+            conn.commit()
+            print(f"🔁 Repeat buy #{new_count}: wallet={wallet} token={mint}")
 
-    c.close()
-    conn.close()
+            if new_count == 2:
+                send_telegram_alert(
+                    f"🔥 Doubling down!\n"
+                    f"Wallet: <code>{wallet}</code>\n"
+                    f"Token: <code>{mint}</code>\n\n"
+                    f"This is buy #2 on this token — wallet's showing real interest.\n"
+                    f"📊 DexScreener: {dexscreener_url}\n"
+                    f"🪐 Jupiter: {jupiter_url}"
+                )
+
+        c.close()
+    finally:
+        conn.close()  # ✅ always released even if exception is thrown
+
 
 # ---------- Periodic pump/momentum check (called by external cron) ----------
 
 @app.route("/check-pumps", methods=["GET", "POST"])
 def check_pumps():
+    """
+    FIX 3: Wrapped entire function in try/finally so the DB connection is
+    always closed, even if DexScreener times out or an exception is raised
+    mid-loop. Previously, a single exception would leave the connection open,
+    and after enough cron runs the pool would exhaust and every run would fail.
+    """
     conn = get_conn()
     c = conn.cursor()
-    c.execute("""
-        SELECT wallet, token_mint, price_at_first_buy, pumped_3x_alerted, momentum_alerted
-        FROM wallet_token_history
-        WHERE first_seen_at > NOW() - INTERVAL '24 hours'
-        AND (pumped_3x_alerted = FALSE OR momentum_alerted = FALSE)
-    """)
-    rows = c.fetchall()
-    print(f"Checking {len(rows)} tokens for pumps/momentum...")
-
     checked = 0
-    for wallet, mint, price_at_first_buy, pumped_alerted, momentum_alerted in rows:
-        pair = get_dexscreener_full(mint)
-        if not pair:
-            continue
-        checked += 1
-        current_price = None
-        try:
-            current_price = float(pair.get("priceUsd"))
-        except (TypeError, ValueError):
-            pass
 
-        dexscreener_url = f"https://dexscreener.com/solana/{mint}"
+    try:
+        c.execute("""
+            SELECT wallet, token_mint, price_at_first_buy, pumped_3x_alerted, momentum_alerted
+            FROM wallet_token_history
+            WHERE first_seen_at > NOW() - INTERVAL '24 hours'
+            AND (pumped_3x_alerted = FALSE OR momentum_alerted = FALSE)
+        """)
+        rows = c.fetchall()
+        print(f"Checking {len(rows)} tokens for pumps/momentum...")
 
-        if not pumped_alerted and price_at_first_buy and current_price:
-            multiplier = current_price / float(price_at_first_buy)
-            if multiplier >= 3:
-                send_telegram_alert(
-                    f"🎯 PUMP ALERT — {multiplier:.1f}x!\n"
-                    f"Wallet: <code>{wallet}</code>\n"
-                    f"Token: <code>{mint}</code>\n"
-                    f"Price then: ${price_at_first_buy} → now: ${current_price}\n\n"
-                    f"📊 DexScreener: {dexscreener_url}"
-                )
-                c.execute(
-                    "UPDATE wallet_token_history SET pumped_3x_alerted = TRUE WHERE wallet=%s AND token_mint=%s",
-                    (wallet, mint)
-                )
-                conn.commit()
+        for wallet, mint, price_at_first_buy, pumped_alerted, momentum_alerted in rows:
+            pair = get_dexscreener_full(mint)
+            if not pair:
                 continue
+            checked += 1
 
-        if not momentum_alerted:
-            score, details = score_momentum(pair)
-            if score >= 70:
-                send_telegram_alert(
-                    f"🚀 Heating up (score {score}/100)\n"
-                    f"Wallet: <code>{wallet}</code>\n"
-                    f"Token: <code>{mint}</code>\n\n"
-                    f"Liquidity: ${details.get('liquidity', 0):.0f}\n"
-                    f"5m volume: ${details.get('vol_5m', 0):.0f} (1h: ${details.get('vol_h1', 0):.0f})\n"
-                    f"Price change 5m/1h/6h: {details.get('pc_5m')}% / {details.get('pc_h1')}% / {details.get('pc_h6')}%\n"
-                    f"Buys vs sells (5m): {details.get('buys_5m')} / {details.get('sells_5m')}\n\n"
-                    f"📊 DexScreener: {dexscreener_url}\n\n"
-                    f"Not a guarantee — DYOR, but the signals are lining up."
-                )
-                c.execute(
-                    "UPDATE wallet_token_history SET momentum_alerted = TRUE WHERE wallet=%s AND token_mint=%s",
-                    (wallet, mint)
-                )
-                conn.commit()
+            current_price = None
+            try:
+                current_price = float(pair.get("priceUsd"))
+            except (TypeError, ValueError):
+                pass
 
-    c.close()
-    conn.close()
-    return f"checked {checked} tokens", 200
+            dexscreener_url = f"https://dexscreener.com/solana/{mint}"
+
+            if not pumped_alerted and price_at_first_buy and current_price:
+                multiplier = current_price / float(price_at_first_buy)
+                if multiplier >= 3:
+                    send_telegram_alert(
+                        f"🎯 PUMP ALERT — {multiplier:.1f}x!\n"
+                        f"Wallet: <code>{wallet}</code>\n"
+                        f"Token: <code>{mint}</code>\n"
+                        f"Price then: ${price_at_first_buy} → now: ${current_price}\n\n"
+                        f"📊 DexScreener: {dexscreener_url}"
+                    )
+                    c.execute(
+                        "UPDATE wallet_token_history SET pumped_3x_alerted = TRUE WHERE wallet=%s AND token_mint=%s",
+                        (wallet, mint)
+                    )
+                    conn.commit()
+                    continue
+
+            if not momentum_alerted:
+                score, details = score_momentum(pair)
+                if score >= 70:
+                    send_telegram_alert(
+                        f"🚀 Heating up (score {score}/100)\n"
+                        f"Wallet: <code>{wallet}</code>\n"
+                        f"Token: <code>{mint}</code>\n\n"
+                        f"Liquidity: ${details.get('liquidity', 0):.0f}\n"
+                        f"5m volume: ${details.get('vol_5m', 0):.0f} (1h: ${details.get('vol_h1', 0):.0f})\n"
+                        f"Price change 5m/1h/6h: {details.get('pc_5m')}% / {details.get('pc_h1')}% / {details.get('pc_h6')}%\n"
+                        f"Buys vs sells (5m): {details.get('buys_5m')} / {details.get('sells_5m')}\n\n"
+                        f"📊 DexScreener: {dexscreener_url}\n\n"
+                        f"Not a guarantee — DYOR, but the signals are lining up."
+                    )
+                    c.execute(
+                        "UPDATE wallet_token_history SET momentum_alerted = TRUE WHERE wallet=%s AND token_mint=%s",
+                        (wallet, mint)
+                    )
+                    conn.commit()
+
+        return f"checked {checked} tokens", 200
+
+    except Exception as e:
+        print(f"check_pumps error: {e}")
+        return "error", 500
+
+    finally:
+        # ✅ FIX 3: always runs — connection never leaks regardless of exceptions
+        c.close()
+        conn.close()
+
 
 # ---------- Telegram incoming messages webhook ----------
 
@@ -454,6 +511,9 @@ def check_pumps():
 def telegram_webhook():
     update = request.json
     print("📩 Telegram update:", update)
+
+    if not update:
+        return "ok", 200
 
     message = update.get("message", {})
     chat_id = message.get("chat", {}).get("id")
@@ -486,9 +546,11 @@ def telegram_webhook():
 
     return "ok", 200
 
+
 @app.route("/")
 def home():
     return "Bot is alive!"
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
