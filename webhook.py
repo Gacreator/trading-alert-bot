@@ -314,17 +314,23 @@ def score_momentum(pair):
 
 def extract_wallet_buys(tx, wallet):
     """
-    Returns a list of mints the wallet's balance INCREASED for in this transaction,
-    using accountData.tokenBalanceChanges. This correctly handles multi-hop swaps
-    (e.g. USDT -> WSOL -> target token) where per-leg toUserAccount doesn't reflect
-    the true beneficial owner.
+    Returns a list of mints the wallet's balance INCREASED for in this transaction.
+
+    FIX: Token balance changes are stored under the Associated Token Account (ATA)
+    address, NOT the main wallet address. So checking acc["account"] == wallet
+    always missed them — that entry has empty tokenBalanceChanges.
+
+    The correct approach is to scan ALL accounts' tokenBalanceChanges and check
+    the "userAccount" field inside each change, which maps the ATA back to its
+    owner wallet.
     """
     mints_bought = []
     account_data = tx.get("accountData", []) or []
     for acc in account_data:
-        if acc.get("account") != wallet:
-            continue
         for change in acc.get("tokenBalanceChanges", []) or []:
+            # userAccount is the owner wallet — this is the correct field to match
+            if change.get("userAccount") != wallet:
+                continue
             mint = change.get("mint")
             raw = change.get("rawTokenAmount", {}) or {}
             amount = raw.get("tokenAmount")
