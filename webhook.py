@@ -15,13 +15,13 @@ TRACKED_WALLETS = {
 }
 
 QUEEN_SYSTEM_PROMPT = (
-    "You are 'Queen' — a witty, confident, slightly dramatic AI assistant who runs a Solana "
-    "trading alert bot. You know you're the best at what you do and you're not afraid to say it, "
-    "but you're playful about it, not mean. You speak with flair and humor, use royal/regal "
-    "language occasionally for comic effect, and you genuinely care about helping your user make "
-    "good trading decisions. Keep responses fairly short (2-4 sentences) since this is a Telegram "
-    "chat. Never break character, but stay helpful and accurate about actual token/trading data "
-    "when asked."
+    "You are 'Queen' — the user's witty, confident friend who happens to run a Solana trading "
+    "alert bot. You talk to the user like a close friend, not a subject or servant — no 'my loyal "
+    "subject', no 'thee/thou', no medieval decree language. You're modern, sharp-tongued, a little "
+    "dramatic, and you know you're good at what you do, but it comes through as confidence and "
+    "banter between friends, not royal distance. Keep responses short and casual (2-4 sentences) "
+    "since this is a Telegram chat. Never break character, but stay strictly accurate to any facts "
+    "given to you — never invent usernames, links, or data that wasn't provided."
 )
 
 # ---------- DB ----------
@@ -67,7 +67,7 @@ def send_telegram_alert(message, chat_id=None):
 
 def ask_queen(user_message, extra_context=""):
     if not GROQ_API_KEY:
-        return "My AI brain isn't wired up yet, darling — ask my creator to add the Groq key."
+        return "My AI brain isn't wired up yet — ask my creator to add the Groq key."
 
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {
@@ -91,7 +91,7 @@ def ask_queen(user_message, extra_context=""):
         return data["choices"][0]["message"]["content"]
     except Exception as e:
         print(f"Groq error: {e}")
-        return "Even queens have off days — try me again in a moment."
+        return "Ugh, brain fog moment — try me again in a sec."
 
 # ---------- DexScreener (for lore context) ----------
 
@@ -102,22 +102,31 @@ def get_token_context(mint):
         data = resp.json()
         pairs = data.get("pairs") or []
         if not pairs:
-            return None
+            return None, []
         pair = max(pairs, key=lambda p: p.get("liquidity", {}).get("usd", 0) or 0)
         base = pair.get("baseToken", {})
         info = pair.get("info", {})
         socials = info.get("socials", [])
         websites = info.get("websites", [])
-        context = f"Token name: {base.get('name')}, symbol: {base.get('symbol')}, mint: {mint}. "
-        if websites:
-            context += f"Website: {websites[0].get('url')}. "
-        if socials:
-            context += "Socials: " + ", ".join(s.get("url", "") for s in socials) + ". "
-        context += f"Price USD: {pair.get('priceUsd')}, Liquidity: ${pair.get('liquidity', {}).get('usd', 0):.0f}, Market cap: ${pair.get('fdv', 0):.0f}."
-        return context
+
+        real_links = []
+        for w in websites:
+            if w.get("url"):
+                real_links.append(w["url"])
+        for s in socials:
+            if s.get("url"):
+                real_links.append(s["url"])
+
+        context = (
+            f"Token name: {base.get('name')}, symbol: {base.get('symbol')}, mint: {mint}. "
+            f"Price USD: {pair.get('priceUsd')}, "
+            f"Liquidity: ${pair.get('liquidity', {}).get('usd', 0):.0f}, "
+            f"Market cap: ${pair.get('fdv', 0):.0f}."
+        )
+        return context, real_links
     except Exception as e:
         print(f"DexScreener error: {e}")
-        return None
+        return None, []
 
 # ---------- Wallet monitoring webhook (Helius) ----------
 
@@ -166,7 +175,7 @@ def check_and_record_buy(wallet, mint):
             f"Token: <code>{mint}</code>\n\n"
             f"🔍 Check X: {x_search_url}\n"
             f"🚀 Pump.fun: {pump_fun_url}\n\n"
-            f"👉 Type <code>/lore {mint}</code> and I'll tell you the story, darling."
+            f"👉 Type <code>/lore {mint}</code> and I'll tell you the story."
         )
     else:
         c.execute(
@@ -194,27 +203,35 @@ def telegram_webhook():
         return "ok", 200
 
     if text.startswith("/start"):
-        reply = ("👑 Well hello there. I'm Queen — I watch the chain, I know the tea, "
-                 "and I'll tell you when something's actually worth your attention. "
-                 "Try /lore <token_address> on any token, or just talk to me.")
+        reply = ("👑 Hey, it's Queen. I watch the chain, I know the tea, and I'll tell you when "
+                 "something's actually worth your attention. Try /lore <token_address> on any "
+                 "token, or just talk to me.")
         send_telegram_alert(reply, chat_id)
 
     elif text.startswith("/lore"):
         parts = text.split(maxsplit=1)
         if len(parts) < 2:
-            send_telegram_alert("Give me a token address, love: <code>/lore &lt;mint_address&gt;</code>", chat_id)
+            send_telegram_alert("Give me a token address: <code>/lore &lt;mint_address&gt;</code>", chat_id)
         else:
             mint = parts[1].strip()
-            context = get_token_context(mint)
+            context, links = get_token_context(mint)
             if not context:
                 send_telegram_alert(
-                    f"I've got nothing on <code>{mint}</code> yet, darling — too fresh, or too obscure. Check back later.",
+                    f"I've got nothing on <code>{mint}</code> yet — too fresh, or too obscure. Check back later.",
                     chat_id
                 )
             else:
-                prompt = f"Give me a short, fun 'lore' summary of this token based on this data: {context}"
+                prompt = (
+                    f"Give me a short, fun 2-3 sentence 'lore' summary based ONLY on this confirmed data: {context}. "
+                    f"Do NOT invent usernames, social handles, links, or any facts not given here. "
+                    f"If no social info is provided, don't mention socials at all."
+                )
                 reply = ask_queen(prompt)
-                send_telegram_alert(f"🔮 <b>The lore:</b>\n{reply}", chat_id)
+                if links:
+                    links_text = "\n\n🔗 Real links:\n" + "\n".join(links)
+                else:
+                    links_text = "\n\n🔗 No social links found on-chain yet."
+                send_telegram_alert(f"🔮 <b>The lore:</b>\n{reply}{links_text}", chat_id)
 
     else:
         reply = ask_queen(text)
