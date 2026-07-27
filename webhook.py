@@ -10,9 +10,9 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
-TRACKED_WALLETS = {
-    "AfHNjAnXJKkQ4yrBDop77A3UaLZgFmGKhaSDZC4Msrvk",
-}
+TRACKED_WALLETS = set(
+    w.strip() for w in os.environ.get("TRACKED_WALLETS", "").split(",") if w.strip()
+)
 
 QUEEN_SYSTEM_PROMPT = (
     "You are 'Queen' — the user's witty, confident friend who happens to run a Solana trading "
@@ -93,16 +93,38 @@ def ask_queen(user_message, extra_context=""):
         print(f"Groq error: {e}")
         return "Ugh, brain fog moment — try me again in a sec."
 
-# ---------- DexScreener (for lore context) ----------
+# ---------- Token data sources ----------
 
-def get_token_context(mint):
+def get_pumpfun_data(mint):
+    """Try pump.fun's own API for the real creator-written description/socials."""
+    try:
+        url = f"https://frontend-api.pump.fun/coins/{mint}"
+        resp = requests.get(url, timeout=5, headers={"User-Agent": "Mozilla/5.0"})
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        if not data:
+            return None
+        return {
+            "name": data.get("name"),
+            "symbol": data.get("symbol"),
+            "description": data.get("description"),
+            "twitter": data.get("twitter"),
+            "telegram": data.get("telegram"),
+            "website": data.get("website"),
+        }
+    except Exception as e:
+        print(f"pump.fun API error: {e}")
+        return None
+
+def get_dexscreener_data(mint):
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
         resp = requests.get(url, timeout=5)
         data = resp.json()
         pairs = data.get("pairs") or []
         if not pairs:
-            return None, []
+            return None
         pair = max(pairs, key=lambda p: p.get("liquidity", {}).get("usd", 0) or 0)
         base = pair.get("baseToken", {})
         info = pair.get("info", {})
@@ -117,16 +139,52 @@ def get_token_context(mint):
             if s.get("url"):
                 real_links.append(s["url"])
 
-        context = (
-            f"Token name: {base.get('name')}, symbol: {base.get('symbol')}, mint: {mint}. "
-            f"Price USD: {pair.get('priceUsd')}, "
-            f"Liquidity: ${pair.get('liquidity', {}).get('usd', 0):.0f}, "
-            f"Market cap: ${pair.get('fdv', 0):.0f}."
-        )
-        return context, real_links
+        return {
+            "name": base.get("name"),
+            "symbol": base.get("symbol"),
+            "price": pair.get("priceUsd"),
+            "liquidity": pair.get("liquidity", {}).get("usd", 0),
+            "market_cap": pair.get("fdv", 0),
+            "links": real_links,
+        }
     except Exception as e:
         print(f"DexScreener error: {e}")
+        return None
+
+def get_token_context(mint):
+    """Combine pump.fun (real description) + DexScreener (real market data)."""
+    pf = get_pumpfun_data(mint)
+    ds = get_dexscreener_data(mint)
+
+    if not pf and not ds:
         return None, []
+
+    context_parts = []
+    links = []
+
+    name = (pf.get("name") if pf else None) or (ds.get("name") if ds else None)
+    symbol = (pf.get("symbol") if pf else None) or (ds.get("symbol") if ds else None)
+    context_parts.append(f"Token name: {name}, symbol: {symbol}, mint: {mint}.")
+
+    if pf and pf.get("description"):
+        context_parts.append(f"Creator's own description: \"{pf['description']}\"")
+    if pf and pf.get("twitter"):
+        links.append(pf["twitter"])
+    if pf and pf.get("telegram"):
+        links.append(pf["telegram"])
+    if pf and pf.get("website"):
+        links.append(pf["website"])
+
+    if ds:
+        context_parts.append(
+            f"Price USD: {ds.get('price')}, Liquidity: ${ds.get('liquidity', 0):.0f}, "
+            f"Market cap: ${ds.get('market_cap', 0):.0f}."
+        )
+        for link in ds.get("links", []):
+            if link not in links:
+                links.append(link)
+
+    return " ".join(context_parts), links
 
 # ---------- Wallet monitoring webhook (Helius) ----------
 
@@ -167,13 +225,17 @@ def check_and_record_buy(wallet, mint):
         print(f"🟢 FIRST BUY DETECTED: wallet={wallet} token={mint}")
 
         pump_fun_url = f"https://pump.fun/{mint}"
+        dexscreener_url = f"https://dexscreener.com/solana/{mint}"
+        jupiter_url = f"https://jup.ag/swap/SOL-{mint}"
         x_search_url = f"https://x.com/search?q={mint}&src=typed_query&f=live"
 
         send_telegram_alert(
             f"🟢 First buy detected!\n"
             f"Wallet: <code>{wallet}</code>\n"
             f"Token: <code>{mint}</code>\n\n"
-            f"🔍 Check X: {x_search_url}\n"
+            f"🔍 X: {x_search_url}\n"
+            f"📊 DexScreener: {dexscreener_url}\n"
+            f"🪐 Jupiter: {jupiter_url}\n"
             f"🚀 Pump.fun: {pump_fun_url}\n\n"
             f"👉 Type <code>/lore {mint}</code> and I'll tell you the story."
         )
@@ -223,14 +285,14 @@ def telegram_webhook():
             else:
                 prompt = (
                     f"Give me a short, fun 2-3 sentence 'lore' summary based ONLY on this confirmed data: {context}. "
-                    f"Do NOT invent usernames, social handles, links, or any facts not given here. "
-                    f"If no social info is provided, don't mention socials at all."
+                    f"If a creator description is included, lean on that for the actual story/meme. "
+                    f"Do NOT invent usernames, social handles, links, or any facts not given here."
                 )
                 reply = ask_queen(prompt)
                 if links:
                     links_text = "\n\n🔗 Real links:\n" + "\n".join(links)
                 else:
-                    links_text = "\n\n🔗 No social links found on-chain yet."
+                    links_text = "\n\n🔗 No social links found."
                 send_telegram_alert(f"🔮 <b>The lore:</b>\n{reply}{links_text}", chat_id)
 
     else:
