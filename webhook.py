@@ -562,35 +562,6 @@ def home():
     return "Bot is alive!"
 
 
-# TEMPORARY ROUTE — hit this once in your browser to fix the DB,
-# then remove it from the code and redeploy.
-@app.route("/fix-db")
-def fix_db():
-    conn = get_conn()
-    try:
-        c = conn.cursor()
-        c.execute("DROP TABLE IF EXISTS wallet_token_history")
-        conn.commit()
-        c.execute("""
-            CREATE TABLE wallet_token_history (
-                wallet TEXT,
-                token_mint TEXT,
-                first_seen_at TIMESTAMP DEFAULT NOW(),
-                buy_count INTEGER,
-                price_at_first_buy NUMERIC,
-                pumped_3x_alerted BOOLEAN DEFAULT FALSE,
-                momentum_alerted BOOLEAN DEFAULT FALSE,
-                PRIMARY KEY (wallet, token_mint)
-            )
-        """)
-        conn.commit()
-        c.close()
-        return "Table dropped and recreated successfully. Remove this route now.", 200
-    except Exception as e:
-        return f"Error: {e}", 500
-    finally:
-        conn.close()
-
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
