@@ -19,6 +19,11 @@ TRACKED_WALLETS = set(
 MIN_LIQUIDITY_USD = 3000
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 
+# How long a token stays under active momentum/pump scanning after first
+# buy. Was hardcoded at 24h, which meant tokens that pumped later than
+# that silently dropped out of consideration and never got alerted.
+SCAN_WINDOW_HOURS = int(os.environ.get("SCAN_WINDOW_HOURS", "168"))  # 7 days default
+
 QUEEN_SYSTEM_PROMPT = (
     "You are 'Queen' — the user's witty, confident friend who happens to run a Solana trading "
     "alert bot. You talk to the user like a close friend, not a subject or servant — no 'my loyal "
@@ -73,6 +78,42 @@ def init_db():
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS momentum_alerted BOOLEAN DEFAULT FALSE")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS first_seen_at TIMESTAMP DEFAULT NOW()")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS buy_count INTEGER")
+
+        # Ground-truth outcome tracking: updated on every scan regardless of
+        # whether an alert fired, so tokens that pumped but never crossed the
+        # alert threshold still leave a record of what they actually did.
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS max_price_seen NUMERIC")
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS max_multiplier_seen NUMERIC")
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS last_checked_at TIMESTAMP")
+
+        # Full snapshot of every score_momentum() call, whether or not it
+        # crossed the alert threshold. This is the raw data for finding
+        # patterns later — what liquidity/volume/price-change/buy-sell
+        # signals actually preceded a real pump vs. a token that fizzled.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS token_scan_log (
+                id SERIAL PRIMARY KEY,
+                wallet TEXT,
+                token_mint TEXT,
+                scanned_at TIMESTAMP DEFAULT NOW(),
+                price NUMERIC,
+                liquidity NUMERIC,
+                vol_5m NUMERIC,
+                vol_h1 NUMERIC,
+                pc_5m NUMERIC,
+                pc_h1 NUMERIC,
+                pc_h6 NUMERIC,
+                buys_5m INTEGER,
+                sells_5m INTEGER,
+                momentum_score NUMERIC,
+                multiplier_from_first_buy NUMERIC,
+                momentum_alert_fired BOOLEAN DEFAULT FALSE,
+                pump_alert_fired BOOLEAN DEFAULT FALSE
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_scan_log_mint ON token_scan_log (token_mint)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_scan_log_scanned_at ON token_scan_log (scanned_at)")
+
         conn.commit()
         c.close()
     finally:
@@ -475,9 +516,9 @@ def run_pump_check():
         c.execute("""
             SELECT wallet, token_mint, price_at_first_buy, pumped_3x_alerted, momentum_alerted
             FROM wallet_token_history
-            WHERE first_seen_at > NOW() - INTERVAL '24 hours'
+            WHERE first_seen_at > NOW() - (INTERVAL '1 hour' * %s)
             AND (pumped_3x_alerted = FALSE OR momentum_alerted = FALSE)
-        """)
+        """, (SCAN_WINDOW_HOURS,))
         rows = c.fetchall()
         print(f"Checking {len(rows)} tokens for pumps/momentum...")
 
@@ -495,42 +536,89 @@ def run_pump_check():
 
             dexscreener_url = f"https://dexscreener.com/solana/{mint}"
 
-            if not pumped_alerted and price_at_first_buy and current_price:
-                multiplier = current_price / float(price_at_first_buy)
-                if multiplier >= 3:
-                    send_telegram_alert(
-                        f"🎯 PUMP ALERT — {multiplier:.1f}x!\n"
-                        f"Wallet: <code>{wallet}</code>\n"
-                        f"Token: <code>{mint}</code>\n"
-                        f"Price then: ${price_at_first_buy} → now: ${current_price}\n\n"
-                        f"📊 DexScreener: {dexscreener_url}"
-                    )
-                    c.execute(
-                        "UPDATE wallet_token_history SET pumped_3x_alerted = TRUE WHERE wallet=%s AND token_mint=%s",
-                        (wallet, mint)
-                    )
-                    conn.commit()
-                    continue
+            # Always score, regardless of alert state — this is what makes
+            # the log useful for pattern-finding later. Previously score
+            # was only ever computed when momentum_alerted was still False,
+            # so tokens that had already been alerted (or that never
+            # crossed the threshold) left no data trail at all.
+            score, details = score_momentum(pair)
 
-            if not momentum_alerted:
-                score, details = score_momentum(pair)
-                if score >= 70:
-                    send_telegram_alert(
-                        f"🚀 Heating up (score {score}/100)\n"
-                        f"Wallet: <code>{wallet}</code>\n"
-                        f"Token: <code>{mint}</code>\n\n"
-                        f"Liquidity: ${details.get('liquidity', 0):.0f}\n"
-                        f"5m volume: ${details.get('vol_5m', 0):.0f} (1h: ${details.get('vol_h1', 0):.0f})\n"
-                        f"Price change 5m/1h/6h: {details.get('pc_5m')}% / {details.get('pc_h1')}% / {details.get('pc_h6')}%\n"
-                        f"Buys vs sells (5m): {details.get('buys_5m')} / {details.get('sells_5m')}\n\n"
-                        f"📊 DexScreener: {dexscreener_url}\n\n"
-                        f"Not a guarantee — DYOR, but the signals are lining up."
-                    )
-                    c.execute(
-                        "UPDATE wallet_token_history SET momentum_alerted = TRUE WHERE wallet=%s AND token_mint=%s",
-                        (wallet, mint)
-                    )
-                    conn.commit()
+            multiplier = None
+            if price_at_first_buy and current_price:
+                try:
+                    multiplier = current_price / float(price_at_first_buy)
+                except (TypeError, ValueError, ZeroDivisionError):
+                    multiplier = None
+
+            # Ground-truth outcome tracking — updated every scan whether or
+            # not any alert fires, so you can later see what a token
+            # actually peaked at even if the bot never flagged it.
+            if current_price is not None:
+                c.execute(
+                    """
+                    UPDATE wallet_token_history
+                    SET last_checked_at = NOW(),
+                        max_price_seen = GREATEST(COALESCE(max_price_seen, 0), %s),
+                        max_multiplier_seen = GREATEST(COALESCE(max_multiplier_seen, 0), COALESCE(%s, 0))
+                    WHERE wallet=%s AND token_mint=%s
+                    """,
+                    (current_price, multiplier, wallet, mint)
+                )
+
+            momentum_alert_fired = False
+            pump_alert_fired = False
+
+            if not pumped_alerted and multiplier is not None and multiplier >= 3:
+                pump_alert_fired = True
+                send_telegram_alert(
+                    f"🎯 PUMP ALERT — {multiplier:.1f}x!\n"
+                    f"Wallet: <code>{wallet}</code>\n"
+                    f"Token: <code>{mint}</code>\n"
+                    f"Price then: ${price_at_first_buy} → now: ${current_price}\n\n"
+                    f"📊 DexScreener: {dexscreener_url}"
+                )
+                c.execute(
+                    "UPDATE wallet_token_history SET pumped_3x_alerted = TRUE WHERE wallet=%s AND token_mint=%s",
+                    (wallet, mint)
+                )
+
+            elif not momentum_alerted and score >= 70:
+                momentum_alert_fired = True
+                send_telegram_alert(
+                    f"🚀 Heating up (score {score}/100)\n"
+                    f"Wallet: <code>{wallet}</code>\n"
+                    f"Token: <code>{mint}</code>\n\n"
+                    f"Liquidity: ${details.get('liquidity', 0):.0f}\n"
+                    f"5m volume: ${details.get('vol_5m', 0):.0f} (1h: ${details.get('vol_h1', 0):.0f})\n"
+                    f"Price change 5m/1h/6h: {details.get('pc_5m')}% / {details.get('pc_h1')}% / {details.get('pc_h6')}%\n"
+                    f"Buys vs sells (5m): {details.get('buys_5m')} / {details.get('sells_5m')}\n\n"
+                    f"📊 DexScreener: {dexscreener_url}\n\n"
+                    f"Not a guarantee — DYOR, but the signals are lining up."
+                )
+                c.execute(
+                    "UPDATE wallet_token_history SET momentum_alerted = TRUE WHERE wallet=%s AND token_mint=%s",
+                    (wallet, mint)
+                )
+
+            # Snapshot this scan regardless of whether anything fired.
+            c.execute(
+                """
+                INSERT INTO token_scan_log
+                    (wallet, token_mint, price, liquidity, vol_5m, vol_h1,
+                     pc_5m, pc_h1, pc_h6, buys_5m, sells_5m, momentum_score,
+                     multiplier_from_first_buy, momentum_alert_fired, pump_alert_fired)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    wallet, mint, current_price, details.get("liquidity"),
+                    details.get("vol_5m"), details.get("vol_h1"),
+                    details.get("pc_5m"), details.get("pc_h1"), details.get("pc_h6"),
+                    details.get("buys_5m"), details.get("sells_5m"), score,
+                    multiplier, momentum_alert_fired, pump_alert_fired
+                )
+            )
+
+            conn.commit()
 
         print(f"check_pumps finished — checked {checked} tokens")
 
