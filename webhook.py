@@ -45,7 +45,6 @@ def init_db():
     conn = get_conn()
     try:
         c = conn.cursor()
-        # Create table if it doesn't exist at all
         c.execute("""
             CREATE TABLE IF NOT EXISTS wallet_token_history (
                 wallet TEXT,
@@ -58,10 +57,6 @@ def init_db():
                 PRIMARY KEY (wallet, token_mint)
             )
         """)
-        # ✅ FIX 4: Migrate existing tables that are missing columns.
-        # CREATE TABLE IF NOT EXISTS skips creation on redeploy, so any
-        # columns added after the table was first created never get added.
-        # ADD COLUMN IF NOT EXISTS is a no-op if the column already exists.
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS price_at_first_buy NUMERIC")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS pumped_3x_alerted BOOLEAN DEFAULT FALSE")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS momentum_alerted BOOLEAN DEFAULT FALSE")
@@ -79,12 +74,6 @@ init_db()
 # ---------- Telegram helpers ----------
 
 def send_telegram_alert(message, chat_id=None):
-    """
-    FIX 1: Changed data= to json= so that booleans and other types
-    are serialized correctly, and Content-Type is set to application/json.
-    Previously, data= sent form-encoded strings, causing Telegram to reject
-    the disable_web_page_preview field and sometimes the entire request.
-    """
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": chat_id or TELEGRAM_CHAT_ID,
@@ -93,7 +82,7 @@ def send_telegram_alert(message, chat_id=None):
         "disable_web_page_preview": True
     }
     try:
-        resp = requests.post(url, json=payload, timeout=5)  # ✅ FIX 1: was data=payload
+        resp = requests.post(url, json=payload, timeout=5)
         print(f"Telegram response: {resp.status_code} {resp.text}")
     except Exception as e:
         print(f"Failed to send Telegram alert: {e}")
@@ -310,51 +299,50 @@ def score_momentum(pair):
     return round(score), details
 
 
-# ---------- Wallet buy detection (balance-change based, handles multi-hop) ----------
+# ---------- Wallet buy detection (combined: direct transfer + balance change) ----------
 
 def extract_wallet_buys(tx, wallet):
     """
-    Returns a list of mints the wallet's balance INCREASED for in this transaction.
+    Detects any token this wallet RECEIVED in this transaction, regardless of
+    whether it was later forwarded out in the same transaction (pass-through
+    trading pattern, common with trading bots/aggregators). Combines two signals:
 
-    FIX: Token balance changes are stored under the Associated Token Account (ATA)
-    address, NOT the main wallet address. So checking acc["account"] == wallet
-    always missed them — that entry has empty tokenBalanceChanges.
-
-    The correct approach is to scan ALL accounts' tokenBalanceChanges and check
-    the "userAccount" field inside each change, which maps the ATA back to its
-    owner wallet.
+    1. Direct tokenTransfers legs where toUserAccount == wallet
+       (catches "buy then immediately forward out" pass-through patterns)
+    2. accountData.tokenBalanceChanges where userAccount == wallet and balance rose
+       (catches multi-hop swaps where the wallet doesn't appear as a direct
+       tokenTransfers leg but its net balance still changed)
     """
-    mints_bought = []
-    account_data = tx.get("accountData", []) or []
-    for acc in account_data:
+    mints_bought = set()
+
+    for transfer in tx.get("tokenTransfers", []) or []:
+        to_wallet = transfer.get("toUserAccount")
+        mint = transfer.get("mint")
+        if to_wallet == wallet and mint and mint != WSOL_MINT:
+            mints_bought.add(mint)
+
+    for acc in tx.get("accountData", []) or []:
         for change in acc.get("tokenBalanceChanges", []) or []:
-            # userAccount is the owner wallet — this is the correct field to match
             if change.get("userAccount") != wallet:
                 continue
             mint = change.get("mint")
             raw = change.get("rawTokenAmount", {}) or {}
-            amount = raw.get("tokenAmount")
             try:
-                amount_val = float(amount)
+                amount_val = float(raw.get("tokenAmount"))
             except (TypeError, ValueError):
                 continue
             if amount_val > 0 and mint and mint != WSOL_MINT:
-                mints_bought.append(mint)
-    return mints_bought
+                mints_bought.add(mint)
+
+    return list(mints_bought)
 
 
 # ---------- Wallet monitoring webhook (Helius) ----------
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """
-    FIX 2: Guard against None/empty body. If Helius sends a request with
-    an unexpected Content-Type or empty body, request.json returns None,
-    causing a TypeError crash that returned a 500 before any alert fired.
-    """
     data = request.json
 
-    # ✅ FIX 2: was missing — None body caused AttributeError crash downstream
     if not data:
         print("Webhook received empty or non-JSON body")
         return "no data", 400
@@ -431,19 +419,13 @@ def check_and_record_buy(wallet, mint):
 
         c.close()
     finally:
-        conn.close()  # ✅ always released even if exception is thrown
+        conn.close()
 
 
 # ---------- Periodic pump/momentum check (called by external cron) ----------
 
 @app.route("/check-pumps", methods=["GET", "POST"])
 def check_pumps():
-    """
-    FIX 3: Wrapped entire function in try/finally so the DB connection is
-    always closed, even if DexScreener times out or an exception is raised
-    mid-loop. Previously, a single exception would leave the connection open,
-    and after enough cron runs the pool would exhaust and every run would fail.
-    """
     conn = get_conn()
     c = conn.cursor()
     checked = 0
@@ -516,7 +498,6 @@ def check_pumps():
         return "error", 500
 
     finally:
-        # ✅ FIX 3: always runs — connection never leaks regardless of exceptions
         c.close()
         conn.close()
 
@@ -566,7 +547,6 @@ def telegram_webhook():
 @app.route("/")
 def home():
     return "Bot is alive!"
-
 
 
 if __name__ == "__main__":
