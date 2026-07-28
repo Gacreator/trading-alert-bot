@@ -31,6 +31,11 @@ QUEEN_SYSTEM_PROMPT = (
 
 SOLANA_ADDRESS_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 
+# Simple in-process lock so two overlapping /check-pumps triggers
+# (e.g. a cron retry firing while the previous run is still going)
+# don't both spin up scan threads at once.
+_check_pumps_lock = threading.Lock()
+
 
 def looks_like_solana_address(text):
     return bool(SOLANA_ADDRESS_RE.match(text.strip()))
@@ -59,7 +64,7 @@ def init_db():
                 PRIMARY KEY (wallet, token_mint)
             )
         """)
-        # ✅ FIX 4: Migrate existing tables that are missing columns.
+        # Migrate existing tables that are missing columns.
         # CREATE TABLE IF NOT EXISTS skips creation on redeploy, so any
         # columns added after the table was first created never get added.
         # ADD COLUMN IF NOT EXISTS is a no-op if the column already exists.
@@ -81,10 +86,9 @@ init_db()
 
 def send_telegram_alert(message, chat_id=None):
     """
-    FIX 1: Changed data= to json= so that booleans and other types
-    are serialized correctly, and Content-Type is set to application/json.
-    Previously, data= sent form-encoded strings, causing Telegram to reject
-    the disable_web_page_preview field and sometimes the entire request.
+    Uses json= (not data=) so booleans/types serialize correctly and
+    Content-Type is set to application/json. data= would form-encode
+    everything as strings, which Telegram can reject.
     """
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -94,7 +98,7 @@ def send_telegram_alert(message, chat_id=None):
         "disable_web_page_preview": True
     }
     try:
-        resp = requests.post(url, json=payload, timeout=5)  # ✅ FIX 1: was data=payload
+        resp = requests.post(url, json=payload, timeout=5)
         print(f"Telegram response: {resp.status_code} {resp.text}")
     except Exception as e:
         print(f"Failed to send Telegram alert: {e}")
@@ -364,13 +368,12 @@ def extract_wallet_buys(tx, wallet):
 @app.route("/webhook", methods=["POST"])
 def webhook():
     """
-    FIX 2: Guard against None/empty body. If Helius sends a request with
-    an unexpected Content-Type or empty body, request.json returns None,
+    Guard against None/empty body. If Helius sends a request with an
+    unexpected Content-Type or empty body, request.json returns None,
     causing a TypeError crash that returned a 500 before any alert fired.
     """
     data = request.json
 
-    # ✅ FIX 2: was missing — None body caused AttributeError crash downstream
     if not data:
         print("Webhook received empty or non-JSON body")
         return "no data", 400
@@ -447,18 +450,22 @@ def check_and_record_buy(wallet, mint):
 
         c.close()
     finally:
-        conn.close()  # ✅ always released even if exception is thrown
+        conn.close()
 
 
 # ---------- Periodic pump/momentum check (called by external cron) ----------
 
-@app.route("/check-pumps", methods=["GET", "POST"])
-def check_pumps():
+def run_pump_check():
     """
-    FIX 3: Wrapped entire function in try/finally so the DB connection is
-    always closed, even if DexScreener times out or an exception is raised
-    mid-loop. Previously, a single exception would leave the connection open,
-    and after enough cron runs the pool would exhaust and every run would fail.
+    The actual scan logic, run in a background thread so the /check-pumps
+    HTTP handler can return immediately. This is what used to run directly
+    inside the request handler — moved out so cron-job.org (30s timeout)
+    never has to wait on it.
+
+    Wrapped in try/finally so the DB connection is always closed, even if
+    DexScreener times out or an exception is raised mid-loop — otherwise a
+    single exception leaves the connection open and eventually exhausts
+    the pool.
     """
     conn = get_conn()
     c = conn.cursor()
@@ -525,16 +532,36 @@ def check_pumps():
                     )
                     conn.commit()
 
-        return f"checked {checked} tokens", 200
+        print(f"check_pumps finished — checked {checked} tokens")
 
     except Exception as e:
         print(f"check_pumps error: {e}")
-        return "error", 500
 
     finally:
-        # ✅ FIX 3: always runs — connection never leaks regardless of exceptions
         c.close()
         conn.close()
+        _check_pumps_lock.release()
+
+
+@app.route("/check-pumps", methods=["GET", "POST"])
+def check_pumps():
+    """
+    Kicks off run_pump_check() in a background thread and returns
+    immediately. cron-job.org (30s timeout on the free plan) gets its
+    200 OK in milliseconds; the actual DexScreener scan — which can take
+    well over 30s once you're tracking a few dozen tokens — keeps running
+    after the HTTP response is already sent.
+
+    The lock prevents a second overlapping trigger (e.g. a retry firing
+    while the previous scan is still running) from starting a second scan
+    on top of the first.
+    """
+    if not _check_pumps_lock.acquire(blocking=False):
+        print("check-pumps already running, skipping this trigger")
+        return "already running", 200
+
+    threading.Thread(target=run_pump_check, daemon=True).start()
+    return "started", 200
 
 
 # ---------- Telegram incoming messages webhook ----------
@@ -584,7 +611,9 @@ def home():
     return "Bot is alive!"
 
 
-
 if __name__ == "__main__":
+    # Note: this dev-server path is only used for local testing.
+    # On Render, use the gunicorn start command in the Procfile instead —
+    # see Procfile and the deployment notes shared alongside this file.
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
