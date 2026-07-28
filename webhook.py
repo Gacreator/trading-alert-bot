@@ -86,6 +86,15 @@ def init_db():
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS max_multiplier_seen NUMERIC")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS last_checked_at TIMESTAMP")
 
+        # Downside tracking — the counterpart to max_price_seen/max_multiplier_seen.
+        # min_price_seen + max_drawdown_seen let you find rugs/dead tokens the
+        # same way max_multiplier_seen lets you find pumps. last_liquidity is
+        # kept so each scan can compute how much liquidity moved since the
+        # previous scan (a sudden drop is the strongest single rug signal).
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS min_price_seen NUMERIC")
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS max_drawdown_seen NUMERIC")
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS last_liquidity NUMERIC")
+
         # Full snapshot of every score_momentum() call, whether or not it
         # crossed the alert threshold. This is the raw data for finding
         # patterns later — what liquidity/volume/price-change/buy-sell
@@ -107,12 +116,18 @@ def init_db():
                 sells_5m INTEGER,
                 momentum_score NUMERIC,
                 multiplier_from_first_buy NUMERIC,
+                drawdown_from_first_buy NUMERIC,
+                liquidity_delta_pct NUMERIC,
                 momentum_alert_fired BOOLEAN DEFAULT FALSE,
                 pump_alert_fired BOOLEAN DEFAULT FALSE
             )
         """)
         c.execute("CREATE INDEX IF NOT EXISTS idx_scan_log_mint ON token_scan_log (token_mint)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_scan_log_scanned_at ON token_scan_log (scanned_at)")
+        # Migrate scan log for deployments that created the table before
+        # these two columns existed.
+        c.execute("ALTER TABLE token_scan_log ADD COLUMN IF NOT EXISTS drawdown_from_first_buy NUMERIC")
+        c.execute("ALTER TABLE token_scan_log ADD COLUMN IF NOT EXISTS liquidity_delta_pct NUMERIC")
 
         conn.commit()
         c.close()
@@ -514,7 +529,7 @@ def run_pump_check():
 
     try:
         c.execute("""
-            SELECT wallet, token_mint, price_at_first_buy, pumped_3x_alerted, momentum_alerted
+            SELECT wallet, token_mint, price_at_first_buy, pumped_3x_alerted, momentum_alerted, last_liquidity
             FROM wallet_token_history
             WHERE first_seen_at > NOW() - (INTERVAL '1 hour' * %s)
             AND (pumped_3x_alerted = FALSE OR momentum_alerted = FALSE)
@@ -522,7 +537,7 @@ def run_pump_check():
         rows = c.fetchall()
         print(f"Checking {len(rows)} tokens for pumps/momentum...")
 
-        for wallet, mint, price_at_first_buy, pumped_alerted, momentum_alerted in rows:
+        for wallet, mint, price_at_first_buy, pumped_alerted, momentum_alerted, prev_liquidity in rows:
             pair = get_dexscreener_full(mint)
             if not pair:
                 continue
@@ -550,19 +565,48 @@ def run_pump_check():
                 except (TypeError, ValueError, ZeroDivisionError):
                     multiplier = None
 
+            # Drawdown: how far below the first-buy price this token has
+            # fallen, as a positive fraction (0.8 = down 80%). This is the
+            # downside counterpart to `multiplier` — the raw material for
+            # spotting rugs/dead tokens the same way multiplier is used to
+            # spot pumps.
+            drawdown = None
+            if price_at_first_buy and current_price:
+                try:
+                    drawdown = max(0.0, 1 - (current_price / float(price_at_first_buy)))
+                except (TypeError, ValueError, ZeroDivisionError):
+                    drawdown = None
+
+            # Liquidity delta since the last scan of this token. A liquidity
+            # pool draining fast (large negative delta) is one of the
+            # clearest early rug signals — much sharper than price alone,
+            # since price can be volatile on low volume before liquidity
+            # actually gets pulled.
+            current_liquidity = details.get("liquidity")
+            liquidity_delta_pct = None
+            if current_liquidity is not None and prev_liquidity:
+                try:
+                    liquidity_delta_pct = (float(current_liquidity) - float(prev_liquidity)) / float(prev_liquidity)
+                except (TypeError, ValueError, ZeroDivisionError):
+                    liquidity_delta_pct = None
+
             # Ground-truth outcome tracking — updated every scan whether or
             # not any alert fires, so you can later see what a token
-            # actually peaked at even if the bot never flagged it.
+            # actually peaked/bottomed at even if the bot never flagged it.
             if current_price is not None:
                 c.execute(
                     """
                     UPDATE wallet_token_history
                     SET last_checked_at = NOW(),
                         max_price_seen = GREATEST(COALESCE(max_price_seen, 0), %s),
-                        max_multiplier_seen = GREATEST(COALESCE(max_multiplier_seen, 0), COALESCE(%s, 0))
+                        max_multiplier_seen = GREATEST(COALESCE(max_multiplier_seen, 0), COALESCE(%s, 0)),
+                        min_price_seen = LEAST(COALESCE(min_price_seen, %s), %s),
+                        max_drawdown_seen = GREATEST(COALESCE(max_drawdown_seen, 0), COALESCE(%s, 0)),
+                        last_liquidity = COALESCE(%s, last_liquidity)
                     WHERE wallet=%s AND token_mint=%s
                     """,
-                    (current_price, multiplier, wallet, mint)
+                    (current_price, multiplier, current_price, current_price,
+                     drawdown, current_liquidity, wallet, mint)
                 )
 
             momentum_alert_fired = False
@@ -606,15 +650,17 @@ def run_pump_check():
                 INSERT INTO token_scan_log
                     (wallet, token_mint, price, liquidity, vol_5m, vol_h1,
                      pc_5m, pc_h1, pc_h6, buys_5m, sells_5m, momentum_score,
-                     multiplier_from_first_buy, momentum_alert_fired, pump_alert_fired)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     multiplier_from_first_buy, drawdown_from_first_buy,
+                     liquidity_delta_pct, momentum_alert_fired, pump_alert_fired)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     wallet, mint, current_price, details.get("liquidity"),
                     details.get("vol_5m"), details.get("vol_h1"),
                     details.get("pc_5m"), details.get("pc_h1"), details.get("pc_h6"),
                     details.get("buys_5m"), details.get("sells_5m"), score,
-                    multiplier, momentum_alert_fired, pump_alert_fired
+                    multiplier, drawdown, liquidity_delta_pct,
+                    momentum_alert_fired, pump_alert_fired
                 )
             )
 
