@@ -10,6 +10,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+HELIUS_API_KEY = os.environ.get("HELIUS_API_KEY")
 
 TRACKED_WALLETS = set(
     w.strip() for w in os.environ.get("TRACKED_WALLETS", "").split(",") if w.strip()
@@ -299,19 +300,14 @@ def score_momentum(pair):
     return round(score), details
 
 
-# ---------- Wallet buy detection (combined: direct transfer + balance change) ----------
+# ---------- Wallet buy detection (combined signals + Helius re-parse fallback) ----------
 
 def extract_wallet_buys(tx, wallet):
     """
-    Detects any token this wallet RECEIVED in this transaction, regardless of
-    whether it was later forwarded out in the same transaction (pass-through
-    trading pattern, common with trading bots/aggregators). Combines two signals:
-
-    1. Direct tokenTransfers legs where toUserAccount == wallet
-       (catches "buy then immediately forward out" pass-through patterns)
+    Detects any token this wallet RECEIVED in this transaction. Combines two signals:
+    1. Direct tokenTransfers legs where toUserAccount == wallet (pass-through buys)
     2. accountData.tokenBalanceChanges where userAccount == wallet and balance rose
-       (catches multi-hop swaps where the wallet doesn't appear as a direct
-       tokenTransfers leg but its net balance still changed)
+       (multi-hop swaps)
     """
     mints_bought = set()
 
@@ -337,6 +333,25 @@ def extract_wallet_buys(tx, wallet):
     return list(mints_bought)
 
 
+def parse_transaction_via_helius(signature):
+    """
+    Fallback: ask Helius's dedicated Parse Transaction API to re-parse a
+    signature on demand. Sometimes resolves complex ALT/router transactions
+    that the initial webhook payload didn't fully resolve.
+    """
+    if not HELIUS_API_KEY or not signature:
+        return None
+    try:
+        url = f"https://api.helius.xyz/v0/transactions/?api-key={HELIUS_API_KEY}"
+        resp = requests.post(url, json={"transactions": [signature]}, timeout=10)
+        data = resp.json()
+        if isinstance(data, list) and data:
+            return data[0]
+    except Exception as e:
+        print(f"Helius parse-transaction fallback error: {e}")
+    return None
+
+
 # ---------- Wallet monitoring webhook (Helius) ----------
 
 @app.route("/webhook", methods=["POST"])
@@ -355,8 +370,21 @@ def webhook():
     for tx in transactions:
         if not isinstance(tx, dict):
             continue
+
+        fee_payer = tx.get("feePayer")
+        signature = tx.get("signature")
+
         for wallet in TRACKED_WALLETS:
             mints = extract_wallet_buys(tx, wallet)
+
+            if not mints and fee_payer == wallet and signature:
+                print(f"No mints found for signer {wallet}, trying fallback parse for {signature}")
+                reparsed = parse_transaction_via_helius(signature)
+                if reparsed:
+                    mints = extract_wallet_buys(reparsed, wallet)
+                    if mints:
+                        print(f"Fallback parse succeeded: found {mints}")
+
             for mint in mints:
                 check_and_record_buy(wallet, mint)
 
