@@ -1,6 +1,7 @@
 from flask import Flask, request
 import os
 import re
+import time
 import psycopg2
 import requests
 import threading
@@ -20,6 +21,7 @@ MIN_LIQUIDITY_USD = 3000
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 
 SCAN_WINDOW_HOURS = int(os.environ.get("SCAN_WINDOW_HOURS", "168"))  # 7 days default
+DEXSCREENER_REQUEST_DELAY = float(os.environ.get("DEXSCREENER_REQUEST_DELAY", "0.3"))
 
 QUEEN_SYSTEM_PROMPT = (
     "You are 'Queen' — the user's witty, confident friend who happens to run a Solana trading "
@@ -192,9 +194,19 @@ def get_pumpfun_data(mint):
 
 
 def get_dexscreener_full(mint):
+    """
+    Fetch DexScreener pair data for a mint. Returns None (never raises) on
+    any failure — including rate-limiting, which shows up as an empty or
+    non-JSON body rather than a clean error status. Checking status_code
+    and response text before calling .json() avoids the
+    "Expecting value: line 1 column 1 (char 0)" crash spam that happens
+    when DexScreener returns an empty body under rate limiting.
+    """
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
         resp = requests.get(url, timeout=5)
+        if resp.status_code != 200 or not resp.text.strip():
+            return None
         data = resp.json()
         pairs = data.get("pairs") or []
         if not pairs:
@@ -202,7 +214,7 @@ def get_dexscreener_full(mint):
         pair = max(pairs, key=lambda p: p.get("liquidity", {}).get("usd", 0) or 0)
         return pair
     except Exception as e:
-        print(f"DexScreener error: {e}")
+        print(f"DexScreener error for {mint}: {e}")
         return None
 
 
@@ -300,11 +312,6 @@ def handle_lore_request(mint, chat_id):
 
 
 def explain_pump(mint, price_at_recommendation, current_price, multiplier, recommended_at):
-    """
-    Grounds the 'why' explanation strictly in real before/after scan data —
-    no speculation about news, influencers, or unverifiable causes. Compares
-    the scan closest to the recommendation moment against the current scan.
-    """
     conn = get_conn()
     try:
         c = conn.cursor()
@@ -473,13 +480,6 @@ def webhook():
 
 
 def check_and_record_buy(wallet, mint):
-    """
-    Records first buys and repeat buys for tracking/analysis (they still
-    feed max_multiplier_seen and max_drawdown_seen, so /stats and /analyze
-    keep working exactly as before). No Telegram alerts here — those now
-    only come from run_pump_check(): the score-based recommendation, and
-    the pump-confirmation alert measured from that recommendation.
-    """
     conn = get_conn()
     try:
         c = conn.cursor()
@@ -538,6 +538,8 @@ def run_pump_check():
              recommended_at) in rows:
 
             pair = get_dexscreener_full(mint)
+            time.sleep(DEXSCREENER_REQUEST_DELAY)  # gentler pacing to avoid rate limiting
+
             if not pair:
                 continue
             checked += 1
