@@ -47,7 +47,22 @@ def looks_like_solana_address(text):
 # ---------- DB ----------
 
 def get_conn():
-    return psycopg2.connect(DATABASE_URL)
+    """
+    connect_timeout caps how long we wait to establish a connection.
+    The keepalives settings make psycopg2 send TCP-level keepalive packets
+    every 10s after 30s idle, up to 5 times before giving up — this is what
+    was missing before, and is the likely reason Neon's connection was
+    silently dying ("SSL connection has been closed unexpectedly") partway
+    through a long scan cycle with 1,600+ tokens.
+    """
+    return psycopg2.connect(
+        DATABASE_URL,
+        connect_timeout=10,
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=5,
+    )
 
 
 def init_db():
@@ -517,13 +532,14 @@ def check_and_record_buy(wallet, mint):
 
 def run_pump_check():
     """
-    conn/c start as None and only get assigned inside the try block. This
-    matters because if get_conn() itself fails (network hiccup, Neon compute
-    waking up slowly, etc.), the function used to crash BEFORE reaching any
-    try/finally, which meant _check_pumps_lock never got released — every
-    future cron trigger would then just log "already running, skipping"
-    forever, silently killing all pump/momentum checks until a manual
-    restart. Now the lock always releases no matter what fails.
+    Two layers of resilience now:
+    1. get_conn() uses TCP keepalives so the connection is much less likely
+       to be silently dropped mid-scan by Neon during a long-running cycle.
+    2. Each token's processing is wrapped in its own try/except. If the DB
+       connection still drops mid-loop (psycopg2.OperationalError), we
+       reconnect and continue with the remaining tokens instead of losing
+       the whole cycle — previously a single connection drop on token #500
+       of 1,600 would abort everything after it.
     """
     conn = None
     c = None
@@ -555,146 +571,165 @@ def run_pump_check():
              prev_liquidity, price_at_recommendation, pumped_since_rec_alerted,
              recommended_at, market_cap_at_recommendation) in rows:
 
-            pair = pairs_by_mint.get(mint)
-            if not pair:
-                continue
-            checked += 1
-
-            current_price = None
             try:
-                current_price = float(pair.get("priceUsd"))
-            except (TypeError, ValueError):
-                pass
+                pair = pairs_by_mint.get(mint)
+                if not pair:
+                    continue
+                checked += 1
 
-            current_market_cap = pair.get("fdv", 0) or 0
-            dexscreener_url = f"https://dexscreener.com/solana/{mint}"
-
-            multiplier_from_first_buy = None
-            if price_at_first_buy and current_price:
+                current_price = None
                 try:
-                    multiplier_from_first_buy = current_price / float(price_at_first_buy)
-                except (TypeError, ValueError, ZeroDivisionError):
-                    multiplier_from_first_buy = None
+                    current_price = float(pair.get("priceUsd"))
+                except (TypeError, ValueError):
+                    pass
 
-            drawdown = None
-            if price_at_first_buy and current_price:
-                try:
-                    drawdown = max(0.0, 1 - (current_price / float(price_at_first_buy)))
-                except (TypeError, ValueError, ZeroDivisionError):
-                    drawdown = None
+                current_market_cap = pair.get("fdv", 0) or 0
+                dexscreener_url = f"https://dexscreener.com/solana/{mint}"
 
-            current_liquidity_raw = pair.get("liquidity", {}).get("usd", 0) or 0
-            liquidity_delta_pct = None
-            if current_liquidity_raw is not None and prev_liquidity:
-                try:
-                    liquidity_delta_pct = (float(current_liquidity_raw) - float(prev_liquidity)) / float(prev_liquidity)
-                except (TypeError, ValueError, ZeroDivisionError):
-                    liquidity_delta_pct = None
+                multiplier_from_first_buy = None
+                if price_at_first_buy and current_price:
+                    try:
+                        multiplier_from_first_buy = current_price / float(price_at_first_buy)
+                    except (TypeError, ValueError, ZeroDivisionError):
+                        multiplier_from_first_buy = None
 
-            score, details = score_momentum(pair, liquidity_delta_pct)
-            current_liquidity = details.get("liquidity")
+                drawdown = None
+                if price_at_first_buy and current_price:
+                    try:
+                        drawdown = max(0.0, 1 - (current_price / float(price_at_first_buy)))
+                    except (TypeError, ValueError, ZeroDivisionError):
+                        drawdown = None
 
-            multiplier_since_recommendation = None
-            if price_at_recommendation and current_price:
-                try:
-                    multiplier_since_recommendation = current_price / float(price_at_recommendation)
-                except (TypeError, ValueError, ZeroDivisionError):
-                    multiplier_since_recommendation = None
+                current_liquidity_raw = pair.get("liquidity", {}).get("usd", 0) or 0
+                liquidity_delta_pct = None
+                if current_liquidity_raw is not None and prev_liquidity:
+                    try:
+                        liquidity_delta_pct = (float(current_liquidity_raw) - float(prev_liquidity)) / float(prev_liquidity)
+                    except (TypeError, ValueError, ZeroDivisionError):
+                        liquidity_delta_pct = None
 
-            if current_price is not None:
-                c.execute(
-                    """
-                    UPDATE wallet_token_history
-                    SET last_checked_at = NOW(),
-                        max_price_seen = GREATEST(COALESCE(max_price_seen, 0), %s),
-                        max_multiplier_seen = GREATEST(COALESCE(max_multiplier_seen, 0), COALESCE(%s, 0)),
-                        min_price_seen = LEAST(COALESCE(min_price_seen, %s), %s),
-                        max_drawdown_seen = GREATEST(COALESCE(max_drawdown_seen, 0), COALESCE(%s, 0)),
-                        last_liquidity = COALESCE(%s, last_liquidity),
-                        max_multiplier_since_recommendation = GREATEST(
-                            COALESCE(max_multiplier_since_recommendation, 0),
-                            COALESCE(%s, 0)
-                        )
-                    WHERE wallet=%s AND token_mint=%s
-                    """,
-                    (current_price, multiplier_from_first_buy, current_price, current_price,
-                     drawdown, current_liquidity, multiplier_since_recommendation, wallet, mint)
-                )
+                score, details = score_momentum(pair, liquidity_delta_pct)
+                current_liquidity = details.get("liquidity")
 
-            momentum_alert_fired = False
-            pump_alert_fired = False
+                multiplier_since_recommendation = None
+                if price_at_recommendation and current_price:
+                    try:
+                        multiplier_since_recommendation = current_price / float(price_at_recommendation)
+                    except (TypeError, ValueError, ZeroDivisionError):
+                        multiplier_since_recommendation = None
 
-            if not momentum_alerted and score >= 70:
-                momentum_alert_fired = True
-                c.execute(
-                    """
-                    UPDATE wallet_token_history
-                    SET momentum_alerted = TRUE,
-                        price_at_recommendation = %s,
-                        recommended_at = NOW(),
-                        market_cap_at_recommendation = %s
-                    WHERE wallet=%s AND token_mint=%s
-                    """,
-                    (current_price, current_market_cap, wallet, mint)
-                )
-                send_telegram_alert(
-                    f"🚀 Heating up (score {score}/100)\n"
-                    f"Wallet: <code>{wallet}</code>\n"
-                    f"Token: <code>{mint}</code>\n\n"
-                    f"Market cap: ${current_market_cap:,.0f}\n"
-                    f"Liquidity: ${details.get('liquidity', 0):.0f}"
-                    + (f" (Δ {liquidity_delta_pct*100:.1f}% since last scan)" if liquidity_delta_pct is not None else "")
-                    + f"\n5m volume: ${details.get('vol_5m', 0):.0f} (1h: ${details.get('vol_h1', 0):.0f})\n"
-                    f"Price change 5m/1h/6h: {details.get('pc_5m')}% / {details.get('pc_h1')}% / {details.get('pc_h6')}%\n\n"
-                    f"📊 DexScreener: {dexscreener_url}\n\n"
-                    f"Recommending this now — tracking from this price to see if it delivers. DYOR."
-                )
-
-            elif (not pumped_since_rec_alerted and price_at_recommendation
-                  and multiplier_since_recommendation and multiplier_since_recommendation >= 3):
-                pump_alert_fired = True
-                mc_line = ""
-                if market_cap_at_recommendation:
-                    mc_line = (
-                        f"Market cap then: ${float(market_cap_at_recommendation):,.0f} → "
-                        f"now: ${current_market_cap:,.0f}\n"
+                if current_price is not None:
+                    c.execute(
+                        """
+                        UPDATE wallet_token_history
+                        SET last_checked_at = NOW(),
+                            max_price_seen = GREATEST(COALESCE(max_price_seen, 0), %s),
+                            max_multiplier_seen = GREATEST(COALESCE(max_multiplier_seen, 0), COALESCE(%s, 0)),
+                            min_price_seen = LEAST(COALESCE(min_price_seen, %s), %s),
+                            max_drawdown_seen = GREATEST(COALESCE(max_drawdown_seen, 0), COALESCE(%s, 0)),
+                            last_liquidity = COALESCE(%s, last_liquidity),
+                            max_multiplier_since_recommendation = GREATEST(
+                                COALESCE(max_multiplier_since_recommendation, 0),
+                                COALESCE(%s, 0)
+                            )
+                        WHERE wallet=%s AND token_mint=%s
+                        """,
+                        (current_price, multiplier_from_first_buy, current_price, current_price,
+                         drawdown, current_liquidity, multiplier_since_recommendation, wallet, mint)
                     )
-                send_telegram_alert(
-                    f"🎯 RECOMMENDATION PAID OFF — {multiplier_since_recommendation:.1f}x since recommended!\n"
-                    f"Wallet: <code>{wallet}</code>\n"
-                    f"Token: <code>{mint}</code>\n"
-                    f"Price at recommendation: ${price_at_recommendation} → now: ${current_price}\n"
-                    f"{mc_line}\n"
-                    f"📊 DexScreener: {dexscreener_url}\n\n"
-                    f"Type <code>/why {mint}</code> if you want the breakdown of what actually moved."
-                )
+
+                momentum_alert_fired = False
+                pump_alert_fired = False
+
+                if not momentum_alerted and score >= 70:
+                    momentum_alert_fired = True
+                    c.execute(
+                        """
+                        UPDATE wallet_token_history
+                        SET momentum_alerted = TRUE,
+                            price_at_recommendation = %s,
+                            recommended_at = NOW(),
+                            market_cap_at_recommendation = %s
+                        WHERE wallet=%s AND token_mint=%s
+                        """,
+                        (current_price, current_market_cap, wallet, mint)
+                    )
+                    send_telegram_alert(
+                        f"🚀 Heating up (score {score}/100)\n"
+                        f"Wallet: <code>{wallet}</code>\n"
+                        f"Token: <code>{mint}</code>\n\n"
+                        f"Market cap: ${current_market_cap:,.0f}\n"
+                        f"Liquidity: ${details.get('liquidity', 0):.0f}"
+                        + (f" (Δ {liquidity_delta_pct*100:.1f}% since last scan)" if liquidity_delta_pct is not None else "")
+                        + f"\n5m volume: ${details.get('vol_5m', 0):.0f} (1h: ${details.get('vol_h1', 0):.0f})\n"
+                        f"Price change 5m/1h/6h: {details.get('pc_5m')}% / {details.get('pc_h1')}% / {details.get('pc_h6')}%\n\n"
+                        f"📊 DexScreener: {dexscreener_url}\n\n"
+                        f"Recommending this now — tracking from this price to see if it delivers. DYOR."
+                    )
+
+                elif (not pumped_since_rec_alerted and price_at_recommendation
+                      and multiplier_since_recommendation and multiplier_since_recommendation >= 3):
+                    pump_alert_fired = True
+                    mc_line = ""
+                    if market_cap_at_recommendation:
+                        mc_line = (
+                            f"Market cap then: ${float(market_cap_at_recommendation):,.0f} → "
+                            f"now: ${current_market_cap:,.0f}\n"
+                        )
+                    send_telegram_alert(
+                        f"🎯 RECOMMENDATION PAID OFF — {multiplier_since_recommendation:.1f}x since recommended!\n"
+                        f"Wallet: <code>{wallet}</code>\n"
+                        f"Token: <code>{mint}</code>\n"
+                        f"Price at recommendation: ${price_at_recommendation} → now: ${current_price}\n"
+                        f"{mc_line}\n"
+                        f"📊 DexScreener: {dexscreener_url}\n\n"
+                        f"Type <code>/why {mint}</code> if you want the breakdown of what actually moved."
+                    )
+                    c.execute(
+                        "UPDATE wallet_token_history SET pumped_since_recommendation_alerted = TRUE WHERE wallet=%s AND token_mint=%s",
+                        (wallet, mint)
+                    )
+
                 c.execute(
-                    "UPDATE wallet_token_history SET pumped_since_recommendation_alerted = TRUE WHERE wallet=%s AND token_mint=%s",
-                    (wallet, mint)
+                    """
+                    INSERT INTO token_scan_log
+                        (wallet, token_mint, price, liquidity, vol_5m, vol_h1,
+                         pc_5m, pc_h1, pc_h6, buys_5m, sells_5m, momentum_score,
+                         multiplier_from_first_buy, drawdown_from_first_buy,
+                         liquidity_delta_pct, momentum_alert_fired, pump_alert_fired,
+                         multiplier_since_recommendation, market_cap)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        wallet, mint, current_price, details.get("liquidity"),
+                        details.get("vol_5m"), details.get("vol_h1"),
+                        details.get("pc_5m"), details.get("pc_h1"), details.get("pc_h6"),
+                        details.get("buys_5m"), details.get("sells_5m"), score,
+                        multiplier_from_first_buy, drawdown, liquidity_delta_pct,
+                        momentum_alert_fired, pump_alert_fired, multiplier_since_recommendation,
+                        current_market_cap
+                    )
                 )
 
-            c.execute(
-                """
-                INSERT INTO token_scan_log
-                    (wallet, token_mint, price, liquidity, vol_5m, vol_h1,
-                     pc_5m, pc_h1, pc_h6, buys_5m, sells_5m, momentum_score,
-                     multiplier_from_first_buy, drawdown_from_first_buy,
-                     liquidity_delta_pct, momentum_alert_fired, pump_alert_fired,
-                     multiplier_since_recommendation, market_cap)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    wallet, mint, current_price, details.get("liquidity"),
-                    details.get("vol_5m"), details.get("vol_h1"),
-                    details.get("pc_5m"), details.get("pc_h1"), details.get("pc_h6"),
-                    details.get("buys_5m"), details.get("sells_5m"), score,
-                    multiplier_from_first_buy, drawdown, liquidity_delta_pct,
-                    momentum_alert_fired, pump_alert_fired, multiplier_since_recommendation,
-                    current_market_cap
-                )
-            )
+                conn.commit()
 
-            conn.commit()
+            except psycopg2.OperationalError as db_err:
+                print(f"DB connection dropped mid-scan on {mint}: {db_err} — reconnecting")
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                try:
+                    conn = get_conn()
+                    c = conn.cursor()
+                except Exception as reconnect_err:
+                    print(f"Reconnect failed: {reconnect_err}")
+                    break
+                continue
+
+            except Exception as e:
+                print(f"Error processing {mint}: {e}")
+                continue
 
         print(f"check_pumps finished — checked {checked} tokens")
 
