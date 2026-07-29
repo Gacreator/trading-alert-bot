@@ -19,9 +19,6 @@ TRACKED_WALLETS = set(
 MIN_LIQUIDITY_USD = 3000
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 
-# How long a token stays under active momentum/pump scanning after first
-# buy. Was hardcoded at 24h, which meant tokens that pumped later than
-# that silently dropped out of consideration and never got alerted.
 SCAN_WINDOW_HOURS = int(os.environ.get("SCAN_WINDOW_HOURS", "168"))  # 7 days default
 
 QUEEN_SYSTEM_PROMPT = (
@@ -36,9 +33,6 @@ QUEEN_SYSTEM_PROMPT = (
 
 SOLANA_ADDRESS_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 
-# Simple in-process lock so two overlapping /check-pumps triggers
-# (e.g. a cron retry firing while the previous run is still going)
-# don't both spin up scan threads at once.
 _check_pumps_lock = threading.Lock()
 
 
@@ -347,7 +341,7 @@ def score_momentum(pair):
     return round(score), details
 
 
-# ---------- Wallet buy detection (balance-change based, handles multi-hop) ----------
+# ---------- Wallet buy detection ----------
 
 def extract_wallet_buys(tx, wallet):
     mints_bought = []
@@ -469,7 +463,7 @@ def check_and_record_buy(wallet, mint):
         conn.close()
 
 
-# ---------- Periodic pump/momentum check (called by external cron) ----------
+# ---------- Periodic pump/momentum check ----------
 
 def run_pump_check():
     conn = get_conn()
@@ -716,12 +710,10 @@ def analyze():
     """
     Compares early scan behavior (first 3 scans after first buy) between
     tokens that eventually pumped 3x+ vs tokens that eventually rugged
-    (80%+ drawdown). Uses token_scan_log, which has a full snapshot of
-    every scan regardless of whether an alert fired — so this isn't
-    limited to tokens that happened to cross an alert threshold.
-
-    Read-only, no side effects. Meant to be checked periodically as more
-    data accumulates, not run once and trusted forever.
+    (80%+ drawdown). Filters to tokens whose FIRST scan showed liquidity
+    under $100k, so large/established tokens that simply drifted down
+    over time don't get miscounted as memecoin "rugs" and skew the
+    averages. Reports both mean and median for every metric.
     """
     conn = get_conn()
     try:
@@ -742,8 +734,19 @@ def analyze():
                 JOIN wallet_token_history h
                     ON h.wallet = s.wallet AND h.token_mint = s.token_mint
             ),
+            first_liquidity AS (
+                SELECT wallet, token_mint, liquidity AS starting_liquidity
+                FROM ranked_scans
+                WHERE scan_num = 1
+            ),
             early_scans AS (
-                SELECT * FROM ranked_scans WHERE scan_num <= 3
+                SELECT r.*
+                FROM ranked_scans r
+                JOIN first_liquidity f
+                    ON f.wallet = r.wallet AND f.token_mint = r.token_mint
+                WHERE r.scan_num <= 3
+                AND f.starting_liquidity IS NOT NULL
+                AND f.starting_liquidity < 100000
             ),
             categorized AS (
                 SELECT *,
@@ -757,15 +760,20 @@ def analyze():
             SELECT
                 bucket,
                 COUNT(DISTINCT (wallet, token_mint)) AS token_count,
-                AVG(
-                    CASE WHEN (buys_5m + sells_5m) > 0
-                    THEN buys_5m::float / (buys_5m + sells_5m) END
-                ) AS avg_buy_ratio,
+                AVG(CASE WHEN (buys_5m + sells_5m) > 0 THEN buys_5m::float / (buys_5m + sells_5m) END) AS avg_buy_ratio,
+                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY
+                    CASE WHEN (buys_5m + sells_5m) > 0 THEN buys_5m::float / (buys_5m + sells_5m) END
+                ) AS median_buy_ratio,
                 AVG(liquidity_delta_pct) AS avg_liquidity_delta_pct,
+                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY liquidity_delta_pct) AS median_liquidity_delta_pct,
                 AVG(vol_5m) AS avg_vol_5m,
+                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY vol_5m) AS median_vol_5m,
                 AVG(vol_h1) AS avg_vol_h1,
+                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY vol_h1) AS median_vol_h1,
                 AVG(momentum_score) AS avg_score,
-                AVG(liquidity) AS avg_liquidity
+                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY momentum_score) AS median_score,
+                AVG(liquidity) AS avg_liquidity,
+                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY liquidity) AS median_liquidity
             FROM categorized
             WHERE bucket IN ('pumped', 'rugged')
             GROUP BY bucket
@@ -775,21 +783,33 @@ def analyze():
         c.close()
 
         if not rows:
-            return "No scan data yet — needs at least one full scan cycle per tracked token first.", 200
+            return "No scan data yet under $100k starting liquidity — needs more small-cap tokens tracked first.", 200
 
-        lines = ["<b>Early-scan comparison (first 3 scans per token):</b><br>"]
+        lines = [
+            "<b>Early-scan comparison (first 3 scans, tokens starting under $100k liquidity):</b><br>"
+        ]
         data_by_bucket = {}
-        for (bucket, token_count, avg_buy_ratio, avg_liq_delta,
-             avg_vol_5m, avg_vol_h1, avg_score, avg_liquidity) in rows:
-            data_by_bucket[bucket] = {
-                "token_count": token_count,
-                "avg_buy_ratio": avg_buy_ratio,
-                "avg_liq_delta": avg_liq_delta,
-                "avg_vol_5m": avg_vol_5m,
-                "avg_vol_h1": avg_vol_h1,
-                "avg_score": avg_score,
-                "avg_liquidity": avg_liquidity,
-            }
+        cols = [
+            "bucket", "token_count",
+            "avg_buy_ratio", "median_buy_ratio",
+            "avg_liq_delta", "median_liq_delta",
+            "avg_vol_5m", "median_vol_5m",
+            "avg_vol_h1", "median_vol_h1",
+            "avg_score", "median_score",
+            "avg_liquidity", "median_liquidity",
+        ]
+        for row in rows:
+            d = dict(zip(cols, row))
+            data_by_bucket[d["bucket"]] = d
+
+        def fmt(val, kind="num"):
+            if val is None:
+                return "n/a"
+            if kind == "pct":
+                return f"{val*100:.1f}%"
+            if kind == "usd":
+                return f"${val:,.0f}"
+            return f"{val:.2f}"
 
         for bucket in ["pumped", "rugged"]:
             d = data_by_bucket.get(bucket)
@@ -797,12 +817,12 @@ def analyze():
                 lines.append(f"{bucket.upper()}: no examples yet<br>")
                 continue
             lines.append(f"<br><b>{bucket.upper()}</b> (n={d['token_count']} tokens)")
-            lines.append(f"Avg buy ratio (buys/(buys+sells)): {d['avg_buy_ratio']:.2f}" if d['avg_buy_ratio'] is not None else "Avg buy ratio: n/a")
-            lines.append(f"Avg liquidity change vs prior scan: {d['avg_liq_delta']*100:.1f}%" if d['avg_liq_delta'] is not None else "Avg liquidity change: n/a")
-            lines.append(f"Avg 5m volume: ${d['avg_vol_5m']:.0f}" if d['avg_vol_5m'] is not None else "Avg 5m volume: n/a")
-            lines.append(f"Avg 1h volume: ${d['avg_vol_h1']:.0f}" if d['avg_vol_h1'] is not None else "Avg 1h volume: n/a")
-            lines.append(f"Avg momentum score: {d['avg_score']:.1f}" if d['avg_score'] is not None else "Avg momentum score: n/a")
-            lines.append(f"Avg liquidity: ${d['avg_liquidity']:.0f}" if d['avg_liquidity'] is not None else "Avg liquidity: n/a")
+            lines.append(f"Buy ratio — avg: {fmt(d['avg_buy_ratio'])}, median: {fmt(d['median_buy_ratio'])}")
+            lines.append(f"Liquidity change vs prior scan — avg: {fmt(d['avg_liq_delta'], 'pct')}, median: {fmt(d['median_liq_delta'], 'pct')}")
+            lines.append(f"5m volume — avg: {fmt(d['avg_vol_5m'], 'usd')}, median: {fmt(d['median_vol_5m'], 'usd')}")
+            lines.append(f"1h volume — avg: {fmt(d['avg_vol_h1'], 'usd')}, median: {fmt(d['median_vol_h1'], 'usd')}")
+            lines.append(f"Momentum score — avg: {fmt(d['avg_score'])}, median: {fmt(d['median_score'])}")
+            lines.append(f"Liquidity — avg: {fmt(d['avg_liquidity'], 'usd')}, median: {fmt(d['median_liquidity'], 'usd')}")
 
         pumped_n = data_by_bucket.get("pumped", {}).get("token_count", 0)
         rugged_n = data_by_bucket.get("rugged", {}).get("token_count", 0)
@@ -810,11 +830,11 @@ def analyze():
         lines.append("<br><br>")
         if smaller < 20:
             lines.append(
-                f"⚠️ Smallest bucket only has {smaller} tokens — treat any gap above as "
-                f"noise until both buckets have 20-30+, per the /stats rule of thumb."
+                f"⚠️ Smallest bucket only has {smaller} tokens after the <$100k starting-liquidity "
+                f"filter — treat any gap above as noise until both buckets have 20-30+."
             )
         else:
-            lines.append(f"Sample sizes ({pumped_n} pumped, {rugged_n} rugged) are large enough to start trusting a consistent gap.")
+            lines.append(f"Sample sizes ({pumped_n} pumped, {rugged_n} rugged) still large enough to trust a consistent gap.")
 
         return "<br>".join(str(l) for l in lines), 200
 
