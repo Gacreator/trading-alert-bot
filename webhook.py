@@ -2,9 +2,10 @@ from flask import Flask, request
 import os
 import re
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import psycopg2
 import requests
-import threading
 
 app = Flask(__name__)
 
@@ -21,7 +22,7 @@ MIN_LIQUIDITY_USD = 3000
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 
 SCAN_WINDOW_HOURS = int(os.environ.get("SCAN_WINDOW_HOURS", "168"))  # 7 days default
-DEXSCREENER_REQUEST_DELAY = float(os.environ.get("DEXSCREENER_REQUEST_DELAY", "0.3"))
+MAX_CONCURRENT_DEXSCREENER = int(os.environ.get("MAX_CONCURRENT_DEXSCREENER", "5"))
 
 QUEEN_SYSTEM_PROMPT = (
     "You are 'Queen' — the user's witty, confident friend who happens to run a Solana trading "
@@ -36,6 +37,7 @@ QUEEN_SYSTEM_PROMPT = (
 SOLANA_ADDRESS_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 
 _check_pumps_lock = threading.Lock()
+_dex_rate_lock = threading.Semaphore(MAX_CONCURRENT_DEXSCREENER)
 
 
 def looks_like_solana_address(text):
@@ -83,6 +85,11 @@ def init_db():
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS max_multiplier_since_recommendation NUMERIC")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS pumped_since_recommendation_alerted BOOLEAN DEFAULT FALSE")
 
+        # New: market cap captured at the moment of recommendation, so the
+        # pump-confirmation alert can show "market cap then vs now" instead
+        # of just price.
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS market_cap_at_recommendation NUMERIC")
+
         c.execute("""
             CREATE TABLE IF NOT EXISTS token_scan_log (
                 id SERIAL PRIMARY KEY,
@@ -111,6 +118,7 @@ def init_db():
         c.execute("ALTER TABLE token_scan_log ADD COLUMN IF NOT EXISTS drawdown_from_first_buy NUMERIC")
         c.execute("ALTER TABLE token_scan_log ADD COLUMN IF NOT EXISTS liquidity_delta_pct NUMERIC")
         c.execute("ALTER TABLE token_scan_log ADD COLUMN IF NOT EXISTS multiplier_since_recommendation NUMERIC")
+        c.execute("ALTER TABLE token_scan_log ADD COLUMN IF NOT EXISTS market_cap NUMERIC")
 
         conn.commit()
         c.close()
@@ -197,10 +205,7 @@ def get_dexscreener_full(mint):
     """
     Fetch DexScreener pair data for a mint. Returns None (never raises) on
     any failure — including rate-limiting, which shows up as an empty or
-    non-JSON body rather than a clean error status. Checking status_code
-    and response text before calling .json() avoids the
-    "Expecting value: line 1 column 1 (char 0)" crash spam that happens
-    when DexScreener returns an empty body under rate limiting.
+    non-JSON body rather than a clean error status.
     """
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
@@ -216,6 +221,20 @@ def get_dexscreener_full(mint):
     except Exception as e:
         print(f"DexScreener error for {mint}: {e}")
         return None
+
+
+def get_dexscreener_full_ratelimited(mint):
+    """
+    Same as get_dexscreener_full, but bounded by a semaphore so at most
+    MAX_CONCURRENT_DEXSCREENER requests are in flight at once. Lets
+    run_pump_check() fetch many tokens in parallel (much faster overall
+    as tracked-token count grows into the thousands) while still capping
+    total concurrent load on DexScreener's API.
+    """
+    with _dex_rate_lock:
+        result = get_dexscreener_full(mint)
+        time.sleep(0.1)
+        return result
 
 
 def get_dexscreener_data(mint):
@@ -524,7 +543,8 @@ def run_pump_check():
         c.execute("""
             SELECT wallet, token_mint, price_at_first_buy, pumped_3x_alerted,
                    momentum_alerted, last_liquidity, price_at_recommendation,
-                   pumped_since_recommendation_alerted, recommended_at
+                   pumped_since_recommendation_alerted, recommended_at,
+                   market_cap_at_recommendation
             FROM wallet_token_history
             WHERE first_seen_at > NOW() - (INTERVAL '1 hour' * %s)
             AND (pumped_3x_alerted = FALSE OR momentum_alerted = FALSE
@@ -533,13 +553,16 @@ def run_pump_check():
         rows = c.fetchall()
         print(f"Checking {len(rows)} tokens for pumps/momentum...")
 
+        mints = [row[1] for row in rows]
+        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_DEXSCREENER) as executor:
+            pair_results = list(executor.map(get_dexscreener_full_ratelimited, mints))
+        pairs_by_mint = dict(zip(mints, pair_results))
+
         for (wallet, mint, price_at_first_buy, pumped_alerted, momentum_alerted,
              prev_liquidity, price_at_recommendation, pumped_since_rec_alerted,
-             recommended_at) in rows:
+             recommended_at, market_cap_at_recommendation) in rows:
 
-            pair = get_dexscreener_full(mint)
-            time.sleep(DEXSCREENER_REQUEST_DELAY)  # gentler pacing to avoid rate limiting
-
+            pair = pairs_by_mint.get(mint)
             if not pair:
                 continue
             checked += 1
@@ -550,6 +573,7 @@ def run_pump_check():
             except (TypeError, ValueError):
                 pass
 
+            current_market_cap = pair.get("fdv", 0) or 0
             dexscreener_url = f"https://dexscreener.com/solana/{mint}"
 
             multiplier_from_first_buy = None
@@ -614,15 +638,17 @@ def run_pump_check():
                     UPDATE wallet_token_history
                     SET momentum_alerted = TRUE,
                         price_at_recommendation = %s,
-                        recommended_at = NOW()
+                        recommended_at = NOW(),
+                        market_cap_at_recommendation = %s
                     WHERE wallet=%s AND token_mint=%s
                     """,
-                    (current_price, wallet, mint)
+                    (current_price, current_market_cap, wallet, mint)
                 )
                 send_telegram_alert(
                     f"🚀 Heating up (score {score}/100)\n"
                     f"Wallet: <code>{wallet}</code>\n"
                     f"Token: <code>{mint}</code>\n\n"
+                    f"Market cap: ${current_market_cap:,.0f}\n"
                     f"Liquidity: ${details.get('liquidity', 0):.0f}"
                     + (f" (Δ {liquidity_delta_pct*100:.1f}% since last scan)" if liquidity_delta_pct is not None else "")
                     + f"\n5m volume: ${details.get('vol_5m', 0):.0f} (1h: ${details.get('vol_h1', 0):.0f})\n"
@@ -634,11 +660,18 @@ def run_pump_check():
             elif (not pumped_since_rec_alerted and price_at_recommendation
                   and multiplier_since_recommendation and multiplier_since_recommendation >= 3):
                 pump_alert_fired = True
+                mc_line = ""
+                if market_cap_at_recommendation:
+                    mc_line = (
+                        f"Market cap then: ${float(market_cap_at_recommendation):,.0f} → "
+                        f"now: ${current_market_cap:,.0f}\n"
+                    )
                 send_telegram_alert(
                     f"🎯 RECOMMENDATION PAID OFF — {multiplier_since_recommendation:.1f}x since recommended!\n"
                     f"Wallet: <code>{wallet}</code>\n"
                     f"Token: <code>{mint}</code>\n"
-                    f"Price at recommendation: ${price_at_recommendation} → now: ${current_price}\n\n"
+                    f"Price at recommendation: ${price_at_recommendation} → now: ${current_price}\n"
+                    f"{mc_line}\n"
                     f"📊 DexScreener: {dexscreener_url}\n\n"
                     f"Type <code>/why {mint}</code> if you want the breakdown of what actually moved."
                 )
@@ -654,8 +687,8 @@ def run_pump_check():
                      pc_5m, pc_h1, pc_h6, buys_5m, sells_5m, momentum_score,
                      multiplier_from_first_buy, drawdown_from_first_buy,
                      liquidity_delta_pct, momentum_alert_fired, pump_alert_fired,
-                     multiplier_since_recommendation)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     multiplier_since_recommendation, market_cap)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     wallet, mint, current_price, details.get("liquidity"),
@@ -663,7 +696,8 @@ def run_pump_check():
                     details.get("pc_5m"), details.get("pc_h1"), details.get("pc_h6"),
                     details.get("buys_5m"), details.get("sells_5m"), score,
                     multiplier_from_first_buy, drawdown, liquidity_delta_pct,
-                    momentum_alert_fired, pump_alert_fired, multiplier_since_recommendation
+                    momentum_alert_fired, pump_alert_fired, multiplier_since_recommendation,
+                    current_market_cap
                 )
             )
 
@@ -977,7 +1011,7 @@ def token_history(mint):
                    pc_5m, pc_h1, pc_h6, buys_5m, sells_5m,
                    momentum_score, multiplier_from_first_buy,
                    liquidity_delta_pct, momentum_alert_fired, pump_alert_fired,
-                   multiplier_since_recommendation
+                   multiplier_since_recommendation, market_cap
             FROM token_scan_log
             WHERE token_mint = %s
             ORDER BY scanned_at ASC
@@ -992,7 +1026,7 @@ def token_history(mint):
         for i, row in enumerate(rows, 1):
             (scanned_at, price, liquidity, vol_5m, vol_h1, pc_5m, pc_h1, pc_h6,
              buys_5m, sells_5m, score, multiplier, liq_delta, mom_fired, pump_fired,
-             mult_since_rec) = row
+             mult_since_rec, market_cap) = row
 
             flags = []
             if mom_fired:
@@ -1003,7 +1037,8 @@ def token_history(mint):
 
             lines.append(
                 f"<br><b>Scan {i}</b> — {scanned_at} {flag_str}<br>"
-                f"Price: ${price} | Multiplier from first buy: {f'{multiplier:.2f}x' if multiplier else 'n/a'}"
+                f"Price: ${price} | Market cap: {f'${market_cap:,.0f}' if market_cap else 'n/a'} | "
+                f"Multiplier from first buy: {f'{multiplier:.2f}x' if multiplier else 'n/a'}"
                 + (f" | Since recommendation: {mult_since_rec:.2f}x" if mult_since_rec else "")
                 + f"<br>"
                 f"Liquidity: ${liquidity:,.0f} (Δ {f'{liq_delta*100:.1f}%' if liq_delta is not None else 'n/a'})<br>"
