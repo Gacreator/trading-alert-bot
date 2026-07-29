@@ -56,7 +56,6 @@ def init_db():
     conn = get_conn()
     try:
         c = conn.cursor()
-        # Create table if it doesn't exist at all
         c.execute("""
             CREATE TABLE IF NOT EXISTS wallet_token_history (
                 wallet TEXT,
@@ -69,36 +68,20 @@ def init_db():
                 PRIMARY KEY (wallet, token_mint)
             )
         """)
-        # Migrate existing tables that are missing columns.
-        # CREATE TABLE IF NOT EXISTS skips creation on redeploy, so any
-        # columns added after the table was first created never get added.
-        # ADD COLUMN IF NOT EXISTS is a no-op if the column already exists.
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS price_at_first_buy NUMERIC")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS pumped_3x_alerted BOOLEAN DEFAULT FALSE")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS momentum_alerted BOOLEAN DEFAULT FALSE")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS first_seen_at TIMESTAMP DEFAULT NOW()")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS buy_count INTEGER")
 
-        # Ground-truth outcome tracking: updated on every scan regardless of
-        # whether an alert fired, so tokens that pumped but never crossed the
-        # alert threshold still leave a record of what they actually did.
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS max_price_seen NUMERIC")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS max_multiplier_seen NUMERIC")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS last_checked_at TIMESTAMP")
 
-        # Downside tracking — the counterpart to max_price_seen/max_multiplier_seen.
-        # min_price_seen + max_drawdown_seen let you find rugs/dead tokens the
-        # same way max_multiplier_seen lets you find pumps. last_liquidity is
-        # kept so each scan can compute how much liquidity moved since the
-        # previous scan (a sudden drop is the strongest single rug signal).
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS min_price_seen NUMERIC")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS max_drawdown_seen NUMERIC")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS last_liquidity NUMERIC")
 
-        # Full snapshot of every score_momentum() call, whether or not it
-        # crossed the alert threshold. This is the raw data for finding
-        # patterns later — what liquidity/volume/price-change/buy-sell
-        # signals actually preceded a real pump vs. a token that fizzled.
         c.execute("""
             CREATE TABLE IF NOT EXISTS token_scan_log (
                 id SERIAL PRIMARY KEY,
@@ -124,8 +107,6 @@ def init_db():
         """)
         c.execute("CREATE INDEX IF NOT EXISTS idx_scan_log_mint ON token_scan_log (token_mint)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_scan_log_scanned_at ON token_scan_log (scanned_at)")
-        # Migrate scan log for deployments that created the table before
-        # these two columns existed.
         c.execute("ALTER TABLE token_scan_log ADD COLUMN IF NOT EXISTS drawdown_from_first_buy NUMERIC")
         c.execute("ALTER TABLE token_scan_log ADD COLUMN IF NOT EXISTS liquidity_delta_pct NUMERIC")
 
@@ -141,11 +122,6 @@ init_db()
 # ---------- Telegram helpers ----------
 
 def send_telegram_alert(message, chat_id=None):
-    """
-    Uses json= (not data=) so booleans/types serialize correctly and
-    Content-Type is set to application/json. data= would form-encode
-    everything as strings, which Telegram can reject.
-    """
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": chat_id or TELEGRAM_CHAT_ID,
@@ -374,19 +350,9 @@ def score_momentum(pair):
 # ---------- Wallet buy detection (balance-change based, handles multi-hop) ----------
 
 def extract_wallet_buys(tx, wallet):
-    """
-    Returns a list of mints the wallet received in this transaction.
-
-    Checks two places Helius puts token data:
-    1. tokenTransfers — toUserAccount matches wallet (most reliable)
-    2. accountData.tokenBalanceChanges — userAccount matches wallet (fallback)
-    Both are needed because Helius uses different fields depending on
-    the transaction type and routing path.
-    """
     mints_bought = []
     seen = set()
 
-    # Method 1: tokenTransfers (most common in swap transactions)
     for transfer in tx.get("tokenTransfers", []) or []:
         if transfer.get("toUserAccount") != wallet:
             continue
@@ -400,7 +366,6 @@ def extract_wallet_buys(tx, wallet):
             mints_bought.append(mint)
             seen.add(mint)
 
-    # Method 2: accountData.tokenBalanceChanges (fallback)
     for acc in tx.get("accountData", []) or []:
         for change in acc.get("tokenBalanceChanges", []) or []:
             if change.get("userAccount") != wallet:
@@ -423,11 +388,6 @@ def extract_wallet_buys(tx, wallet):
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """
-    Guard against None/empty body. If Helius sends a request with an
-    unexpected Content-Type or empty body, request.json returns None,
-    causing a TypeError crash that returned a 500 before any alert fired.
-    """
     data = request.json
 
     if not data:
@@ -512,17 +472,6 @@ def check_and_record_buy(wallet, mint):
 # ---------- Periodic pump/momentum check (called by external cron) ----------
 
 def run_pump_check():
-    """
-    The actual scan logic, run in a background thread so the /check-pumps
-    HTTP handler can return immediately. This is what used to run directly
-    inside the request handler — moved out so cron-job.org (30s timeout)
-    never has to wait on it.
-
-    Wrapped in try/finally so the DB connection is always closed, even if
-    DexScreener times out or an exception is raised mid-loop — otherwise a
-    single exception leaves the connection open and eventually exhausts
-    the pool.
-    """
     conn = get_conn()
     c = conn.cursor()
     checked = 0
@@ -551,11 +500,6 @@ def run_pump_check():
 
             dexscreener_url = f"https://dexscreener.com/solana/{mint}"
 
-            # Always score, regardless of alert state — this is what makes
-            # the log useful for pattern-finding later. Previously score
-            # was only ever computed when momentum_alerted was still False,
-            # so tokens that had already been alerted (or that never
-            # crossed the threshold) left no data trail at all.
             score, details = score_momentum(pair)
 
             multiplier = None
@@ -565,11 +509,6 @@ def run_pump_check():
                 except (TypeError, ValueError, ZeroDivisionError):
                     multiplier = None
 
-            # Drawdown: how far below the first-buy price this token has
-            # fallen, as a positive fraction (0.8 = down 80%). This is the
-            # downside counterpart to `multiplier` — the raw material for
-            # spotting rugs/dead tokens the same way multiplier is used to
-            # spot pumps.
             drawdown = None
             if price_at_first_buy and current_price:
                 try:
@@ -577,11 +516,6 @@ def run_pump_check():
                 except (TypeError, ValueError, ZeroDivisionError):
                     drawdown = None
 
-            # Liquidity delta since the last scan of this token. A liquidity
-            # pool draining fast (large negative delta) is one of the
-            # clearest early rug signals — much sharper than price alone,
-            # since price can be volatile on low volume before liquidity
-            # actually gets pulled.
             current_liquidity = details.get("liquidity")
             liquidity_delta_pct = None
             if current_liquidity is not None and prev_liquidity:
@@ -590,9 +524,6 @@ def run_pump_check():
                 except (TypeError, ValueError, ZeroDivisionError):
                     liquidity_delta_pct = None
 
-            # Ground-truth outcome tracking — updated every scan whether or
-            # not any alert fires, so you can later see what a token
-            # actually peaked/bottomed at even if the bot never flagged it.
             if current_price is not None:
                 c.execute(
                     """
@@ -644,7 +575,6 @@ def run_pump_check():
                     (wallet, mint)
                 )
 
-            # Snapshot this scan regardless of whether anything fired.
             c.execute(
                 """
                 INSERT INTO token_scan_log
@@ -679,17 +609,6 @@ def run_pump_check():
 
 @app.route("/check-pumps", methods=["GET", "POST"])
 def check_pumps():
-    """
-    Kicks off run_pump_check() in a background thread and returns
-    immediately. cron-job.org (30s timeout on the free plan) gets its
-    200 OK in milliseconds; the actual DexScreener scan — which can take
-    well over 30s once you're tracking a few dozen tokens — keeps running
-    after the HTTP response is already sent.
-
-    The lock prevents a second overlapping trigger (e.g. a retry firing
-    while the previous scan is still running) from starting a second scan
-    on top of the first.
-    """
     if not _check_pumps_lock.acquire(blocking=False):
         print("check-pumps already running, skipping this trigger")
         return "already running", 200
@@ -747,12 +666,6 @@ def home():
 
 @app.route("/stats")
 def stats():
-    """
-    Read-only sanity check: how much data has actually accumulated,
-    broken out by outcome bucket. The point is to know whether there's
-    enough to trust a pattern before hard-coding one — not to build
-    logic off a feeling.
-    """
     conn = get_conn()
     try:
         c = conn.cursor()
@@ -798,9 +711,120 @@ def stats():
         conn.close()
 
 
+@app.route("/analyze")
+def analyze():
+    """
+    Compares early scan behavior (first 3 scans after first buy) between
+    tokens that eventually pumped 3x+ vs tokens that eventually rugged
+    (80%+ drawdown). Uses token_scan_log, which has a full snapshot of
+    every scan regardless of whether an alert fired — so this isn't
+    limited to tokens that happened to cross an alert threshold.
+
+    Read-only, no side effects. Meant to be checked periodically as more
+    data accumulates, not run once and trusted forever.
+    """
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            WITH ranked_scans AS (
+                SELECT
+                    s.wallet, s.token_mint, s.scanned_at,
+                    s.buys_5m, s.sells_5m, s.vol_5m, s.vol_h1,
+                    s.liquidity_delta_pct, s.momentum_score, s.liquidity,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY s.wallet, s.token_mint
+                        ORDER BY s.scanned_at
+                    ) AS scan_num,
+                    h.max_multiplier_seen,
+                    h.max_drawdown_seen
+                FROM token_scan_log s
+                JOIN wallet_token_history h
+                    ON h.wallet = s.wallet AND h.token_mint = s.token_mint
+            ),
+            early_scans AS (
+                SELECT * FROM ranked_scans WHERE scan_num <= 3
+            ),
+            categorized AS (
+                SELECT *,
+                    CASE
+                        WHEN COALESCE(max_multiplier_seen, 0) >= 3 THEN 'pumped'
+                        WHEN COALESCE(max_drawdown_seen, 0) >= 0.8 THEN 'rugged'
+                        ELSE 'neither'
+                    END AS bucket
+                FROM early_scans
+            )
+            SELECT
+                bucket,
+                COUNT(DISTINCT (wallet, token_mint)) AS token_count,
+                AVG(
+                    CASE WHEN (buys_5m + sells_5m) > 0
+                    THEN buys_5m::float / (buys_5m + sells_5m) END
+                ) AS avg_buy_ratio,
+                AVG(liquidity_delta_pct) AS avg_liquidity_delta_pct,
+                AVG(vol_5m) AS avg_vol_5m,
+                AVG(vol_h1) AS avg_vol_h1,
+                AVG(momentum_score) AS avg_score,
+                AVG(liquidity) AS avg_liquidity
+            FROM categorized
+            WHERE bucket IN ('pumped', 'rugged')
+            GROUP BY bucket
+            ORDER BY bucket
+        """)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return "No scan data yet — needs at least one full scan cycle per tracked token first.", 200
+
+        lines = ["<b>Early-scan comparison (first 3 scans per token):</b><br>"]
+        data_by_bucket = {}
+        for (bucket, token_count, avg_buy_ratio, avg_liq_delta,
+             avg_vol_5m, avg_vol_h1, avg_score, avg_liquidity) in rows:
+            data_by_bucket[bucket] = {
+                "token_count": token_count,
+                "avg_buy_ratio": avg_buy_ratio,
+                "avg_liq_delta": avg_liq_delta,
+                "avg_vol_5m": avg_vol_5m,
+                "avg_vol_h1": avg_vol_h1,
+                "avg_score": avg_score,
+                "avg_liquidity": avg_liquidity,
+            }
+
+        for bucket in ["pumped", "rugged"]:
+            d = data_by_bucket.get(bucket)
+            if not d:
+                lines.append(f"{bucket.upper()}: no examples yet<br>")
+                continue
+            lines.append(f"<br><b>{bucket.upper()}</b> (n={d['token_count']} tokens)")
+            lines.append(f"Avg buy ratio (buys/(buys+sells)): {d['avg_buy_ratio']:.2f}" if d['avg_buy_ratio'] is not None else "Avg buy ratio: n/a")
+            lines.append(f"Avg liquidity change vs prior scan: {d['avg_liq_delta']*100:.1f}%" if d['avg_liq_delta'] is not None else "Avg liquidity change: n/a")
+            lines.append(f"Avg 5m volume: ${d['avg_vol_5m']:.0f}" if d['avg_vol_5m'] is not None else "Avg 5m volume: n/a")
+            lines.append(f"Avg 1h volume: ${d['avg_vol_h1']:.0f}" if d['avg_vol_h1'] is not None else "Avg 1h volume: n/a")
+            lines.append(f"Avg momentum score: {d['avg_score']:.1f}" if d['avg_score'] is not None else "Avg momentum score: n/a")
+            lines.append(f"Avg liquidity: ${d['avg_liquidity']:.0f}" if d['avg_liquidity'] is not None else "Avg liquidity: n/a")
+
+        pumped_n = data_by_bucket.get("pumped", {}).get("token_count", 0)
+        rugged_n = data_by_bucket.get("rugged", {}).get("token_count", 0)
+        smaller = min(pumped_n, rugged_n)
+        lines.append("<br><br>")
+        if smaller < 20:
+            lines.append(
+                f"⚠️ Smallest bucket only has {smaller} tokens — treat any gap above as "
+                f"noise until both buckets have 20-30+, per the /stats rule of thumb."
+            )
+        else:
+            lines.append(f"Sample sizes ({pumped_n} pumped, {rugged_n} rugged) are large enough to start trusting a consistent gap.")
+
+        return "<br>".join(str(l) for l in lines), 200
+
+    except Exception as e:
+        return f"analyze error: {e}", 500
+
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
-    # Note: this dev-server path is only used for local testing.
-    # On Render, use the gunicorn start command in the Procfile instead —
-    # see Procfile and the deployment notes shared alongside this file.
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
