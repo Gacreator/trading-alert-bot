@@ -21,7 +21,7 @@ TRACKED_WALLETS = set(
 MIN_LIQUIDITY_USD = 3000
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 
-SCAN_WINDOW_HOURS = int(os.environ.get("SCAN_WINDOW_HOURS", "168"))  # 7 days default
+SCAN_WINDOW_HOURS = int(os.environ.get("SCAN_WINDOW_HOURS", "168"))
 MAX_CONCURRENT_DEXSCREENER = int(os.environ.get("MAX_CONCURRENT_DEXSCREENER", "5"))
 
 QUEEN_SYSTEM_PROMPT = (
@@ -71,23 +71,16 @@ def init_db():
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS momentum_alerted BOOLEAN DEFAULT FALSE")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS first_seen_at TIMESTAMP DEFAULT NOW()")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS buy_count INTEGER")
-
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS max_price_seen NUMERIC")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS max_multiplier_seen NUMERIC")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS last_checked_at TIMESTAMP")
-
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS min_price_seen NUMERIC")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS max_drawdown_seen NUMERIC")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS last_liquidity NUMERIC")
-
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS price_at_recommendation NUMERIC")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS recommended_at TIMESTAMP")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS max_multiplier_since_recommendation NUMERIC")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS pumped_since_recommendation_alerted BOOLEAN DEFAULT FALSE")
-
-        # New: market cap captured at the moment of recommendation, so the
-        # pump-confirmation alert can show "market cap then vs now" instead
-        # of just price.
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS market_cap_at_recommendation NUMERIC")
 
         c.execute("""
@@ -202,11 +195,6 @@ def get_pumpfun_data(mint):
 
 
 def get_dexscreener_full(mint):
-    """
-    Fetch DexScreener pair data for a mint. Returns None (never raises) on
-    any failure — including rate-limiting, which shows up as an empty or
-    non-JSON body rather than a clean error status.
-    """
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
         resp = requests.get(url, timeout=5)
@@ -224,13 +212,6 @@ def get_dexscreener_full(mint):
 
 
 def get_dexscreener_full_ratelimited(mint):
-    """
-    Same as get_dexscreener_full, but bounded by a semaphore so at most
-    MAX_CONCURRENT_DEXSCREENER requests are in flight at once. Lets
-    run_pump_check() fetch many tokens in parallel (much faster overall
-    as tracked-token count grows into the thousands) while still capping
-    total concurrent load on DexScreener's API.
-    """
     with _dex_rate_lock:
         result = get_dexscreener_full(mint)
         time.sleep(0.1)
@@ -535,11 +516,23 @@ def check_and_record_buy(wallet, mint):
 # ---------- Periodic pump/momentum check ----------
 
 def run_pump_check():
-    conn = get_conn()
-    c = conn.cursor()
+    """
+    conn/c start as None and only get assigned inside the try block. This
+    matters because if get_conn() itself fails (network hiccup, Neon compute
+    waking up slowly, etc.), the function used to crash BEFORE reaching any
+    try/finally, which meant _check_pumps_lock never got released — every
+    future cron trigger would then just log "already running, skipping"
+    forever, silently killing all pump/momentum checks until a manual
+    restart. Now the lock always releases no matter what fails.
+    """
+    conn = None
+    c = None
     checked = 0
 
     try:
+        conn = get_conn()
+        c = conn.cursor()
+
         c.execute("""
             SELECT wallet, token_mint, price_at_first_buy, pumped_3x_alerted,
                    momentum_alerted, last_liquidity, price_at_recommendation,
@@ -709,8 +702,16 @@ def run_pump_check():
         print(f"check_pumps error: {e}")
 
     finally:
-        c.close()
-        conn.close()
+        if c:
+            try:
+                c.close()
+            except Exception:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
         _check_pumps_lock.release()
 
 
