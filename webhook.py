@@ -295,7 +295,24 @@ def handle_lore_request(mint, chat_id):
 
 # ---------- Momentum scoring ----------
 
-def score_momentum(pair):
+def score_momentum(pair, liquidity_delta_pct=None):
+    """
+    Rebalanced based on real data from /analyze (62 pumped vs 255 rugged
+    memecoins, filtered to <$100k starting liquidity):
+
+    - Liquidity trend (growing vs shrinking since last scan) was the
+      single strongest, most consistent signal — now the biggest weight.
+    - Starting/current liquidity level itself: pumped tokens had ~2.8x
+      the median liquidity of rugged tokens.
+    - Price action across windows: modest real signal, kept but reduced.
+    - Buy/sell ratio: DROPPED. Identical between pumped (0.53) and
+      rugged (0.53) — zero discriminative power, was pure noise.
+    - Volume acceleration bonus: REMOVED and replaced with a mild penalty
+      for extreme volume relative to liquidity. Rugged tokens actually
+      had HIGHER median 1h volume ($83,924) than pumped ($48,969) —
+      consistent with wash-traded volume being used to fake legitimacy
+      right before a dump. High volume is no longer treated as bullish.
+    """
     score = 0
     details = {}
 
@@ -304,19 +321,15 @@ def score_momentum(pair):
     if liquidity < MIN_LIQUIDITY_USD:
         return 0, details
 
-    liquidity_score = min(20, (liquidity / MIN_LIQUIDITY_USD) * 10)
-    score += liquidity_score
+    details["liquidity_delta_pct"] = liquidity_delta_pct
+    if liquidity_delta_pct is not None and liquidity_delta_pct > 0:
+        trend_score = min(1.0, liquidity_delta_pct / 0.10) * 45
+    else:
+        trend_score = 0
+    score += trend_score
 
-    volume = pair.get("volume", {}) or {}
-    vol_5m = volume.get("m5", 0) or 0
-    vol_h1 = volume.get("h1", 0) or 0
-    avg_5m_from_hour = vol_h1 / 12 if vol_h1 else 0
-    details["vol_5m"] = vol_5m
-    details["vol_h1"] = vol_h1
-    if avg_5m_from_hour > 0 and vol_5m > avg_5m_from_hour * 1.5:
-        score += 30
-    elif vol_5m > 0:
-        score += 10
+    liquidity_score = min(1.0, liquidity / 15000) * 25
+    score += liquidity_score
 
     price_change = pair.get("priceChange", {}) or {}
     pc_5m = price_change.get("m5", 0) or 0
@@ -326,19 +339,27 @@ def score_momentum(pair):
     details["pc_h1"] = pc_h1
     details["pc_h6"] = pc_h6
     positive_windows = sum(1 for x in [pc_5m, pc_h1, pc_h6] if x and x > 0)
-    score += positive_windows * (25 / 3)
+    score += positive_windows * (20 / 3)
+
+    volume = pair.get("volume", {}) or {}
+    vol_5m = volume.get("m5", 0) or 0
+    vol_h1 = volume.get("h1", 0) or 0
+    details["vol_5m"] = vol_5m
+    details["vol_h1"] = vol_h1
+
+    vol_to_liq_ratio = (vol_5m / liquidity) if liquidity > 0 else 0
+    details["vol_to_liq_ratio"] = vol_to_liq_ratio
+    if vol_to_liq_ratio > 0.5:
+        score -= 10
+    elif 0.01 <= vol_to_liq_ratio <= 0.3:
+        score += 10
 
     txns = pair.get("txns", {}) or {}
     m5 = txns.get("m5", {}) or {}
-    buys = m5.get("buys", 0) or 0
-    sells = m5.get("sells", 0) or 0
-    details["buys_5m"] = buys
-    details["sells_5m"] = sells
-    if buys + sells > 0:
-        ratio = buys / (buys + sells)
-        score += ratio * 25
+    details["buys_5m"] = m5.get("buys", 0) or 0
+    details["sells_5m"] = m5.get("sells", 0) or 0
 
-    return round(score), details
+    return round(max(0, score)), details
 
 
 # ---------- Wallet buy detection ----------
@@ -494,8 +515,6 @@ def run_pump_check():
 
             dexscreener_url = f"https://dexscreener.com/solana/{mint}"
 
-            score, details = score_momentum(pair)
-
             multiplier = None
             if price_at_first_buy and current_price:
                 try:
@@ -510,13 +529,16 @@ def run_pump_check():
                 except (TypeError, ValueError, ZeroDivisionError):
                     drawdown = None
 
-            current_liquidity = details.get("liquidity")
+            current_liquidity_raw = pair.get("liquidity", {}).get("usd", 0) or 0
             liquidity_delta_pct = None
-            if current_liquidity is not None and prev_liquidity:
+            if current_liquidity_raw is not None and prev_liquidity:
                 try:
-                    liquidity_delta_pct = (float(current_liquidity) - float(prev_liquidity)) / float(prev_liquidity)
+                    liquidity_delta_pct = (float(current_liquidity_raw) - float(prev_liquidity)) / float(prev_liquidity)
                 except (TypeError, ValueError, ZeroDivisionError):
                     liquidity_delta_pct = None
+
+            score, details = score_momentum(pair, liquidity_delta_pct)
+            current_liquidity = details.get("liquidity")
 
             if current_price is not None:
                 c.execute(
@@ -557,10 +579,18 @@ def run_pump_check():
                     f"🚀 Heating up (score {score}/100)\n"
                     f"Wallet: <code>{wallet}</code>\n"
                     f"Token: <code>{mint}</code>\n\n"
+                    f"Liquidity: ${details.get('liquidity', 0):.0f} (Δ {liquidity_delta_pct*100:.1f}% since last scan)\n"
+                    f"5m volume: ${details.get('vol_5m', 0):.0f} (1h: ${details.get('vol_h1', 0):.0f})\n"
+                    f"Price change 5m/1h/6h: {details.get('pc_5m')}% / {details.get('pc_h1')}% / {details.get('pc_h6')}%\n\n"
+                    f"📊 DexScreener: {dexscreener_url}\n\n"
+                    f"Not a guarantee — DYOR, but the signals are lining up."
+                    if liquidity_delta_pct is not None else
+                    f"🚀 Heating up (score {score}/100)\n"
+                    f"Wallet: <code>{wallet}</code>\n"
+                    f"Token: <code>{mint}</code>\n\n"
                     f"Liquidity: ${details.get('liquidity', 0):.0f}\n"
                     f"5m volume: ${details.get('vol_5m', 0):.0f} (1h: ${details.get('vol_h1', 0):.0f})\n"
-                    f"Price change 5m/1h/6h: {details.get('pc_5m')}% / {details.get('pc_h1')}% / {details.get('pc_h6')}%\n"
-                    f"Buys vs sells (5m): {details.get('buys_5m')} / {details.get('sells_5m')}\n\n"
+                    f"Price change 5m/1h/6h: {details.get('pc_5m')}% / {details.get('pc_h1')}% / {details.get('pc_h6')}%\n\n"
                     f"📊 DexScreener: {dexscreener_url}\n\n"
                     f"Not a guarantee — DYOR, but the signals are lining up."
                 )
@@ -707,14 +737,6 @@ def stats():
 
 @app.route("/analyze")
 def analyze():
-    """
-    Compares early scan behavior (first 3 scans after first buy) between
-    tokens that eventually pumped 3x+ vs tokens that eventually rugged
-    (80%+ drawdown). Filters to tokens whose FIRST scan showed liquidity
-    under $100k, so large/established tokens that simply drifted down
-    over time don't get miscounted as memecoin "rugs" and skew the
-    averages. Reports both mean and median for every metric.
-    """
     conn = get_conn()
     try:
         c = conn.cursor()
