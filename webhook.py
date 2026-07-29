@@ -745,6 +745,59 @@ def home():
     return "Bot is alive!"
 
 
+@app.route("/stats")
+def stats():
+    """
+    Read-only sanity check: how much data has actually accumulated,
+    broken out by outcome bucket. The point is to know whether there's
+    enough to trust a pattern before hard-coding one — not to build
+    logic off a feeling.
+    """
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+
+        c.execute("SELECT COUNT(*) FROM wallet_token_history")
+        total_tokens = c.fetchone()[0]
+
+        c.execute("SELECT COUNT(*) FROM wallet_token_history WHERE max_multiplier_seen >= 3")
+        pumped_3x = c.fetchone()[0]
+
+        c.execute("SELECT COUNT(*) FROM wallet_token_history WHERE max_multiplier_seen >= 10")
+        pumped_10x = c.fetchone()[0]
+
+        c.execute("SELECT COUNT(*) FROM wallet_token_history WHERE max_drawdown_seen >= 0.8")
+        rugged = c.fetchone()[0]
+
+        c.execute("SELECT COUNT(*) FROM token_scan_log")
+        total_scans = c.fetchone()[0]
+
+        c.execute("SELECT MIN(first_seen_at) FROM wallet_token_history")
+        earliest = c.fetchone()[0]
+
+        c.close()
+
+        lines = [
+            f"Tracking since: {earliest}",
+            f"Total tokens tracked: {total_tokens}",
+            f"Total scan snapshots logged: {total_scans}",
+            f"Tokens that hit 3x+: {pumped_3x}",
+            f"Tokens that hit 10x+: {pumped_10x}",
+            f"Tokens that drew down 80%+ (likely rugs/dead): {rugged}",
+            "",
+            "Rule of thumb: you want 20-30+ examples in your smallest",
+            "bucket (pumps or rugs, whichever is rarer) before trusting",
+            "any pattern drawn from it.",
+        ]
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"stats error: {e}", 500
+
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
     # Note: this dev-server path is only used for local testing.
     # On Render, use the gunicorn start command in the Procfile instead —
