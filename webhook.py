@@ -18,7 +18,12 @@ TRACKED_WALLETS = set(
     w.strip() for w in os.environ.get("TRACKED_WALLETS", "").split(",") if w.strip()
 )
 
-MIN_LIQUIDITY_USD = 3000
+# Raised from 3000 to 8000 based on /analyze data: pumped tokens had a
+# median starting liquidity of ~$12,600 vs rugged tokens at ~$4,500. The
+# old $3k floor was barely above the RUGGED median, letting through a lot
+# of the exact profile that tends to fail. Now an env var so it can be
+# tuned without a code change going forward.
+MIN_LIQUIDITY_USD = int(os.environ.get("MIN_LIQUIDITY_USD", "8000"))
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 
 SCAN_WINDOW_HOURS = int(os.environ.get("SCAN_WINDOW_HOURS", "168"))
@@ -47,14 +52,6 @@ def looks_like_solana_address(text):
 # ---------- DB ----------
 
 def get_conn():
-    """
-    connect_timeout caps how long we wait to establish a connection.
-    The keepalives settings make psycopg2 send TCP-level keepalive packets
-    every 10s after 30s idle, up to 5 times before giving up — this is what
-    was missing before, and is the likely reason Neon's connection was
-    silently dying ("SSL connection has been closed unexpectedly") partway
-    through a long scan cycle with 1,600+ tokens.
-    """
     return psycopg2.connect(
         DATABASE_URL,
         connect_timeout=10,
@@ -531,16 +528,6 @@ def check_and_record_buy(wallet, mint):
 # ---------- Periodic pump/momentum check ----------
 
 def run_pump_check():
-    """
-    Two layers of resilience now:
-    1. get_conn() uses TCP keepalives so the connection is much less likely
-       to be silently dropped mid-scan by Neon during a long-running cycle.
-    2. Each token's processing is wrapped in its own try/except. If the DB
-       connection still drops mid-loop (psycopg2.OperationalError), we
-       reconnect and continue with the remaining tokens instead of losing
-       the whole cycle — previously a single connection drop on token #500
-       of 1,600 would abort everything after it.
-    """
     conn = None
     c = None
     checked = 0
@@ -1032,6 +1019,69 @@ def analyze():
 
     except Exception as e:
         return f"analyze error: {e}", 500
+
+    finally:
+        conn.close()
+
+
+@app.route("/analyze-alerts")
+def analyze_alerts():
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT
+                s.wallet, s.token_mint, s.momentum_score,
+                h.max_multiplier_since_recommendation,
+                h.pumped_since_recommendation_alerted
+            FROM token_scan_log s
+            JOIN wallet_token_history h
+                ON h.wallet = s.wallet AND h.token_mint = s.token_mint
+            WHERE s.momentum_alert_fired = TRUE
+        """)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return "No recommendations logged yet.", 200
+
+        buckets = {
+            "70-79": {"total": 0, "hit_3x": 0},
+            "80-89": {"total": 0, "hit_3x": 0},
+            "90-100": {"total": 0, "hit_3x": 0},
+        }
+
+        for wallet, mint, score, max_mult, hit_3x in rows:
+            if score is None:
+                continue
+            if 70 <= score < 80:
+                key = "70-79"
+            elif 80 <= score < 90:
+                key = "80-89"
+            elif score >= 90:
+                key = "90-100"
+            else:
+                continue
+
+            buckets[key]["total"] += 1
+            if hit_3x or (max_mult and max_mult >= 3):
+                buckets[key]["hit_3x"] += 1
+
+        lines = ["<b>Recommendation hit-rate by score bucket:</b><br>"]
+        for bucket, d in buckets.items():
+            total = d["total"]
+            hits = d["hit_3x"]
+            rate = f"{hits/total*100:.1f}%" if total else "n/a"
+            lines.append(f"<br>Score {bucket}: {hits}/{total} hit 3x+ ({rate})")
+
+        lines.append("<br><br>⚠️ Needs time to mature — recommendations made in the last "
+                      "few hours haven't had a chance to play out yet. Check back after "
+                      "24-48h of stable running for a meaningful read.")
+
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"analyze_alerts error: {e}", 500
 
     finally:
         conn.close()
