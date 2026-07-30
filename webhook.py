@@ -427,12 +427,6 @@ def score_momentum(pair, liquidity_delta_pct=None):
 # ---------- Backward-looking trend labels (zero-delay, informational only) ----------
 
 def get_prior_scan_snapshot(mint):
-    """
-    Pulls the most recent already-logged scan for this token, BEFORE the
-    current scan's row is inserted. Used purely to label the recommendation
-    alert with trend-consistency context — does NOT gate or delay the
-    alert, since this data already exists from a previous scan cycle.
-    """
     conn = get_conn()
     try:
         c = conn.cursor()
@@ -472,6 +466,55 @@ def price_trend_label(current_pc_5m, prior_pc_5m):
         return "⚠️ Price just turned positive this scan — no confirmation yet from prior check."
     else:
         return "⚠️ Price trend unclear."
+
+
+# ---------- RugCheck integration ----------
+
+def get_rugcheck_data(mint):
+    """
+    Free, no-key-required RugCheck API check (https://api.rugcheck.xyz/v1).
+    Returns (risk_score, liquidity_flags) or (None, None) on any failure —
+    never blocks or delays the alert if RugCheck is slow/down, just omits
+    this section from the message.
+
+    Note: RugCheck flags CONTRACT-level risks (mint/freeze authority,
+    LP lock status) — it does not predict ordinary market-driven dumps
+    (e.g. a team simply selling their bags), only structural rug-pull
+    mechanisms like unlocked liquidity.
+    """
+    try:
+        url = f"https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary"
+        resp = requests.get(url, timeout=5)
+        if resp.status_code != 200:
+            return None, None
+        data = resp.json()
+        risk_score = data.get("score_normalised")
+        risks = data.get("risks", []) or []
+
+        liquidity_risks = [
+            r for r in risks
+            if r.get("name") and ("liquidity" in r["name"].lower() or "lp" in r["name"].lower())
+        ]
+        summary_bits = [r.get("name") for r in liquidity_risks if r.get("name")]
+
+        return risk_score, summary_bits
+    except Exception as e:
+        print(f"RugCheck error for {mint}: {e}")
+        return None, None
+
+
+def rugcheck_label(risk_score, liquidity_flags):
+    if risk_score is None:
+        return "⚪ RugCheck: no data available for this token."
+    if risk_score <= 30:
+        base = f"🟢 RugCheck score: {risk_score}/100 (low risk)"
+    elif risk_score <= 60:
+        base = f"🟡 RugCheck score: {risk_score}/100 (moderate risk)"
+    else:
+        base = f"🔴 RugCheck score: {risk_score}/100 (HIGH RISK)"
+    if liquidity_flags:
+        base += f" — flags: {', '.join(liquidity_flags)}"
+    return base
 
 
 # ---------- Wallet buy detection ----------
@@ -689,13 +732,12 @@ def run_pump_check():
                 if not momentum_alerted and score >= 70:
                     momentum_alert_fired = True
 
-                    # Backward-looking, zero-delay trend labels — uses data
-                    # from the PREVIOUS scan (already logged before this
-                    # one) to add informational context to the alert.
-                    # Does not delay or gate the alert in any way.
                     prior_liq_delta, prior_pc_5m = get_prior_scan_snapshot(mint)
                     liq_trend_note = liquidity_trend_label(liquidity_delta_pct, prior_liq_delta)
                     price_trend_note = price_trend_label(details.get("pc_5m"), prior_pc_5m)
+
+                    rug_score, rug_liq_flags = get_rugcheck_data(mint)
+                    rug_note = rugcheck_label(rug_score, rug_liq_flags)
 
                     c.execute(
                         """
@@ -718,7 +760,8 @@ def run_pump_check():
                         + f"\n5m volume: ${details.get('vol_5m', 0):.0f} (1h: ${details.get('vol_h1', 0):.0f})\n"
                         f"Price change 5m/1h/6h: {details.get('pc_5m')}% / {details.get('pc_h1')}% / {details.get('pc_h6')}%\n\n"
                         f"{liq_trend_note}\n"
-                        f"{price_trend_note}\n\n"
+                        f"{price_trend_note}\n"
+                        f"{rug_note}\n\n"
                         f"📊 DexScreener: {dexscreener_url}\n\n"
                         f"Recommending this now — tracking from this price to see if it delivers. DYOR."
                     )
