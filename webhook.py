@@ -18,12 +18,8 @@ TRACKED_WALLETS = set(
     w.strip() for w in os.environ.get("TRACKED_WALLETS", "").split(",") if w.strip()
 )
 
-# Raised from 3000 to 8000 based on /analyze data: pumped tokens had a
-# median starting liquidity of ~$12,600 vs rugged tokens at ~$4,500. The
-# old $3k floor was barely above the RUGGED median, letting through a lot
-# of the exact profile that tends to fail. Now an env var so it can be
-# tuned without a code change going forward.
 MIN_LIQUIDITY_USD = int(os.environ.get("MIN_LIQUIDITY_USD", "8000"))
+MIN_VOL_5M_USD = int(os.environ.get("MIN_VOL_5M_USD", "200"))
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 
 SCAN_WINDOW_HOURS = int(os.environ.get("SCAN_WINDOW_HOURS", "168"))
@@ -379,6 +375,12 @@ def explain_pump(mint, price_at_recommendation, current_price, multiplier, recom
 # ---------- Momentum scoring ----------
 
 def score_momentum(pair, liquidity_delta_pct=None):
+    """
+    MIN_VOL_5M_USD floor added: your own data showed pumped-token medians
+    at $4,647 (5m volume) and rugged at $6,247 — a $200 floor sits far
+    below both, only screening out genuinely inactive tokens rather than
+    real ones on either side of the outcome.
+    """
     score = 0
     details = {}
 
@@ -412,6 +414,9 @@ def score_momentum(pair, liquidity_delta_pct=None):
     vol_h1 = volume.get("h1", 0) or 0
     details["vol_5m"] = vol_5m
     details["vol_h1"] = vol_h1
+
+    if vol_5m < MIN_VOL_5M_USD:
+        return 0, details
 
     vol_to_liq_ratio = (vol_5m / liquidity) if liquidity > 0 else 0
     details["vol_to_liq_ratio"] = vol_to_liq_ratio
@@ -1082,6 +1087,149 @@ def analyze_alerts():
 
     except Exception as e:
         return f"analyze_alerts error: {e}", 500
+
+    finally:
+        conn.close()
+
+
+@app.route("/check-gate-risk")
+def check_gate_risk():
+    """
+    Answers: of tokens that eventually pumped 3x+, what fraction had at
+    least one early scan (first 3) with negative liquidity delta? If this
+    is high, a hard gate blocking negative-delta scans would filter out
+    real winners along with the noise it's meant to catch.
+    """
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            WITH ranked_scans AS (
+                SELECT
+                    s.wallet, s.token_mint, s.liquidity_delta_pct,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY s.wallet, s.token_mint
+                        ORDER BY s.scanned_at
+                    ) AS scan_num,
+                    h.max_multiplier_seen
+                FROM token_scan_log s
+                JOIN wallet_token_history h
+                    ON h.wallet = s.wallet AND h.token_mint = s.token_mint
+            ),
+            pumped_tokens AS (
+                SELECT DISTINCT wallet, token_mint
+                FROM ranked_scans
+                WHERE max_multiplier_seen >= 3
+            ),
+            early_scans_of_pumped AS (
+                SELECT r.wallet, r.token_mint, r.liquidity_delta_pct
+                FROM ranked_scans r
+                JOIN pumped_tokens p
+                    ON p.wallet = r.wallet AND p.token_mint = r.token_mint
+                WHERE r.scan_num <= 3
+            )
+            SELECT
+                COUNT(DISTINCT (wallet, token_mint)) AS total_pumped_tokens,
+                COUNT(DISTINCT (wallet, token_mint)) FILTER (
+                    WHERE liquidity_delta_pct < 0
+                ) AS pumped_tokens_with_early_negative_delta
+            FROM early_scans_of_pumped
+        """)
+        row = c.fetchone()
+        c.close()
+
+        if not row or not row[0]:
+            return "No pumped tokens with scan history yet.", 200
+
+        total, with_negative = row
+        pct = (with_negative / total * 100) if total else 0
+
+        lines = [
+            f"Total pumped (3x+) tokens with scan history: {total}",
+            f"Of those, tokens with at least one early negative liquidity delta: {with_negative} ({pct:.1f}%)",
+            "",
+            "If this % is high (e.g. 30%+), a hard gate blocking negative-delta "
+            "scans would filter out real winners — better to keep it as a "
+            "scored factor, not a strict requirement.",
+            "If this % is low, the hard gate is safe to add.",
+        ]
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_gate_risk error: {e}", 500
+
+    finally:
+        conn.close()
+
+
+@app.route("/check-volume-floor-risk")
+def check_volume_floor_risk():
+    """
+    Finds the minimum 5m volume seen in any early scan (first 3) of a
+    token that went on to pump 3x+. This tells us the lowest safe floor —
+    setting MIN_VOL_5M_USD above this number risks filtering out real
+    winners that started quiet before taking off.
+    """
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            WITH ranked_scans AS (
+                SELECT
+                    s.wallet, s.token_mint, s.vol_5m,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY s.wallet, s.token_mint
+                        ORDER BY s.scanned_at
+                    ) AS scan_num,
+                    h.max_multiplier_seen
+                FROM token_scan_log s
+                JOIN wallet_token_history h
+                    ON h.wallet = s.wallet AND h.token_mint = s.token_mint
+            ),
+            pumped_tokens AS (
+                SELECT DISTINCT wallet, token_mint
+                FROM ranked_scans
+                WHERE max_multiplier_seen >= 3
+            ),
+            early_scans_of_pumped AS (
+                SELECT r.wallet, r.token_mint, r.vol_5m
+                FROM ranked_scans r
+                JOIN pumped_tokens p
+                    ON p.wallet = r.wallet AND p.token_mint = r.token_mint
+                WHERE r.scan_num <= 3
+                AND r.vol_5m IS NOT NULL
+            )
+            SELECT
+                MIN(vol_5m) AS min_vol,
+                PERCENTILE_CONT(0.05) WITHIN GROUP (ORDER BY vol_5m) AS p5_vol,
+                PERCENTILE_CONT(0.10) WITHIN GROUP (ORDER BY vol_5m) AS p10_vol,
+                COUNT(*) AS total_scans
+            FROM early_scans_of_pumped
+        """)
+        row = c.fetchone()
+        c.close()
+
+        if not row or row[3] == 0:
+            return "No early scan data for pumped tokens yet.", 200
+
+        min_vol, p5_vol, p10_vol, total_scans = row
+
+        lines = [
+            f"Based on {total_scans} early scans of tokens that went on to pump 3x+:",
+            "",
+            f"Absolute minimum 5m volume seen: ${min_vol:,.2f}",
+            f"5th percentile: ${p5_vol:,.2f}",
+            f"10th percentile: ${p10_vol:,.2f}",
+            "",
+            "A MIN_VOL_5M_USD floor set ABOVE the absolute minimum risks "
+            "cutting off at least one real winner that started this quiet. "
+            "Setting it at or below the 5th percentile keeps that risk very low "
+            "(only ~5% of pumped-token early scans were this quiet or quieter).",
+        ]
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_volume_floor_risk error: {e}", 500
 
     finally:
         conn.close()
