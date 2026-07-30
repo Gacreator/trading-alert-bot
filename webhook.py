@@ -424,6 +424,56 @@ def score_momentum(pair, liquidity_delta_pct=None):
     return round(max(0, score)), details
 
 
+# ---------- Backward-looking trend labels (zero-delay, informational only) ----------
+
+def get_prior_scan_snapshot(mint):
+    """
+    Pulls the most recent already-logged scan for this token, BEFORE the
+    current scan's row is inserted. Used purely to label the recommendation
+    alert with trend-consistency context — does NOT gate or delay the
+    alert, since this data already exists from a previous scan cycle.
+    """
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT liquidity_delta_pct, pc_5m
+            FROM token_scan_log
+            WHERE token_mint = %s
+            ORDER BY scanned_at DESC
+            LIMIT 1
+        """, (mint,))
+        row = c.fetchone()
+        c.close()
+        if not row:
+            return None, None
+        return row[0], row[1]
+    finally:
+        conn.close()
+
+
+def liquidity_trend_label(current_delta, prior_delta):
+    if current_delta is None or prior_delta is None:
+        return "⚪ Liquidity trend: not enough history yet to judge consistency."
+    if current_delta > 0 and prior_delta > 0:
+        return "✅ Liquidity growing across 2+ scans — looks like sustained trend."
+    elif current_delta > 0 and prior_delta <= 0:
+        return "⚠️ Liquidity just ticked up after a dip — could be a one-off blip, not confirmed trend yet."
+    else:
+        return "⚠️ Liquidity trend unclear."
+
+
+def price_trend_label(current_pc_5m, prior_pc_5m):
+    if current_pc_5m is None or prior_pc_5m is None:
+        return "⚪ Price trend: not enough history yet to judge consistency."
+    if current_pc_5m > 0 and prior_pc_5m > 0:
+        return "✅ Price also rising on prior scan — momentum looks consistent."
+    elif current_pc_5m > 0 and prior_pc_5m <= 0:
+        return "⚠️ Price just turned positive this scan — no confirmation yet from prior check."
+    else:
+        return "⚠️ Price trend unclear."
+
+
 # ---------- Wallet buy detection ----------
 
 def extract_wallet_buys(tx, wallet):
@@ -524,15 +574,6 @@ def check_and_record_buy(wallet, mint):
 # ---------- Periodic pump/momentum check ----------
 
 def run_pump_check():
-    """
-    Now proactively refreshes the DB connection every DB_CONN_REFRESH_EVERY
-    tokens (default 150) instead of only reconnecting reactively after a
-    drop. The "DB connection dropped mid-scan" errors were happening on a
-    suspiciously regular ~15min cadence — consistent with Neon (and many
-    managed Postgres providers) capping how long a single connection can
-    stay open regardless of activity. Refreshing proactively avoids ever
-    hitting that limit in the first place, rather than reacting to it.
-    """
     conn = None
     c = None
     checked = 0
@@ -647,6 +688,15 @@ def run_pump_check():
 
                 if not momentum_alerted and score >= 70:
                     momentum_alert_fired = True
+
+                    # Backward-looking, zero-delay trend labels — uses data
+                    # from the PREVIOUS scan (already logged before this
+                    # one) to add informational context to the alert.
+                    # Does not delay or gate the alert in any way.
+                    prior_liq_delta, prior_pc_5m = get_prior_scan_snapshot(mint)
+                    liq_trend_note = liquidity_trend_label(liquidity_delta_pct, prior_liq_delta)
+                    price_trend_note = price_trend_label(details.get("pc_5m"), prior_pc_5m)
+
                     c.execute(
                         """
                         UPDATE wallet_token_history
@@ -667,6 +717,8 @@ def run_pump_check():
                         + (f" (Δ {liquidity_delta_pct*100:.1f}% since last scan)" if liquidity_delta_pct is not None else "")
                         + f"\n5m volume: ${details.get('vol_5m', 0):.0f} (1h: ${details.get('vol_h1', 0):.0f})\n"
                         f"Price change 5m/1h/6h: {details.get('pc_5m')}% / {details.get('pc_h1')}% / {details.get('pc_h6')}%\n\n"
+                        f"{liq_trend_note}\n"
+                        f"{price_trend_note}\n\n"
                         f"📊 DexScreener: {dexscreener_url}\n\n"
                         f"Recommending this now — tracking from this price to see if it delivers. DYOR."
                     )
@@ -1230,6 +1282,85 @@ def check_volume_floor_risk():
 
     except Exception as e:
         return f"check_volume_floor_risk error: {e}", 500
+
+    finally:
+        conn.close()
+
+
+@app.route("/check-oscillation-risk")
+def check_oscillation_risk():
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            WITH ranked_scans AS (
+                SELECT
+                    s.wallet, s.token_mint, s.liquidity_delta_pct,
+                    s.momentum_alert_fired, s.momentum_score,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY s.wallet, s.token_mint
+                        ORDER BY s.scanned_at
+                    ) AS scan_num
+                FROM token_scan_log s
+            ),
+            recommendation_scans AS (
+                SELECT wallet, token_mint, scan_num
+                FROM ranked_scans
+                WHERE momentum_alert_fired = TRUE AND momentum_score >= 90
+            ),
+            prior_scan_delta AS (
+                SELECT
+                    r.wallet, r.token_mint,
+                    prior.liquidity_delta_pct AS prior_delta
+                FROM recommendation_scans r
+                JOIN ranked_scans prior
+                    ON prior.wallet = r.wallet
+                    AND prior.token_mint = r.token_mint
+                    AND prior.scan_num = r.scan_num - 1
+            )
+            SELECT
+                p.wallet, p.token_mint, p.prior_delta,
+                h.pumped_since_recommendation_alerted,
+                h.max_multiplier_since_recommendation
+            FROM prior_scan_delta p
+            JOIN wallet_token_history h
+                ON h.wallet = p.wallet AND h.token_mint = p.token_mint
+        """)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return "Not enough 90+ recommendations with prior-scan data yet.", 200
+
+        sustained = {"total": 0, "paid_off": 0}
+        oscillating = {"total": 0, "paid_off": 0}
+
+        for wallet, mint, prior_delta, paid_off, max_mult in rows:
+            hit = bool(paid_off) or (max_mult and max_mult >= 3)
+            if prior_delta is not None and prior_delta > 0:
+                sustained["total"] += 1
+                if hit:
+                    sustained["paid_off"] += 1
+            elif prior_delta is not None and prior_delta <= 0:
+                oscillating["total"] += 1
+                if hit:
+                    oscillating["paid_off"] += 1
+
+        def rate(d):
+            return f"{d['paid_off']}/{d['total']} ({d['paid_off']/d['total']*100:.1f}%)" if d["total"] else "n/a"
+
+        lines = [
+            "<b>90+ score recommendations, by liquidity pattern:</b><br>",
+            f"<br>Sustained growth (prior scan also positive): {rate(sustained)}",
+            f"Oscillating (prior scan was flat/negative): {rate(oscillating)}",
+            "<br><br>If oscillating tokens hit noticeably less often, that "
+            "confirms the fix is worth the delay. If both rates are similar, "
+            "the delay isn't worth adding.",
+        ]
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_oscillation_risk error: {e}", 500
 
     finally:
         conn.close()
