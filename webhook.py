@@ -19,7 +19,6 @@ TRACKED_WALLETS = set(
 )
 
 MIN_LIQUIDITY_USD = int(os.environ.get("MIN_LIQUIDITY_USD", "8000"))
-MIN_VOL_5M_USD = int(os.environ.get("MIN_VOL_5M_USD", "200"))
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 
 SCAN_WINDOW_HOURS = int(os.environ.get("SCAN_WINDOW_HOURS", "168"))
@@ -376,10 +375,18 @@ def explain_pump(mint, price_at_recommendation, current_price, multiplier, recom
 
 def score_momentum(pair, liquidity_delta_pct=None):
     """
-    MIN_VOL_5M_USD floor added: your own data showed pumped-token medians
-    at $4,647 (5m volume) and rugged at $6,247 — a $200 floor sits far
-    below both, only screening out genuinely inactive tokens rather than
-    real ones on either side of the outcome.
+    MIN_VOL_5M_USD floor was tried and REMOVED after /check-volume-floor-risk
+    showed the absolute minimum and even 5th percentile 5m volume among
+    eventual 3x+ winners' early scans was $0.00 — meaning any floor above
+    zero would have blocked genuine winners in their quietest early moments.
+    Volume is still handled sensibly via vol_to_liq_ratio scoring below,
+    just without a hard cutoff.
+
+    Liquidity-trend hard gate was also considered and REJECTED after
+    /check-gate-risk showed 34.9% of eventual 3x+ winners had at least one
+    early scan with negative liquidity delta — blocking on that would have
+    filtered out roughly 1 in 3 real winners. Liquidity trend stays a
+    scored factor (up to 45 points), not a strict requirement.
     """
     score = 0
     details = {}
@@ -414,9 +421,6 @@ def score_momentum(pair, liquidity_delta_pct=None):
     vol_h1 = volume.get("h1", 0) or 0
     details["vol_5m"] = vol_5m
     details["vol_h1"] = vol_h1
-
-    if vol_5m < MIN_VOL_5M_USD:
-        return 0, details
 
     vol_to_liq_ratio = (vol_5m / liquidity) if liquidity > 0 else 0
     details["vol_to_liq_ratio"] = vol_to_liq_ratio
@@ -1094,12 +1098,6 @@ def analyze_alerts():
 
 @app.route("/check-gate-risk")
 def check_gate_risk():
-    """
-    Answers: of tokens that eventually pumped 3x+, what fraction had at
-    least one early scan (first 3) with negative liquidity delta? If this
-    is high, a hard gate blocking negative-delta scans would filter out
-    real winners along with the noise it's meant to catch.
-    """
     conn = get_conn()
     try:
         c = conn.cursor()
@@ -1164,12 +1162,6 @@ def check_gate_risk():
 
 @app.route("/check-volume-floor-risk")
 def check_volume_floor_risk():
-    """
-    Finds the minimum 5m volume seen in any early scan (first 3) of a
-    token that went on to pump 3x+. This tells us the lowest safe floor —
-    setting MIN_VOL_5M_USD above this number risks filtering out real
-    winners that started quiet before taking off.
-    """
     conn = get_conn()
     try:
         c = conn.cursor()
