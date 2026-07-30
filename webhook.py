@@ -23,6 +23,7 @@ WSOL_MINT = "So11111111111111111111111111111111111111112"
 
 SCAN_WINDOW_HOURS = int(os.environ.get("SCAN_WINDOW_HOURS", "168"))
 MAX_CONCURRENT_DEXSCREENER = int(os.environ.get("MAX_CONCURRENT_DEXSCREENER", "5"))
+DB_CONN_REFRESH_EVERY = int(os.environ.get("DB_CONN_REFRESH_EVERY", "150"))
 
 QUEEN_SYSTEM_PROMPT = (
     "You are 'Queen' — the user's witty, confident friend who happens to run a Solana trading "
@@ -374,20 +375,6 @@ def explain_pump(mint, price_at_recommendation, current_price, multiplier, recom
 # ---------- Momentum scoring ----------
 
 def score_momentum(pair, liquidity_delta_pct=None):
-    """
-    MIN_VOL_5M_USD floor was tried and REMOVED after /check-volume-floor-risk
-    showed the absolute minimum and even 5th percentile 5m volume among
-    eventual 3x+ winners' early scans was $0.00 — meaning any floor above
-    zero would have blocked genuine winners in their quietest early moments.
-    Volume is still handled sensibly via vol_to_liq_ratio scoring below,
-    just without a hard cutoff.
-
-    Liquidity-trend hard gate was also considered and REJECTED after
-    /check-gate-risk showed 34.9% of eventual 3x+ winners had at least one
-    early scan with negative liquidity delta — blocking on that would have
-    filtered out roughly 1 in 3 real winners. Liquidity trend stays a
-    scored factor (up to 45 points), not a strict requirement.
-    """
     score = 0
     details = {}
 
@@ -537,6 +524,15 @@ def check_and_record_buy(wallet, mint):
 # ---------- Periodic pump/momentum check ----------
 
 def run_pump_check():
+    """
+    Now proactively refreshes the DB connection every DB_CONN_REFRESH_EVERY
+    tokens (default 150) instead of only reconnecting reactively after a
+    drop. The "DB connection dropped mid-scan" errors were happening on a
+    suspiciously regular ~15min cadence — consistent with Neon (and many
+    managed Postgres providers) capping how long a single connection can
+    stay open regardless of activity. Refreshing proactively avoids ever
+    hitting that limit in the first place, rather than reacting to it.
+    """
     conn = None
     c = None
     checked = 0
@@ -563,9 +559,21 @@ def run_pump_check():
             pair_results = list(executor.map(get_dexscreener_full_ratelimited, mints))
         pairs_by_mint = dict(zip(mints, pair_results))
 
-        for (wallet, mint, price_at_first_buy, pumped_alerted, momentum_alerted,
-             prev_liquidity, price_at_recommendation, pumped_since_rec_alerted,
-             recommended_at, market_cap_at_recommendation) in rows:
+        for i, (wallet, mint, price_at_first_buy, pumped_alerted, momentum_alerted,
+                prev_liquidity, price_at_recommendation, pumped_since_rec_alerted,
+                recommended_at, market_cap_at_recommendation) in enumerate(rows):
+
+            if i > 0 and i % DB_CONN_REFRESH_EVERY == 0:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                try:
+                    conn = get_conn()
+                    c = conn.cursor()
+                    print(f"Proactively refreshed DB connection at token {i}")
+                except Exception as refresh_err:
+                    print(f"Proactive refresh failed at token {i}: {refresh_err}")
 
             try:
                 pair = pairs_by_mint.get(mint)
