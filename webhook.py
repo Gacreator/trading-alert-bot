@@ -26,6 +26,14 @@ SCAN_WINDOW_HOURS = int(os.environ.get("SCAN_WINDOW_HOURS", "48"))
 MAX_CONCURRENT_DEXSCREENER = int(os.environ.get("MAX_CONCURRENT_DEXSCREENER", "5"))
 DB_CONN_REFRESH_EVERY = int(os.environ.get("DB_CONN_REFRESH_EVERY", "150"))
 
+# Sanity cap for implausible reads (likely DexScreener returning stale/
+# mismatched pair data during AMM migration or multi-pair confusion,
+# rather than a genuine pump). Any scan crossing these gets flagged as
+# suspect_data — still recorded for visibility, but excluded from all
+# analysis and blocked from triggering live alerts.
+MAX_PLAUSIBLE_MULTIPLIER = float(os.environ.get("MAX_PLAUSIBLE_MULTIPLIER", "50"))
+MAX_PLAUSIBLE_PC_H6 = float(os.environ.get("MAX_PLAUSIBLE_PC_H6", "5000"))
+
 QUEEN_SYSTEM_PROMPT = (
     "You are 'Queen' — the user's witty, confident friend who happens to run a Solana trading "
     "alert bot. You talk to the user like a close friend, not a subject or servant — no 'my loyal "
@@ -127,6 +135,7 @@ def init_db():
         c.execute("ALTER TABLE token_scan_log ADD COLUMN IF NOT EXISTS liquidity_delta_pct NUMERIC")
         c.execute("ALTER TABLE token_scan_log ADD COLUMN IF NOT EXISTS multiplier_since_recommendation NUMERIC")
         c.execute("ALTER TABLE token_scan_log ADD COLUMN IF NOT EXISTS market_cap NUMERIC")
+        c.execute("ALTER TABLE token_scan_log ADD COLUMN IF NOT EXISTS suspect_data BOOLEAN DEFAULT FALSE")
 
         conn.commit()
         c.close()
@@ -480,6 +489,23 @@ def price_trend_label(current_pc_5m, prior_pc_5m):
         return "⚠️ Price trend unclear."
 
 
+def is_suspect_scan(multiplier_from_first_buy, multiplier_since_recommendation, pc_h6):
+    """
+    Flags a scan as likely bad DexScreener data (stale/mismatched pair
+    during AMM migration or multi-pair confusion) rather than a genuine
+    pump. Observed pattern: implausible multipliers or 6h price changes
+    that self-correct the next cycle. These get recorded but excluded
+    from analysis and blocked from triggering live alerts.
+    """
+    if multiplier_from_first_buy is not None and multiplier_from_first_buy > MAX_PLAUSIBLE_MULTIPLIER:
+        return True
+    if multiplier_since_recommendation is not None and multiplier_since_recommendation > MAX_PLAUSIBLE_MULTIPLIER:
+        return True
+    if pc_h6 is not None and abs(pc_h6) > MAX_PLAUSIBLE_PC_H6:
+        return True
+    return False
+
+
 # ---------- RugCheck integration ----------
 
 def get_rugcheck_data(mint):
@@ -709,7 +735,18 @@ def run_pump_check():
                     except (TypeError, ValueError, ZeroDivisionError):
                         multiplier_since_recommendation = None
 
-                if current_price is not None:
+                suspect = is_suspect_scan(
+                    multiplier_from_first_buy,
+                    multiplier_since_recommendation,
+                    details.get("pc_h6")
+                )
+
+                if suspect:
+                    print(f"⚠️ Suspect data for {mint}: mult_first={multiplier_from_first_buy}, "
+                          f"mult_rec={multiplier_since_recommendation}, pc_h6={details.get('pc_h6')} "
+                          f"— excluding from alerts/stats this scan")
+
+                if current_price is not None and not suspect:
                     c.execute(
                         """
                         UPDATE wallet_token_history
@@ -728,11 +765,25 @@ def run_pump_check():
                         (current_price, multiplier_from_first_buy, current_price, current_price,
                          drawdown, current_liquidity, multiplier_since_recommendation, wallet, mint)
                     )
+                elif current_price is not None and suspect:
+                    # Still update last_checked_at/last_liquidity so the next
+                    # cycle's liquidity_delta_pct calculation stays sane, but
+                    # skip the max/min tracking fields that suspect data would
+                    # corrupt.
+                    c.execute(
+                        """
+                        UPDATE wallet_token_history
+                        SET last_checked_at = NOW(),
+                            last_liquidity = COALESCE(%s, last_liquidity)
+                        WHERE wallet=%s AND token_mint=%s
+                        """,
+                        (current_liquidity, wallet, mint)
+                    )
 
                 momentum_alert_fired = False
                 pump_alert_fired = False
 
-                if not momentum_alerted and score >= 70:
+                if not suspect and not momentum_alerted and score >= 70:
                     momentum_alert_fired = True
 
                     liq_trend_note = liquidity_trend_label(liquidity_delta_pct, prior_liq_delta)
@@ -768,7 +819,7 @@ def run_pump_check():
                         f"Recommending this now — tracking from this price to see if it delivers. DYOR."
                     )
 
-                elif (not pumped_since_rec_alerted and price_at_recommendation
+                elif (not suspect and not pumped_since_rec_alerted and price_at_recommendation
                       and multiplier_since_recommendation and multiplier_since_recommendation >= 3):
                     pump_alert_fired = True
                     mc_line = ""
@@ -799,8 +850,8 @@ def run_pump_check():
                          pc_5m, pc_h1, pc_h6, buys_5m, sells_5m, momentum_score,
                          multiplier_from_first_buy, drawdown_from_first_buy,
                          liquidity_delta_pct, momentum_alert_fired, pump_alert_fired,
-                         multiplier_since_recommendation, market_cap)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                         multiplier_since_recommendation, market_cap, suspect_data)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         wallet, mint, current_price, details.get("liquidity"),
@@ -809,7 +860,7 @@ def run_pump_check():
                         details.get("buys_5m"), details.get("sells_5m"), score,
                         multiplier_from_first_buy, drawdown, liquidity_delta_pct,
                         momentum_alert_fired, pump_alert_fired, multiplier_since_recommendation,
-                        current_market_cap
+                        current_market_cap, suspect
                     )
                 )
 
@@ -1022,8 +1073,11 @@ def stats():
         c.execute(f"SELECT COUNT(*) FROM wallet_token_history {token_filter} AND max_drawdown_seen >= 0.8", token_params)
         rugged = c.fetchone()[0]
 
-        c.execute("SELECT COUNT(*) FROM token_scan_log")
+        c.execute("SELECT COUNT(*) FROM token_scan_log WHERE suspect_data IS NOT TRUE")
         total_scans = c.fetchone()[0]
+
+        c.execute("SELECT COUNT(*) FROM token_scan_log WHERE suspect_data = TRUE")
+        suspect_scans = c.fetchone()[0]
 
         c.execute("SELECT MIN(first_seen_at) FROM wallet_token_history")
         earliest = c.fetchone()[0]
@@ -1052,7 +1106,7 @@ def stats():
         lines = [
             f"Tracking since: {earliest}{range_label}",
             f"Total tokens tracked: {total_tokens}",
-            f"Total scan snapshots logged: {total_scans}",
+            f"Total scan snapshots logged: {total_scans} ({suspect_scans} flagged as suspect/excluded)",
             f"Tokens that hit 3x+ (from first buy): {pumped_3x}",
             f"Tokens that hit 10x+ (from first buy): {pumped_10x}",
             f"Tokens that drew down 80%+ (likely rugs/dead): {rugged}",
@@ -1105,6 +1159,7 @@ def analyze():
                 FROM token_scan_log s
                 JOIN wallet_token_history h
                     ON h.wallet = s.wallet AND h.token_mint = s.token_mint
+                WHERE s.suspect_data IS NOT TRUE
             ),
             first_liquidity AS (
                 SELECT wallet, token_mint, liquidity AS starting_liquidity
@@ -1163,7 +1218,7 @@ def analyze():
             range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
 
         lines = [
-            f"<b>Early-scan comparison (first 3 scans, tokens starting under $100k liquidity):</b>{range_label}<br>"
+            f"<b>Early-scan comparison (first 3 scans, tokens starting under $100k liquidity, suspect data excluded):</b>{range_label}<br>"
         ]
         data_by_bucket = {}
         cols = [
@@ -1239,6 +1294,7 @@ def analyze_alerts():
             JOIN wallet_token_history h
                 ON h.wallet = s.wallet AND h.token_mint = s.token_mint
             WHERE s.momentum_alert_fired = TRUE
+            AND s.suspect_data IS NOT TRUE
         """
         params = []
         if since_param:
@@ -1281,7 +1337,7 @@ def analyze_alerts():
         if since_param or until_param:
             range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
 
-        lines = [f"<b>Recommendation hit-rate by score bucket:</b>{range_label}<br>"]
+        lines = [f"<b>Recommendation hit-rate by score bucket (suspect data excluded):</b>{range_label}<br>"]
         for bucket, d in buckets.items():
             total = d["total"]
             hits = d["hit_3x"]
@@ -1329,6 +1385,7 @@ def check_gate_risk():
                 FROM token_scan_log s
                 JOIN wallet_token_history h
                     ON h.wallet = s.wallet AND h.token_mint = s.token_mint
+                WHERE s.suspect_data IS NOT TRUE
             ),
             pumped_tokens AS (
                 SELECT DISTINCT wallet, token_mint
@@ -1405,6 +1462,7 @@ def check_volume_floor_risk():
                 FROM token_scan_log s
                 JOIN wallet_token_history h
                     ON h.wallet = s.wallet AND h.token_mint = s.token_mint
+                WHERE s.suspect_data IS NOT TRUE
             ),
             pumped_tokens AS (
                 SELECT DISTINCT wallet, token_mint
@@ -1482,6 +1540,7 @@ def check_oscillation_risk():
                         ORDER BY s.scanned_at
                     ) AS scan_num
                 FROM token_scan_log s
+                WHERE s.suspect_data IS NOT TRUE
             ),
             recommendation_scans AS (
                 SELECT wallet, token_mint, scan_num
@@ -1532,7 +1591,7 @@ def check_oscillation_risk():
             return f"{d['paid_off']}/{d['total']} ({d['paid_off']/d['total']*100:.1f}%)" if d["total"] else "n/a"
 
         lines = [
-            "<b>90+ score recommendations, by liquidity pattern:</b><br>",
+            "<b>90+ score recommendations, by liquidity pattern (suspect data excluded):</b><br>",
             f"<br>Sustained growth (prior scan also positive): {rate(sustained)}",
             f"Oscillating (prior scan was flat/negative): {rate(oscillating)}",
             "<br><br>If oscillating tokens hit noticeably less often, that "
@@ -1565,6 +1624,7 @@ def check_recency_bias():
             JOIN wallet_token_history h
                 ON h.wallet = s.wallet AND h.token_mint = s.token_mint
             WHERE s.momentum_alert_fired = TRUE
+            AND s.suspect_data IS NOT TRUE
             AND h.recommended_at IS NOT NULL
         """
         params = []
@@ -1650,6 +1710,7 @@ def check_pump_retention():
                 SELECT wallet, token_mint, scanned_at, multiplier_from_first_buy
                 FROM token_scan_log
                 WHERE multiplier_from_first_buy IS NOT NULL
+                AND suspect_data IS NOT TRUE
             ),
             peak AS (
                 SELECT DISTINCT ON (wallet, token_mint)
@@ -1698,7 +1759,7 @@ def check_pump_retention():
         held_pct = (held / total * 100) if total else 0
 
         lines = [
-            f"<b>Pump retention check (peak 3x+, {hours}+ hours after peak):</b><br>",
+            f"<b>Pump retention check (peak 3x+, {hours}+ hours after peak, suspect data excluded):</b><br>",
             f"<br>Total qualifying tokens: {total}",
             f"Still holding 50%+ of peak: {held} ({held_pct:.1f}%)",
             f"Dumped below 50% of peak: {dumped} ({100-held_pct:.1f}%)",
@@ -1731,6 +1792,7 @@ def check_pump_retention_detail():
                 SELECT wallet, token_mint, scanned_at, multiplier_from_first_buy
                 FROM token_scan_log
                 WHERE multiplier_from_first_buy IS NOT NULL
+                AND suspect_data IS NOT TRUE
             ),
             peak AS (
                 SELECT DISTINCT ON (wallet, token_mint)
@@ -1762,7 +1824,7 @@ def check_pump_retention_detail():
         if not rows:
             return f"No qualifying tokens for {hours}+ hours after peak.", 200
 
-        lines = [f"<b>Pump retention detail ({hours}+ hours after peak):</b><br>"]
+        lines = [f"<b>Pump retention detail ({hours}+ hours after peak, suspect data excluded):</b><br>"]
         shown = 0
         for wallet, mint, peak_mult, peak_at, latest_mult, latest_at in rows:
             threshold = float(peak_mult) * 0.5
@@ -1807,6 +1869,7 @@ def check_extension_risk():
             FROM token_scan_log s
             WHERE s.momentum_alert_fired = TRUE
             AND s.multiplier_from_first_buy IS NOT NULL
+            AND s.suspect_data IS NOT TRUE
         """
         params = []
         if since_param:
@@ -1856,7 +1919,7 @@ def check_extension_risk():
         if since_param or until_param:
             range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
 
-        lines = [f"<b>Multiplier-from-first-buy AT RECOMMENDATION, by score bucket:</b>{range_label}<br>"]
+        lines = [f"<b>Multiplier-from-first-buy AT RECOMMENDATION, by score bucket (suspect data excluded):</b>{range_label}<br>"]
         for bucket, vals in buckets.items():
             if not vals:
                 lines.append(f"<br>{bucket}: no data")
@@ -1887,12 +1950,6 @@ def check_extension_risk():
 
 @app.route("/check-retention-patterns")
 def check_retention_patterns():
-    """
-    Compares HELD vs DUMPED groups at recommendation time, reporting both
-    mean and median for every metric — mean is sensitive to outliers,
-    median tells you what a "typical" token in each group actually looked
-    like.
-    """
     hours = request.args.get("hours", "6")
     try:
         hours = float(hours)
@@ -1907,6 +1964,7 @@ def check_retention_patterns():
                 SELECT wallet, token_mint, scanned_at, multiplier_from_first_buy
                 FROM token_scan_log
                 WHERE multiplier_from_first_buy IS NOT NULL
+                AND suspect_data IS NOT TRUE
             ),
             peak AS (
                 SELECT DISTINCT ON (wallet, token_mint)
@@ -1941,6 +1999,7 @@ def check_retention_patterns():
                     s.pc_5m, s.pc_h1, s.pc_h6
                 FROM token_scan_log s
                 WHERE s.momentum_alert_fired = TRUE
+                AND s.suspect_data IS NOT TRUE
             ),
             joined AS (
                 SELECT o.outcome, r.momentum_score, r.liquidity,
@@ -2003,7 +2062,7 @@ def check_retention_patterns():
                 return f"${val:,.0f}"
             return f"{val:.2f}"
 
-        lines = [f"<b>Retention patterns at recommendation time ({hours}+ hours after peak):</b><br>"]
+        lines = [f"<b>Retention patterns at recommendation time ({hours}+ hours after peak, suspect data excluded):</b><br>"]
         for outcome in ["held", "dumped"]:
             d = data.get(outcome)
             if not d:
@@ -2094,7 +2153,7 @@ def token_history(mint):
                    pc_5m, pc_h1, pc_h6, buys_5m, sells_5m,
                    momentum_score, multiplier_from_first_buy,
                    liquidity_delta_pct, momentum_alert_fired, pump_alert_fired,
-                   multiplier_since_recommendation, market_cap
+                   multiplier_since_recommendation, market_cap, suspect_data
             FROM token_scan_log
             WHERE token_mint = %s
             ORDER BY scanned_at ASC
@@ -2109,13 +2168,15 @@ def token_history(mint):
         for i, row in enumerate(rows, 1):
             (scanned_at, price, liquidity, vol_5m, vol_h1, pc_5m, pc_h1, pc_h6,
              buys_5m, sells_5m, score, multiplier, liq_delta, mom_fired, pump_fired,
-             mult_since_rec, market_cap) = row
+             mult_since_rec, market_cap, suspect) = row
 
             flags = []
             if mom_fired:
                 flags.append("🚀 RECOMMENDED HERE")
             if pump_fired:
                 flags.append("🎯 3x-SINCE-RECOMMENDATION FIRED")
+            if suspect:
+                flags.append("⚠️ SUSPECT DATA (excluded from analysis)")
             flag_str = " ".join(flags)
 
             lines.append(
