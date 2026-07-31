@@ -1797,14 +1797,6 @@ def check_pump_retention_detail():
 
 @app.route("/check-extension-risk")
 def check_extension_risk():
-    """
-    For each score bucket, checks the average and median multiplier_from_first_buy
-    AT THE MOMENT OF RECOMMENDATION — i.e. how far into its run a token
-    already was when it got recommended. If 90-100 recommendations happen
-    at a much higher multiplier-from-first-buy than 70-79, that means high
-    scores are systematically catching tokens near the TOP of an already-
-    extended move, not at the start of a genuine new one.
-    """
     since_param, until_param = get_date_filter_params()
     conn = get_conn()
     try:
@@ -1888,6 +1880,128 @@ def check_extension_risk():
 
     except Exception as e:
         return f"check_extension_risk error: {e}", 500
+
+    finally:
+        conn.close()
+
+
+@app.route("/check-retention-patterns")
+def check_retention_patterns():
+    """
+    For tokens that peaked at 3x+ and had ?hours= pass since that peak,
+    compares everything measurable AT THE MOMENT OF RECOMMENDATION between
+    the group that HELD 50%+ of peak vs the group that DUMPED below it —
+    momentum score, liquidity, liquidity trend, volume, and price-change
+    windows, all side by side. Single-query version of manually reviewing
+    each winning token one at a time.
+    """
+    hours = request.args.get("hours", "6")
+    try:
+        hours = float(hours)
+    except (TypeError, ValueError):
+        hours = 6.0
+
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            WITH scans AS (
+                SELECT wallet, token_mint, scanned_at, multiplier_from_first_buy
+                FROM token_scan_log
+                WHERE multiplier_from_first_buy IS NOT NULL
+            ),
+            peak AS (
+                SELECT DISTINCT ON (wallet, token_mint)
+                    wallet, token_mint, scanned_at AS peak_at,
+                    multiplier_from_first_buy AS peak_mult
+                FROM scans
+                ORDER BY wallet, token_mint, multiplier_from_first_buy DESC, scanned_at ASC
+            ),
+            qualifying AS (
+                SELECT * FROM peak WHERE peak_mult >= 3
+            ),
+            latest AS (
+                SELECT DISTINCT ON (wallet, token_mint)
+                    wallet, token_mint, scanned_at AS latest_at,
+                    multiplier_from_first_buy AS latest_mult
+                FROM scans
+                ORDER BY wallet, token_mint, scanned_at DESC
+            ),
+            outcomes AS (
+                SELECT q.wallet, q.token_mint, q.peak_mult, q.peak_at,
+                       l.latest_mult, l.latest_at,
+                       CASE WHEN l.latest_mult >= q.peak_mult * 0.5
+                            THEN 'held' ELSE 'dumped' END AS outcome
+                FROM qualifying q
+                JOIN latest l ON l.wallet = q.wallet AND l.token_mint = q.token_mint
+                WHERE l.latest_at >= q.peak_at + (INTERVAL '1 hour' * %s)
+            ),
+            recommendation_scan AS (
+                SELECT
+                    s.wallet, s.token_mint, s.momentum_score, s.liquidity,
+                    s.liquidity_delta_pct, s.vol_5m, s.vol_h1,
+                    s.pc_5m, s.pc_h1, s.pc_h6
+                FROM token_scan_log s
+                WHERE s.momentum_alert_fired = TRUE
+            )
+            SELECT
+                o.outcome,
+                COUNT(*) AS n,
+                AVG(r.momentum_score) AS avg_score,
+                AVG(r.liquidity) AS avg_liquidity,
+                AVG(r.liquidity_delta_pct) AS avg_liq_delta,
+                AVG(r.vol_5m) AS avg_vol_5m,
+                AVG(r.vol_h1) AS avg_vol_h1,
+                AVG(r.pc_5m) AS avg_pc_5m,
+                AVG(r.pc_h1) AS avg_pc_h1,
+                AVG(r.pc_h6) AS avg_pc_h6
+            FROM outcomes o
+            JOIN recommendation_scan r
+                ON r.wallet = o.wallet AND r.token_mint = o.token_mint
+            GROUP BY o.outcome
+        """, (hours,))
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return f"No qualifying tokens for {hours}+ hours after peak with recommendation data.", 200
+
+        cols = ["outcome", "n", "avg_score", "avg_liquidity", "avg_liq_delta",
+                "avg_vol_5m", "avg_vol_h1", "avg_pc_5m", "avg_pc_h1", "avg_pc_h6"]
+        data = {}
+        for row in rows:
+            d = dict(zip(cols, row))
+            data[d["outcome"]] = d
+
+        def fmt(val, kind="num"):
+            if val is None:
+                return "n/a"
+            if kind == "pct":
+                return f"{val*100:.1f}%"
+            if kind == "usd":
+                return f"${val:,.0f}"
+            return f"{val:.2f}"
+
+        lines = [f"<b>Retention patterns at recommendation time ({hours}+ hours after peak):</b><br>"]
+        for outcome in ["held", "dumped"]:
+            d = data.get(outcome)
+            if not d:
+                lines.append(f"<br>{outcome.upper()}: no examples")
+                continue
+            lines.append(f"<br><b>{outcome.upper()}</b> (n={d['n']})")
+            lines.append(f"Momentum score: {fmt(d['avg_score'])}")
+            lines.append(f"Liquidity: {fmt(d['avg_liquidity'], 'usd')}")
+            lines.append(f"Liquidity delta: {fmt(d['avg_liq_delta'], 'pct')}")
+            lines.append(f"5m volume: {fmt(d['avg_vol_5m'], 'usd')} | 1h volume: {fmt(d['avg_vol_h1'], 'usd')}")
+            lines.append(f"Price change 5m/1h/6h: {fmt(d['avg_pc_5m'])}% / {fmt(d['avg_pc_h1'])}% / {fmt(d['avg_pc_h6'])}%")
+
+        lines.append("<br><br>Compare HELD vs DUMPED above — any metric with a "
+                      "consistent, meaningful gap is a real candidate signal for "
+                      "predicting whether a pump will actually hold.")
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_retention_patterns error: {e}", 500
 
     finally:
         conn.close()
