@@ -47,11 +47,6 @@ def looks_like_solana_address(text):
 
 
 def get_date_filter_params():
-    """
-    Shared helper for reading ?since= and ?until= query params (ISO format,
-    e.g. 2026-07-29T00:00:00) used across all analysis endpoints for
-    consistent before/after comparisons across deploy changes.
-    """
     since_param = request.args.get("since")
     until_param = request.args.get("until")
     return since_param, until_param
@@ -789,7 +784,8 @@ def run_pump_check():
                         f"Price at recommendation: ${price_at_recommendation} → now: ${current_price}\n"
                         f"{mc_line}\n"
                         f"📊 DexScreener: {dexscreener_url}\n\n"
-                        f"Type <code>/why {mint}</code> if you want the breakdown of what actually moved."
+                        f"Type <code>/why {mint}</code> for the breakdown, or <code>/peak {mint}</code> "
+                        f"anytime to check the all-time-high multiplier since this recommendation."
                     )
                     c.execute(
                         "UPDATE wallet_token_history SET pumped_since_recommendation_alerted = TRUE WHERE wallet=%s AND token_mint=%s",
@@ -939,6 +935,50 @@ def telegram_webhook():
                         chat_id
                     )
 
+    elif stripped.lower().startswith("/peak"):
+        parts = stripped.split(maxsplit=1)
+        if len(parts) < 2:
+            send_telegram_alert("Give me a token address: <code>/peak &lt;mint_address&gt;</code>", chat_id)
+        else:
+            mint = parts[1].strip()
+            conn = get_conn()
+            try:
+                c = conn.cursor()
+                c.execute("""
+                    SELECT price_at_recommendation, max_multiplier_since_recommendation,
+                           pumped_since_recommendation_alerted
+                    FROM wallet_token_history
+                    WHERE token_mint = %s AND price_at_recommendation IS NOT NULL
+                    ORDER BY recommended_at DESC
+                    LIMIT 1
+                """, (mint,))
+                row = c.fetchone()
+                c.close()
+            finally:
+                conn.close()
+
+            if not row or not row[0]:
+                send_telegram_alert(
+                    f"I never recommended <code>{mint}</code> — no ATH to report.",
+                    chat_id
+                )
+            else:
+                price_at_rec, max_mult, paid_off = row
+                current_price = get_current_price(mint)
+                current_mult_line = ""
+                if current_price and price_at_rec:
+                    try:
+                        current_mult = current_price / float(price_at_rec)
+                        current_mult_line = f"\nCurrently at: {current_mult:.2f}x"
+                    except (TypeError, ValueError, ZeroDivisionError):
+                        pass
+                send_telegram_alert(
+                    f"📈 <b>Peak since recommendation for {mint}:</b>\n"
+                    f"All-time high: {f'{max_mult:.2f}x' if max_mult else 'n/a'}"
+                    f"{current_mult_line}",
+                    chat_id
+                )
+
     elif looks_like_solana_address(stripped):
         handle_lore_request(stripped, chat_id)
 
@@ -956,11 +996,6 @@ def home():
 
 @app.route("/stats")
 def stats():
-    """
-    Supports ?since= and ?until= (ISO format) to filter token counts by
-    first_seen_at and recommendation counts by recommended_at, for
-    before/after comparisons across deploy changes.
-    """
     since_param, until_param = get_date_filter_params()
     conn = get_conn()
     try:
@@ -1041,10 +1076,6 @@ def stats():
 
 @app.route("/analyze")
 def analyze():
-    """
-    Supports ?since= and ?until= (ISO format) filtering on scan timestamp,
-    for before/after comparisons across deploy changes.
-    """
     since_param, until_param = get_date_filter_params()
     conn = get_conn()
     try:
@@ -1598,6 +1629,150 @@ def check_recency_bias():
 
     except Exception as e:
         return f"check_recency_bias error: {e}", 500
+
+    finally:
+        conn.close()
+
+
+@app.route("/check-pump-retention")
+def check_pump_retention():
+    """
+    Among tokens that peaked at 3x+ (from first buy) at some point, checks
+    what fraction were still holding at 50% or more of that peak multiplier
+    after ?hours= have passed since the peak. Tells you whether pumps tend
+    to hold their gains or dump back down quickly.
+    """
+    hours = request.args.get("hours", "6")
+    try:
+        hours = float(hours)
+    except (TypeError, ValueError):
+        hours = 6.0
+
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            WITH scans AS (
+                SELECT wallet, token_mint, scanned_at, multiplier_from_first_buy
+                FROM token_scan_log
+                WHERE multiplier_from_first_buy IS NOT NULL
+            ),
+            peak AS (
+                SELECT DISTINCT ON (wallet, token_mint)
+                    wallet, token_mint, scanned_at AS peak_at,
+                    multiplier_from_first_buy AS peak_mult
+                FROM scans
+                ORDER BY wallet, token_mint, multiplier_from_first_buy DESC, scanned_at ASC
+            ),
+            qualifying AS (
+                SELECT * FROM peak WHERE peak_mult >= 3
+            ),
+            latest AS (
+                SELECT DISTINCT ON (wallet, token_mint)
+                    wallet, token_mint, scanned_at AS latest_at,
+                    multiplier_from_first_buy AS latest_mult
+                FROM scans
+                ORDER BY wallet, token_mint, scanned_at DESC
+            )
+            SELECT q.wallet, q.token_mint, q.peak_mult, q.peak_at,
+                   l.latest_mult, l.latest_at
+            FROM qualifying q
+            JOIN latest l ON l.wallet = q.wallet AND l.token_mint = q.token_mint
+            WHERE l.latest_at >= q.peak_at + (INTERVAL '1 hour' * %s)
+        """, (hours,))
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return (
+                f"No tokens have both peaked at 3x+ AND had {hours}+ hours "
+                f"pass since that peak yet. Try a smaller ?hours= value or "
+                f"check back later.",
+                200
+            )
+
+        held = 0
+        dumped = 0
+        for wallet, mint, peak_mult, peak_at, latest_mult, latest_at in rows:
+            threshold = float(peak_mult) * 0.5
+            if latest_mult is not None and float(latest_mult) >= threshold:
+                held += 1
+            else:
+                dumped += 1
+
+        total = held + dumped
+        held_pct = (held / total * 100) if total else 0
+
+        lines = [
+            f"<b>Pump retention check (peak 3x+, {hours}+ hours after peak):</b><br>",
+            f"<br>Total qualifying tokens: {total}",
+            f"Still holding 50%+ of peak: {held} ({held_pct:.1f}%)",
+            f"Dumped below 50% of peak: {dumped} ({100-held_pct:.1f}%)",
+            "<br><br>Try different ?hours= values (e.g. ?hours=1, ?hours=12, "
+            "?hours=24) to see how retention changes with more time elapsed.",
+        ]
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_pump_retention error: {e}", 500
+
+    finally:
+        conn.close()
+
+
+@app.route("/recommendation/<mint>")
+def recommendation_lookup(mint):
+    """
+    Given any recommended token's mint address, reports the all-time-high
+    multiplier reached since recommendation, and the current multiplier —
+    since the 3x confirmation alert only fires once and never reports if
+    the token later went to 8x, 15x, or higher.
+    """
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT wallet, price_at_recommendation, recommended_at,
+                   max_multiplier_since_recommendation,
+                   pumped_since_recommendation_alerted,
+                   market_cap_at_recommendation
+            FROM wallet_token_history
+            WHERE token_mint = %s AND price_at_recommendation IS NOT NULL
+            ORDER BY recommended_at DESC
+            LIMIT 1
+        """, (mint,))
+        row = c.fetchone()
+        c.close()
+
+        if not row:
+            return f"No recommendation found for {mint} — this token was never recommended.", 200
+
+        (wallet, price_at_rec, recommended_at, max_mult,
+         paid_off, market_cap_at_rec) = row
+
+        current_price = get_current_price(mint)
+        current_mult = None
+        if current_price and price_at_rec:
+            try:
+                current_mult = current_price / float(price_at_rec)
+            except (TypeError, ValueError, ZeroDivisionError):
+                current_mult = None
+
+        lines = [
+            f"<b>Recommendation lookup: {mint}</b><br>",
+            f"<br>Wallet: <code>{wallet}</code>",
+            f"Recommended at: {recommended_at}",
+            f"Price at recommendation: ${price_at_rec}",
+            f"Market cap at recommendation: ${float(market_cap_at_rec):,.0f}" if market_cap_at_rec else "Market cap at recommendation: n/a",
+            "",
+            f"<b>ALL-TIME HIGH since recommendation: {f'{max_mult:.2f}x' if max_mult else 'n/a'}</b>",
+            f"Current multiplier: {f'{current_mult:.2f}x' if current_mult else 'n/a'} (price now: ${current_price if current_price else 'n/a'})",
+            f"3x confirmation fired: {'Yes' if paid_off else 'No'}",
+        ]
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"recommendation_lookup error: {e}", 500
 
     finally:
         conn.close()
