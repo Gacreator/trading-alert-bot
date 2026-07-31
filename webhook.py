@@ -1636,12 +1636,6 @@ def check_recency_bias():
 
 @app.route("/check-pump-retention")
 def check_pump_retention():
-    """
-    Among tokens that peaked at 3x+ (from first buy) at some point, checks
-    what fraction were still holding at 50% or more of that peak multiplier
-    after ?hours= have passed since the peak. Tells you whether pumps tend
-    to hold their gains or dump back down quickly.
-    """
     hours = request.args.get("hours", "6")
     try:
         hours = float(hours)
@@ -1720,14 +1714,94 @@ def check_pump_retention():
         conn.close()
 
 
+@app.route("/check-pump-retention-detail")
+def check_pump_retention_detail():
+    """
+    Same logic as /check-pump-retention, but lists the actual wallet/mint
+    pairs instead of just the aggregate count — so specific winning tokens
+    can be identified and studied for common patterns.
+    """
+    hours = request.args.get("hours", "6")
+    only_held = request.args.get("only_held", "true").lower() == "true"
+    try:
+        hours = float(hours)
+    except (TypeError, ValueError):
+        hours = 6.0
+
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            WITH scans AS (
+                SELECT wallet, token_mint, scanned_at, multiplier_from_first_buy
+                FROM token_scan_log
+                WHERE multiplier_from_first_buy IS NOT NULL
+            ),
+            peak AS (
+                SELECT DISTINCT ON (wallet, token_mint)
+                    wallet, token_mint, scanned_at AS peak_at,
+                    multiplier_from_first_buy AS peak_mult
+                FROM scans
+                ORDER BY wallet, token_mint, multiplier_from_first_buy DESC, scanned_at ASC
+            ),
+            qualifying AS (
+                SELECT * FROM peak WHERE peak_mult >= 3
+            ),
+            latest AS (
+                SELECT DISTINCT ON (wallet, token_mint)
+                    wallet, token_mint, scanned_at AS latest_at,
+                    multiplier_from_first_buy AS latest_mult
+                FROM scans
+                ORDER BY wallet, token_mint, scanned_at DESC
+            )
+            SELECT q.wallet, q.token_mint, q.peak_mult, q.peak_at,
+                   l.latest_mult, l.latest_at
+            FROM qualifying q
+            JOIN latest l ON l.wallet = q.wallet AND l.token_mint = q.token_mint
+            WHERE l.latest_at >= q.peak_at + (INTERVAL '1 hour' * %s)
+            ORDER BY q.peak_mult DESC
+        """, (hours,))
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return f"No qualifying tokens for {hours}+ hours after peak.", 200
+
+        lines = [f"<b>Pump retention detail ({hours}+ hours after peak):</b><br>"]
+        shown = 0
+        for wallet, mint, peak_mult, peak_at, latest_mult, latest_at in rows:
+            threshold = float(peak_mult) * 0.5
+            held = latest_mult is not None and float(latest_mult) >= threshold
+            if only_held and not held:
+                continue
+            shown += 1
+            retained_pct = (float(latest_mult) / float(peak_mult) * 100) if latest_mult else 0
+            lines.append(
+                f"<br><b>{'✅ HELD' if held else '❌ dumped'}</b> — "
+                f"<code>{mint}</code><br>"
+                f"Peak: {peak_mult:.2f}x at {peak_at} | "
+                f"Now: {latest_mult:.2f}x ({retained_pct:.0f}% of peak retained)<br>"
+                f"Wallet: <code>{wallet}</code>"
+            )
+
+        if shown == 0:
+            lines.append("<br>No tokens matched the filter (try ?only_held=false to see all).")
+
+        lines.append(
+            f"<br><br>Showing {shown} of {len(rows)} total qualifying tokens. "
+            f"Use ?only_held=false to see dumped ones too, or ?hours= to change the window."
+        )
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_pump_retention_detail error: {e}", 500
+
+    finally:
+        conn.close()
+
+
 @app.route("/recommendation/<mint>")
 def recommendation_lookup(mint):
-    """
-    Given any recommended token's mint address, reports the all-time-high
-    multiplier reached since recommendation, and the current multiplier —
-    since the 3x confirmation alert only fires once and never reports if
-    the token later went to 8x, 15x, or higher.
-    """
     conn = get_conn()
     try:
         c = conn.cursor()
