@@ -1888,12 +1888,10 @@ def check_extension_risk():
 @app.route("/check-retention-patterns")
 def check_retention_patterns():
     """
-    For tokens that peaked at 3x+ and had ?hours= pass since that peak,
-    compares everything measurable AT THE MOMENT OF RECOMMENDATION between
-    the group that HELD 50%+ of peak vs the group that DUMPED below it —
-    momentum score, liquidity, liquidity trend, volume, and price-change
-    windows, all side by side. Single-query version of manually reviewing
-    each winning token one at a time.
+    Compares HELD vs DUMPED groups at recommendation time, reporting both
+    mean and median for every metric — mean is sensitive to outliers,
+    median tells you what a "typical" token in each group actually looked
+    like.
     """
     hours = request.args.get("hours", "6")
     try:
@@ -1943,22 +1941,36 @@ def check_retention_patterns():
                     s.pc_5m, s.pc_h1, s.pc_h6
                 FROM token_scan_log s
                 WHERE s.momentum_alert_fired = TRUE
+            ),
+            joined AS (
+                SELECT o.outcome, r.momentum_score, r.liquidity,
+                       r.liquidity_delta_pct, r.vol_5m, r.vol_h1,
+                       r.pc_5m, r.pc_h1, r.pc_h6
+                FROM outcomes o
+                JOIN recommendation_scan r
+                    ON r.wallet = o.wallet AND r.token_mint = o.token_mint
             )
             SELECT
-                o.outcome,
+                outcome,
                 COUNT(*) AS n,
-                AVG(r.momentum_score) AS avg_score,
-                AVG(r.liquidity) AS avg_liquidity,
-                AVG(r.liquidity_delta_pct) AS avg_liq_delta,
-                AVG(r.vol_5m) AS avg_vol_5m,
-                AVG(r.vol_h1) AS avg_vol_h1,
-                AVG(r.pc_5m) AS avg_pc_5m,
-                AVG(r.pc_h1) AS avg_pc_h1,
-                AVG(r.pc_h6) AS avg_pc_h6
-            FROM outcomes o
-            JOIN recommendation_scan r
-                ON r.wallet = o.wallet AND r.token_mint = o.token_mint
-            GROUP BY o.outcome
+                AVG(momentum_score) AS avg_score,
+                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY momentum_score) AS median_score,
+                AVG(liquidity) AS avg_liquidity,
+                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY liquidity) AS median_liquidity,
+                AVG(liquidity_delta_pct) AS avg_liq_delta,
+                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY liquidity_delta_pct) AS median_liq_delta,
+                AVG(vol_5m) AS avg_vol_5m,
+                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY vol_5m) AS median_vol_5m,
+                AVG(vol_h1) AS avg_vol_h1,
+                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY vol_h1) AS median_vol_h1,
+                AVG(pc_5m) AS avg_pc_5m,
+                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY pc_5m) AS median_pc_5m,
+                AVG(pc_h1) AS avg_pc_h1,
+                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY pc_h1) AS median_pc_h1,
+                AVG(pc_h6) AS avg_pc_h6,
+                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY pc_h6) AS median_pc_h6
+            FROM joined
+            GROUP BY outcome
         """, (hours,))
         rows = c.fetchall()
         c.close()
@@ -1966,8 +1978,17 @@ def check_retention_patterns():
         if not rows:
             return f"No qualifying tokens for {hours}+ hours after peak with recommendation data.", 200
 
-        cols = ["outcome", "n", "avg_score", "avg_liquidity", "avg_liq_delta",
-                "avg_vol_5m", "avg_vol_h1", "avg_pc_5m", "avg_pc_h1", "avg_pc_h6"]
+        cols = [
+            "outcome", "n",
+            "avg_score", "median_score",
+            "avg_liquidity", "median_liquidity",
+            "avg_liq_delta", "median_liq_delta",
+            "avg_vol_5m", "median_vol_5m",
+            "avg_vol_h1", "median_vol_h1",
+            "avg_pc_5m", "median_pc_5m",
+            "avg_pc_h1", "median_pc_h1",
+            "avg_pc_h6", "median_pc_h6",
+        ]
         data = {}
         for row in rows:
             d = dict(zip(cols, row))
@@ -1989,15 +2010,19 @@ def check_retention_patterns():
                 lines.append(f"<br>{outcome.upper()}: no examples")
                 continue
             lines.append(f"<br><b>{outcome.upper()}</b> (n={d['n']})")
-            lines.append(f"Momentum score: {fmt(d['avg_score'])}")
-            lines.append(f"Liquidity: {fmt(d['avg_liquidity'], 'usd')}")
-            lines.append(f"Liquidity delta: {fmt(d['avg_liq_delta'], 'pct')}")
-            lines.append(f"5m volume: {fmt(d['avg_vol_5m'], 'usd')} | 1h volume: {fmt(d['avg_vol_h1'], 'usd')}")
-            lines.append(f"Price change 5m/1h/6h: {fmt(d['avg_pc_5m'])}% / {fmt(d['avg_pc_h1'])}% / {fmt(d['avg_pc_h6'])}%")
+            lines.append(f"Momentum score — avg: {fmt(d['avg_score'])}, median: {fmt(d['median_score'])}")
+            lines.append(f"Liquidity — avg: {fmt(d['avg_liquidity'], 'usd')}, median: {fmt(d['median_liquidity'], 'usd')}")
+            lines.append(f"Liquidity delta — avg: {fmt(d['avg_liq_delta'], 'pct')}, median: {fmt(d['median_liq_delta'], 'pct')}")
+            lines.append(f"5m volume — avg: {fmt(d['avg_vol_5m'], 'usd')}, median: {fmt(d['median_vol_5m'], 'usd')}")
+            lines.append(f"1h volume — avg: {fmt(d['avg_vol_h1'], 'usd')}, median: {fmt(d['median_vol_h1'], 'usd')}")
+            lines.append(f"Price change 5m — avg: {fmt(d['avg_pc_5m'])}%, median: {fmt(d['median_pc_5m'])}%")
+            lines.append(f"Price change 1h — avg: {fmt(d['avg_pc_h1'])}%, median: {fmt(d['median_pc_h1'])}%")
+            lines.append(f"Price change 6h — avg: {fmt(d['avg_pc_h6'])}%, median: {fmt(d['median_pc_h6'])}%")
 
-        lines.append("<br><br>Compare HELD vs DUMPED above — any metric with a "
-                      "consistent, meaningful gap is a real candidate signal for "
-                      "predicting whether a pump will actually hold.")
+        lines.append("<br><br>Compare medians especially — averages can be "
+                      "distorted by a single extreme outlier. A metric where "
+                      "BOTH avg and median show a consistent gap is the most "
+                      "trustworthy candidate signal.")
         return "<br>".join(lines), 200
 
     except Exception as e:
