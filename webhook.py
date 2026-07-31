@@ -22,12 +22,6 @@ TRACKED_WALLETS = set(
 MIN_LIQUIDITY_USD = int(os.environ.get("MIN_LIQUIDITY_USD", "8000"))
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 
-# Dropped from 168 (7 days) to 48 (2 days). Scan cycle time had grown from
-# ~10min to 24+ minutes as the tracked pool kept expanding under the 7-day
-# window, meaning cycles could no longer reliably finish before the next
-# cron trigger — undermining timely score updates for EVERY tracked token,
-# not just old ones. A bot that can't complete its scan loop is a bigger
-# problem than missing the rare token that takes >2 days to pump.
 SCAN_WINDOW_HOURS = int(os.environ.get("SCAN_WINDOW_HOURS", "48"))
 MAX_CONCURRENT_DEXSCREENER = int(os.environ.get("MAX_CONCURRENT_DEXSCREENER", "5"))
 DB_CONN_REFRESH_EVERY = int(os.environ.get("DB_CONN_REFRESH_EVERY", "150"))
@@ -50,6 +44,17 @@ _dex_rate_lock = threading.Semaphore(MAX_CONCURRENT_DEXSCREENER)
 
 def looks_like_solana_address(text):
     return bool(SOLANA_ADDRESS_RE.match(text.strip()))
+
+
+def get_date_filter_params():
+    """
+    Shared helper for reading ?since= and ?until= query params (ISO format,
+    e.g. 2026-07-29T00:00:00) used across all analysis endpoints for
+    consistent before/after comparisons across deploy changes.
+    """
+    since_param = request.args.get("since")
+    until_param = request.args.get("until")
+    return since_param, until_param
 
 
 # ---------- DB ----------
@@ -951,20 +956,35 @@ def home():
 
 @app.route("/stats")
 def stats():
+    """
+    Supports ?since= and ?until= (ISO format) to filter token counts by
+    first_seen_at and recommendation counts by recommended_at, for
+    before/after comparisons across deploy changes.
+    """
+    since_param, until_param = get_date_filter_params()
     conn = get_conn()
     try:
         c = conn.cursor()
 
-        c.execute("SELECT COUNT(*) FROM wallet_token_history")
+        token_filter = "WHERE 1=1"
+        token_params = []
+        if since_param:
+            token_filter += " AND first_seen_at >= %s"
+            token_params.append(since_param)
+        if until_param:
+            token_filter += " AND first_seen_at < %s"
+            token_params.append(until_param)
+
+        c.execute(f"SELECT COUNT(*) FROM wallet_token_history {token_filter}", token_params)
         total_tokens = c.fetchone()[0]
 
-        c.execute("SELECT COUNT(*) FROM wallet_token_history WHERE max_multiplier_seen >= 3")
+        c.execute(f"SELECT COUNT(*) FROM wallet_token_history {token_filter} AND max_multiplier_seen >= 3", token_params)
         pumped_3x = c.fetchone()[0]
 
-        c.execute("SELECT COUNT(*) FROM wallet_token_history WHERE max_multiplier_seen >= 10")
+        c.execute(f"SELECT COUNT(*) FROM wallet_token_history {token_filter} AND max_multiplier_seen >= 10", token_params)
         pumped_10x = c.fetchone()[0]
 
-        c.execute("SELECT COUNT(*) FROM wallet_token_history WHERE max_drawdown_seen >= 0.8")
+        c.execute(f"SELECT COUNT(*) FROM wallet_token_history {token_filter} AND max_drawdown_seen >= 0.8", token_params)
         rugged = c.fetchone()[0]
 
         c.execute("SELECT COUNT(*) FROM token_scan_log")
@@ -973,16 +993,29 @@ def stats():
         c.execute("SELECT MIN(first_seen_at) FROM wallet_token_history")
         earliest = c.fetchone()[0]
 
-        c.execute("SELECT COUNT(*) FROM wallet_token_history WHERE momentum_alerted = TRUE")
+        rec_filter = "WHERE momentum_alerted = TRUE"
+        rec_params = []
+        if since_param:
+            rec_filter += " AND recommended_at >= %s"
+            rec_params.append(since_param)
+        if until_param:
+            rec_filter += " AND recommended_at < %s"
+            rec_params.append(until_param)
+
+        c.execute(f"SELECT COUNT(*) FROM wallet_token_history {rec_filter}", rec_params)
         total_recommended = c.fetchone()[0]
 
-        c.execute("SELECT COUNT(*) FROM wallet_token_history WHERE pumped_since_recommendation_alerted = TRUE")
+        c.execute(f"SELECT COUNT(*) FROM wallet_token_history {rec_filter} AND pumped_since_recommendation_alerted = TRUE", rec_params)
         recommendations_that_paid_off = c.fetchone()[0]
 
         c.close()
 
+        range_label = ""
+        if since_param or until_param:
+            range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
+
         lines = [
-            f"Tracking since: {earliest}",
+            f"Tracking since: {earliest}{range_label}",
             f"Total tokens tracked: {total_tokens}",
             f"Total scan snapshots logged: {total_scans}",
             f"Tokens that hit 3x+ (from first buy): {pumped_3x}",
@@ -1008,10 +1041,25 @@ def stats():
 
 @app.route("/analyze")
 def analyze():
+    """
+    Supports ?since= and ?until= (ISO format) filtering on scan timestamp,
+    for before/after comparisons across deploy changes.
+    """
+    since_param, until_param = get_date_filter_params()
     conn = get_conn()
     try:
         c = conn.cursor()
-        c.execute("""
+
+        date_filter_sql = ""
+        params = []
+        if since_param:
+            date_filter_sql += " AND r.scanned_at >= %s"
+            params.append(since_param)
+        if until_param:
+            date_filter_sql += " AND r.scanned_at < %s"
+            params.append(until_param)
+
+        c.execute(f"""
             WITH ranked_scans AS (
                 SELECT
                     s.wallet, s.token_mint, s.scanned_at,
@@ -1040,6 +1088,7 @@ def analyze():
                 WHERE r.scan_num <= 3
                 AND f.starting_liquidity IS NOT NULL
                 AND f.starting_liquidity < 100000
+                {date_filter_sql}
             ),
             categorized AS (
                 SELECT *,
@@ -1071,15 +1120,19 @@ def analyze():
             WHERE bucket IN ('pumped', 'rugged')
             GROUP BY bucket
             ORDER BY bucket
-        """)
+        """, params)
         rows = c.fetchall()
         c.close()
 
         if not rows:
             return "No scan data yet under $100k starting liquidity — needs more small-cap tokens tracked first.", 200
 
+        range_label = ""
+        if since_param or until_param:
+            range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
+
         lines = [
-            "<b>Early-scan comparison (first 3 scans, tokens starting under $100k liquidity):</b><br>"
+            f"<b>Early-scan comparison (first 3 scans, tokens starting under $100k liquidity):</b>{range_label}<br>"
         ]
         data_by_bucket = {}
         cols = [
@@ -1140,17 +1193,7 @@ def analyze():
 
 @app.route("/analyze-alerts")
 def analyze_alerts():
-    """
-    Optional query params for date segmentation:
-      ?since=2026-07-30T13:30:00  (ISO format) — only include recommendations
-        made AT or AFTER this timestamp, so you can isolate the effect of a
-        specific deploy without mixing in older, pre-change data.
-      ?until=2026-07-30T18:00:00  (optional) — only include recommendations
-        made BEFORE this timestamp.
-    Example: /analyze-alerts?since=2026-07-30T13:30:00
-    """
-    since_param = request.args.get("since")
-    until_param = request.args.get("until")
+    since_param, until_param = get_date_filter_params()
 
     conn = get_conn()
     try:
@@ -1160,8 +1203,7 @@ def analyze_alerts():
             SELECT
                 s.wallet, s.token_mint, s.momentum_score,
                 h.max_multiplier_since_recommendation,
-                h.pumped_since_recommendation_alerted,
-                h.recommended_at
+                h.pumped_since_recommendation_alerted
             FROM token_scan_log s
             JOIN wallet_token_history h
                 ON h.wallet = s.wallet AND h.token_mint = s.token_mint
@@ -1188,7 +1230,7 @@ def analyze_alerts():
             "90-100": {"total": 0, "hit_3x": 0},
         }
 
-        for wallet, mint, score, max_mult, hit_3x, recommended_at in rows:
+        for wallet, mint, score, max_mult, hit_3x in rows:
             if score is None:
                 continue
             if 70 <= score < 80:
@@ -1206,10 +1248,7 @@ def analyze_alerts():
 
         range_label = ""
         if since_param or until_param:
-            range_label = (
-                f"<br>Filtered: since={since_param or 'start'}, "
-                f"until={until_param or 'now'}<br>"
-            )
+            range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
 
         lines = [f"<b>Recommendation hit-rate by score bucket:</b>{range_label}<br>"]
         for bucket, d in buckets.items():
@@ -1233,13 +1272,24 @@ def analyze_alerts():
 
 @app.route("/check-gate-risk")
 def check_gate_risk():
+    since_param, until_param = get_date_filter_params()
     conn = get_conn()
     try:
         c = conn.cursor()
-        c.execute("""
+
+        date_filter_sql = ""
+        params = []
+        if since_param:
+            date_filter_sql += " AND r.scanned_at >= %s"
+            params.append(since_param)
+        if until_param:
+            date_filter_sql += " AND r.scanned_at < %s"
+            params.append(until_param)
+
+        c.execute(f"""
             WITH ranked_scans AS (
                 SELECT
-                    s.wallet, s.token_mint, s.liquidity_delta_pct,
+                    s.wallet, s.token_mint, s.liquidity_delta_pct, s.scanned_at,
                     ROW_NUMBER() OVER (
                         PARTITION BY s.wallet, s.token_mint
                         ORDER BY s.scanned_at
@@ -1260,6 +1310,7 @@ def check_gate_risk():
                 JOIN pumped_tokens p
                     ON p.wallet = r.wallet AND p.token_mint = r.token_mint
                 WHERE r.scan_num <= 3
+                {date_filter_sql}
             )
             SELECT
                 COUNT(DISTINCT (wallet, token_mint)) AS total_pumped_tokens,
@@ -1267,7 +1318,7 @@ def check_gate_risk():
                     WHERE liquidity_delta_pct < 0
                 ) AS pumped_tokens_with_early_negative_delta
             FROM early_scans_of_pumped
-        """)
+        """, params)
         row = c.fetchone()
         c.close()
 
@@ -1297,13 +1348,24 @@ def check_gate_risk():
 
 @app.route("/check-volume-floor-risk")
 def check_volume_floor_risk():
+    since_param, until_param = get_date_filter_params()
     conn = get_conn()
     try:
         c = conn.cursor()
-        c.execute("""
+
+        date_filter_sql = ""
+        params = []
+        if since_param:
+            date_filter_sql += " AND r.scanned_at >= %s"
+            params.append(since_param)
+        if until_param:
+            date_filter_sql += " AND r.scanned_at < %s"
+            params.append(until_param)
+
+        c.execute(f"""
             WITH ranked_scans AS (
                 SELECT
-                    s.wallet, s.token_mint, s.vol_5m,
+                    s.wallet, s.token_mint, s.vol_5m, s.scanned_at,
                     ROW_NUMBER() OVER (
                         PARTITION BY s.wallet, s.token_mint
                         ORDER BY s.scanned_at
@@ -1325,6 +1387,7 @@ def check_volume_floor_risk():
                     ON p.wallet = r.wallet AND p.token_mint = r.token_mint
                 WHERE r.scan_num <= 3
                 AND r.vol_5m IS NOT NULL
+                {date_filter_sql}
             )
             SELECT
                 MIN(vol_5m) AS min_vol,
@@ -1332,7 +1395,7 @@ def check_volume_floor_risk():
                 PERCENTILE_CONT(0.10) WITHIN GROUP (ORDER BY vol_5m) AS p10_vol,
                 COUNT(*) AS total_scans
             FROM early_scans_of_pumped
-        """)
+        """, params)
         row = c.fetchone()
         c.close()
 
@@ -1364,10 +1427,21 @@ def check_volume_floor_risk():
 
 @app.route("/check-oscillation-risk")
 def check_oscillation_risk():
+    since_param, until_param = get_date_filter_params()
     conn = get_conn()
     try:
         c = conn.cursor()
-        c.execute("""
+
+        date_filter_sql = ""
+        params = []
+        if since_param:
+            date_filter_sql += " AND h.recommended_at >= %s"
+            params.append(since_param)
+        if until_param:
+            date_filter_sql += " AND h.recommended_at < %s"
+            params.append(until_param)
+
+        c.execute(f"""
             WITH ranked_scans AS (
                 SELECT
                     s.wallet, s.token_mint, s.liquidity_delta_pct,
@@ -1400,7 +1474,9 @@ def check_oscillation_risk():
             FROM prior_scan_delta p
             JOIN wallet_token_history h
                 ON h.wallet = p.wallet AND h.token_mint = p.token_mint
-        """)
+            WHERE 1=1
+            {date_filter_sql}
+        """, params)
         rows = c.fetchall()
         c.close()
 
@@ -1443,10 +1519,12 @@ def check_oscillation_risk():
 
 @app.route("/check-recency-bias")
 def check_recency_bias():
+    since_param, until_param = get_date_filter_params()
     conn = get_conn()
     try:
         c = conn.cursor()
-        c.execute("""
+
+        query = """
             SELECT
                 s.momentum_score,
                 h.recommended_at,
@@ -1457,7 +1535,16 @@ def check_recency_bias():
                 ON h.wallet = s.wallet AND h.token_mint = s.token_mint
             WHERE s.momentum_alert_fired = TRUE
             AND h.recommended_at IS NOT NULL
-        """)
+        """
+        params = []
+        if since_param:
+            query += " AND h.recommended_at >= %s"
+            params.append(since_param)
+        if until_param:
+            query += " AND h.recommended_at < %s"
+            params.append(until_param)
+
+        c.execute(query, params)
         rows = c.fetchall()
         c.close()
 
