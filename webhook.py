@@ -22,7 +22,13 @@ TRACKED_WALLETS = set(
 MIN_LIQUIDITY_USD = int(os.environ.get("MIN_LIQUIDITY_USD", "8000"))
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 
-SCAN_WINDOW_HOURS = int(os.environ.get("SCAN_WINDOW_HOURS", "168"))
+# Dropped from 168 (7 days) to 48 (2 days). Scan cycle time had grown from
+# ~10min to 24+ minutes as the tracked pool kept expanding under the 7-day
+# window, meaning cycles could no longer reliably finish before the next
+# cron trigger — undermining timely score updates for EVERY tracked token,
+# not just old ones. A bot that can't complete its scan loop is a bigger
+# problem than missing the rare token that takes >2 days to pump.
+SCAN_WINDOW_HOURS = int(os.environ.get("SCAN_WINDOW_HOURS", "48"))
 MAX_CONCURRENT_DEXSCREENER = int(os.environ.get("MAX_CONCURRENT_DEXSCREENER", "5"))
 DB_CONN_REFRESH_EVERY = int(os.environ.get("DB_CONN_REFRESH_EVERY", "150"))
 
@@ -376,21 +382,6 @@ def explain_pump(mint, price_at_recommendation, current_price, multiplier, recom
 # ---------- Momentum scoring ----------
 
 def score_momentum(pair, liquidity_delta_pct=None, prior_liquidity_delta_pct=None):
-    """
-    UPDATED: liquidity-trend scoring now requires confirmation across 2
-    consecutive scans to award full points. Evidence: /analyze-alerts showed
-    the 90-100 score bucket hit 3x+ only 1.6% of the time vs 4.1% for the
-    70-79 bucket, and /check-recency-bias confirmed this wasn't just an
-    immaturity artifact (all buckets had similar average age, 11-15h).
-
-    A rugged 99-score example showed liquidity oscillating up/down/up/down
-    across scans, hitting max score twice purely because the formula only
-    ever looked at the SINGLE most recent delta — a one-off uptick (real or
-    manipulated) could max out 45 points regardless of what happened just
-    before. Requiring the PRIOR scan to also show growth before awarding
-    full points should filter out this specific failure mode, since that
-    prior-scan data already exists and costs zero alert-timing delay.
-    """
     score = 0
     details = {}
 
@@ -404,10 +395,8 @@ def score_momentum(pair, liquidity_delta_pct=None, prior_liquidity_delta_pct=Non
 
     if liquidity_delta_pct is not None and liquidity_delta_pct > 0:
         if prior_liquidity_delta_pct is not None and prior_liquidity_delta_pct > 0:
-            # Confirmed across 2 consecutive scans — full weight
             trend_score = min(1.0, liquidity_delta_pct / 0.10) * 45
         else:
-            # One-off uptick, no confirmation yet — capped much lower
             trend_score = min(1.0, liquidity_delta_pct / 0.10) * 15
     else:
         trend_score = 0
@@ -708,10 +697,6 @@ def run_pump_check():
                     except (TypeError, ValueError, ZeroDivisionError):
                         liquidity_delta_pct = None
 
-                # Fetch prior scan's snapshot BEFORE scoring — this same
-                # already-existing data now feeds directly into the score
-                # calculation itself (not just the alert-message trend tags),
-                # with zero added delay since it's a lookup, not a wait.
                 prior_liq_delta, prior_pc_5m = get_prior_scan_snapshot(mint)
 
                 score, details = score_momentum(pair, liquidity_delta_pct, prior_liq_delta)
@@ -1155,24 +1140,47 @@ def analyze():
 
 @app.route("/analyze-alerts")
 def analyze_alerts():
+    """
+    Optional query params for date segmentation:
+      ?since=2026-07-30T13:30:00  (ISO format) — only include recommendations
+        made AT or AFTER this timestamp, so you can isolate the effect of a
+        specific deploy without mixing in older, pre-change data.
+      ?until=2026-07-30T18:00:00  (optional) — only include recommendations
+        made BEFORE this timestamp.
+    Example: /analyze-alerts?since=2026-07-30T13:30:00
+    """
+    since_param = request.args.get("since")
+    until_param = request.args.get("until")
+
     conn = get_conn()
     try:
         c = conn.cursor()
-        c.execute("""
+
+        query = """
             SELECT
                 s.wallet, s.token_mint, s.momentum_score,
                 h.max_multiplier_since_recommendation,
-                h.pumped_since_recommendation_alerted
+                h.pumped_since_recommendation_alerted,
+                h.recommended_at
             FROM token_scan_log s
             JOIN wallet_token_history h
                 ON h.wallet = s.wallet AND h.token_mint = s.token_mint
             WHERE s.momentum_alert_fired = TRUE
-        """)
+        """
+        params = []
+        if since_param:
+            query += " AND h.recommended_at >= %s"
+            params.append(since_param)
+        if until_param:
+            query += " AND h.recommended_at < %s"
+            params.append(until_param)
+
+        c.execute(query, params)
         rows = c.fetchall()
         c.close()
 
         if not rows:
-            return "No recommendations logged yet.", 200
+            return "No recommendations logged in this date range.", 200
 
         buckets = {
             "70-79": {"total": 0, "hit_3x": 0},
@@ -1180,7 +1188,7 @@ def analyze_alerts():
             "90-100": {"total": 0, "hit_3x": 0},
         }
 
-        for wallet, mint, score, max_mult, hit_3x in rows:
+        for wallet, mint, score, max_mult, hit_3x, recommended_at in rows:
             if score is None:
                 continue
             if 70 <= score < 80:
@@ -1196,7 +1204,14 @@ def analyze_alerts():
             if hit_3x or (max_mult and max_mult >= 3):
                 buckets[key]["hit_3x"] += 1
 
-        lines = ["<b>Recommendation hit-rate by score bucket:</b><br>"]
+        range_label = ""
+        if since_param or until_param:
+            range_label = (
+                f"<br>Filtered: since={since_param or 'start'}, "
+                f"until={until_param or 'now'}<br>"
+            )
+
+        lines = [f"<b>Recommendation hit-rate by score bucket:</b>{range_label}<br>"]
         for bucket, d in buckets.items():
             total = d["total"]
             hits = d["hit_3x"]
