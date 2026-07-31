@@ -2,6 +2,7 @@ from flask import Flask, request
 import os
 import re
 import time
+import datetime
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import psycopg2
@@ -471,17 +472,6 @@ def price_trend_label(current_pc_5m, prior_pc_5m):
 # ---------- RugCheck integration ----------
 
 def get_rugcheck_data(mint):
-    """
-    Free, no-key-required RugCheck API check (https://api.rugcheck.xyz/v1).
-    Returns (risk_score, liquidity_flags) or (None, None) on any failure —
-    never blocks or delays the alert if RugCheck is slow/down, just omits
-    this section from the message.
-
-    Note: RugCheck flags CONTRACT-level risks (mint/freeze authority,
-    LP lock status) — it does not predict ordinary market-driven dumps
-    (e.g. a team simply selling their bags), only structural rug-pull
-    mechanisms like unlocked liquidity.
-    """
     try:
         url = f"https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary"
         resp = requests.get(url, timeout=5)
@@ -1404,6 +1394,90 @@ def check_oscillation_risk():
 
     except Exception as e:
         return f"check_oscillation_risk error: {e}", 500
+
+    finally:
+        conn.close()
+
+
+@app.route("/check-recency-bias")
+def check_recency_bias():
+    """
+    Checks whether higher-scoring recommendations are simply more recent
+    (haven't had time to mature) vs whether the hit-rate gap seen in
+    /analyze-alerts is a real, time-independent quality difference.
+
+    If avg hours since recommendation is similar across buckets, the lower
+    hit-rate seen in higher-scoring buckets is likely a REAL signal — not
+    just an artifact of recent tokens not having had time to pump yet.
+    """
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT
+                s.momentum_score,
+                h.recommended_at,
+                h.max_multiplier_since_recommendation,
+                h.pumped_since_recommendation_alerted
+            FROM token_scan_log s
+            JOIN wallet_token_history h
+                ON h.wallet = s.wallet AND h.token_mint = s.token_mint
+            WHERE s.momentum_alert_fired = TRUE
+            AND h.recommended_at IS NOT NULL
+        """)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return "No recommendations yet.", 200
+
+        buckets = {
+            "70-79": [],
+            "80-89": [],
+            "90-100": [],
+        }
+
+        for score, recommended_at, max_mult, hit_3x in rows:
+            if score is None or recommended_at is None:
+                continue
+            if 70 <= score < 80:
+                key = "70-79"
+            elif 80 <= score < 90:
+                key = "80-89"
+            elif score >= 90:
+                key = "90-100"
+            else:
+                continue
+            buckets[key].append(recommended_at)
+
+        now = datetime.datetime.utcnow()
+
+        lines = ["<b>Average maturity time per score bucket:</b><br>"]
+        for bucket, items in buckets.items():
+            if not items:
+                lines.append(f"<br>{bucket}: no data")
+                continue
+            hours_elapsed = [
+                (now - r).total_seconds() / 3600
+                for r in items
+                if r is not None
+            ]
+            avg_hours = sum(hours_elapsed) / len(hours_elapsed) if hours_elapsed else 0
+            lines.append(
+                f"<br>Score {bucket}: {len(items)} recs, "
+                f"avg age {avg_hours:.1f}h since recommendation"
+            )
+
+        lines.append(
+            "<br><br>If avg age is similar across buckets, the hit-rate gap "
+            "seen in /analyze-alerts is likely REAL, not just immaturity — "
+            "worth investigating whether high scores are catching "
+            "manipulation/oscillation patterns rather than genuine momentum."
+        )
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_recency_bias error: {e}", 500
 
     finally:
         conn.close()
