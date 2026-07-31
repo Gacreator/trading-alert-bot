@@ -375,7 +375,22 @@ def explain_pump(mint, price_at_recommendation, current_price, multiplier, recom
 
 # ---------- Momentum scoring ----------
 
-def score_momentum(pair, liquidity_delta_pct=None):
+def score_momentum(pair, liquidity_delta_pct=None, prior_liquidity_delta_pct=None):
+    """
+    UPDATED: liquidity-trend scoring now requires confirmation across 2
+    consecutive scans to award full points. Evidence: /analyze-alerts showed
+    the 90-100 score bucket hit 3x+ only 1.6% of the time vs 4.1% for the
+    70-79 bucket, and /check-recency-bias confirmed this wasn't just an
+    immaturity artifact (all buckets had similar average age, 11-15h).
+
+    A rugged 99-score example showed liquidity oscillating up/down/up/down
+    across scans, hitting max score twice purely because the formula only
+    ever looked at the SINGLE most recent delta — a one-off uptick (real or
+    manipulated) could max out 45 points regardless of what happened just
+    before. Requiring the PRIOR scan to also show growth before awarding
+    full points should filter out this specific failure mode, since that
+    prior-scan data already exists and costs zero alert-timing delay.
+    """
     score = 0
     details = {}
 
@@ -385,8 +400,15 @@ def score_momentum(pair, liquidity_delta_pct=None):
         return 0, details
 
     details["liquidity_delta_pct"] = liquidity_delta_pct
+    details["prior_liquidity_delta_pct"] = prior_liquidity_delta_pct
+
     if liquidity_delta_pct is not None and liquidity_delta_pct > 0:
-        trend_score = min(1.0, liquidity_delta_pct / 0.10) * 45
+        if prior_liquidity_delta_pct is not None and prior_liquidity_delta_pct > 0:
+            # Confirmed across 2 consecutive scans — full weight
+            trend_score = min(1.0, liquidity_delta_pct / 0.10) * 45
+        else:
+            # One-off uptick, no confirmation yet — capped much lower
+            trend_score = min(1.0, liquidity_delta_pct / 0.10) * 15
     else:
         trend_score = 0
     score += trend_score
@@ -686,7 +708,13 @@ def run_pump_check():
                     except (TypeError, ValueError, ZeroDivisionError):
                         liquidity_delta_pct = None
 
-                score, details = score_momentum(pair, liquidity_delta_pct)
+                # Fetch prior scan's snapshot BEFORE scoring — this same
+                # already-existing data now feeds directly into the score
+                # calculation itself (not just the alert-message trend tags),
+                # with zero added delay since it's a lookup, not a wait.
+                prior_liq_delta, prior_pc_5m = get_prior_scan_snapshot(mint)
+
+                score, details = score_momentum(pair, liquidity_delta_pct, prior_liq_delta)
                 current_liquidity = details.get("liquidity")
 
                 multiplier_since_recommendation = None
@@ -722,7 +750,6 @@ def run_pump_check():
                 if not momentum_alerted and score >= 70:
                     momentum_alert_fired = True
 
-                    prior_liq_delta, prior_pc_5m = get_prior_scan_snapshot(mint)
                     liq_trend_note = liquidity_trend_label(liquidity_delta_pct, prior_liq_delta)
                     price_trend_note = price_trend_label(details.get("pc_5m"), prior_pc_5m)
 
@@ -1401,15 +1428,6 @@ def check_oscillation_risk():
 
 @app.route("/check-recency-bias")
 def check_recency_bias():
-    """
-    Checks whether higher-scoring recommendations are simply more recent
-    (haven't had time to mature) vs whether the hit-rate gap seen in
-    /analyze-alerts is a real, time-independent quality difference.
-
-    If avg hours since recommendation is similar across buckets, the lower
-    hit-rate seen in higher-scoring buckets is likely a REAL signal — not
-    just an artifact of recent tokens not having had time to pump yet.
-    """
     conn = get_conn()
     try:
         c = conn.cursor()
