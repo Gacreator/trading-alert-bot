@@ -1716,11 +1716,6 @@ def check_pump_retention():
 
 @app.route("/check-pump-retention-detail")
 def check_pump_retention_detail():
-    """
-    Same logic as /check-pump-retention, but lists the actual wallet/mint
-    pairs instead of just the aggregate count — so specific winning tokens
-    can be identified and studied for common patterns.
-    """
     hours = request.args.get("hours", "6")
     only_held = request.args.get("only_held", "true").lower() == "true"
     try:
@@ -1795,6 +1790,104 @@ def check_pump_retention_detail():
 
     except Exception as e:
         return f"check_pump_retention_detail error: {e}", 500
+
+    finally:
+        conn.close()
+
+
+@app.route("/check-extension-risk")
+def check_extension_risk():
+    """
+    For each score bucket, checks the average and median multiplier_from_first_buy
+    AT THE MOMENT OF RECOMMENDATION — i.e. how far into its run a token
+    already was when it got recommended. If 90-100 recommendations happen
+    at a much higher multiplier-from-first-buy than 70-79, that means high
+    scores are systematically catching tokens near the TOP of an already-
+    extended move, not at the start of a genuine new one.
+    """
+    since_param, until_param = get_date_filter_params()
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+
+        query = """
+            SELECT s.momentum_score, s.multiplier_from_first_buy
+            FROM token_scan_log s
+            WHERE s.momentum_alert_fired = TRUE
+            AND s.multiplier_from_first_buy IS NOT NULL
+        """
+        params = []
+        if since_param:
+            query += " AND s.scanned_at >= %s"
+            params.append(since_param)
+        if until_param:
+            query += " AND s.scanned_at < %s"
+            params.append(until_param)
+
+        c.execute(query, params)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return "No recommendation data with multiplier_from_first_buy yet.", 200
+
+        buckets = {
+            "70-79": [],
+            "80-89": [],
+            "90-100": [],
+        }
+
+        for score, mult in rows:
+            if score is None or mult is None:
+                continue
+            if 70 <= score < 80:
+                key = "70-79"
+            elif 80 <= score < 90:
+                key = "80-89"
+            elif score >= 90:
+                key = "90-100"
+            else:
+                continue
+            buckets[key].append(float(mult))
+
+        def median(vals):
+            s = sorted(vals)
+            n = len(s)
+            if n == 0:
+                return None
+            mid = n // 2
+            if n % 2 == 0:
+                return (s[mid - 1] + s[mid]) / 2
+            return s[mid]
+
+        range_label = ""
+        if since_param or until_param:
+            range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
+
+        lines = [f"<b>Multiplier-from-first-buy AT RECOMMENDATION, by score bucket:</b>{range_label}<br>"]
+        for bucket, vals in buckets.items():
+            if not vals:
+                lines.append(f"<br>{bucket}: no data")
+                continue
+            avg_mult = sum(vals) / len(vals)
+            med_mult = median(vals)
+            lines.append(
+                f"<br>Score {bucket}: n={len(vals)}, "
+                f"avg {avg_mult:.2f}x, median {med_mult:.2f}x already run up "
+                f"before recommendation"
+            )
+
+        lines.append(
+            "<br><br>If 90-100 shows a noticeably higher avg/median multiplier "
+            "than 70-79, that means high scores are systematically catching "
+            "tokens further into an already-extended move — i.e. closer to "
+            "the top, not the start — which would explain poor hit-rate "
+            "independent of any liquidity-oscillation pattern."
+        )
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_extension_risk error: {e}", 500
 
     finally:
         conn.close()
