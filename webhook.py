@@ -14,6 +14,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+HELIUS_API_KEY = os.environ.get("HELIUS_API_KEY")
 
 TRACKED_WALLETS = set(
     w.strip() for w in os.environ.get("TRACKED_WALLETS", "").split(",") if w.strip()
@@ -532,6 +533,81 @@ def rugcheck_label(risk_score, liquidity_flags):
     return base
 
 
+# ---------- Holder concentration check (free, via Helius/Solana RPC) ----------
+
+def get_top_holder_concentration(mint):
+    """
+    Uses Solana RPC via Helius (getTokenSupply + getTokenLargestAccounts) to
+    check what % of total supply the largest holders control. Free — uses
+    the existing HELIUS_API_KEY, no new service required.
+
+    Honest limitation: getTokenLargestAccounts returns TOKEN ACCOUNTS, which
+    can include the liquidity pool's own holding address as a top "holder" —
+    this is normal and doesn't mean a person controls that share. This check
+    can't yet distinguish LP addresses from real wallets, so a high top1%
+    could sometimes just be the pool itself. Treat this as a first-pass
+    signal, not a definitive verdict — genuine bundler/multi-wallet
+    detection (like Bubblemaps' Magic Nodes) would need more sophistication.
+
+    Called only at recommendation time (not every scan) to keep RPC usage
+    reasonable.
+    """
+    if not HELIUS_API_KEY:
+        return None
+    try:
+        url = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+
+        supply_resp = requests.post(
+            url, json={"jsonrpc": "2.0", "id": 1, "method": "getTokenSupply", "params": [mint]},
+            timeout=5
+        )
+        supply_data = supply_resp.json()
+        supply_value = supply_data.get("result", {}).get("value", {}) or {}
+        total_supply_ui = float(supply_value.get("uiAmount") or 0)
+        if total_supply_ui <= 0:
+            return None
+
+        largest_resp = requests.post(
+            url, json={"jsonrpc": "2.0", "id": 1, "method": "getTokenLargestAccounts", "params": [mint]},
+            timeout=5
+        )
+        largest_data = largest_resp.json()
+        accounts = largest_data.get("result", {}).get("value", []) or []
+        if not accounts:
+            return None
+
+        holdings_pct = []
+        for acc in accounts:
+            ui_amt = float(acc.get("uiAmount") or 0)
+            pct = (ui_amt / total_supply_ui) * 100 if total_supply_ui else 0
+            holdings_pct.append(pct)
+
+        top1_pct = holdings_pct[0] if holdings_pct else 0
+        top5_pct = sum(holdings_pct[:5])
+
+        return {"top1_pct": top1_pct, "top5_pct": top5_pct}
+
+    except Exception as e:
+        print(f"Holder concentration error for {mint}: {e}")
+        return None
+
+
+def holder_concentration_label(data):
+    if not data:
+        return "⚪ Holder concentration: unable to check."
+    top1 = data["top1_pct"]
+    top5 = data["top5_pct"]
+    if top1 >= 10:
+        base = f"🔴 Top holder: {top1:.1f}% of supply (HIGH concentration risk)"
+    elif top1 >= 7:
+        base = f"🟡 Top holder: {top1:.1f}% of supply (moderate concentration)"
+    else:
+        base = f"🟢 Top holder: {top1:.1f}% of supply"
+    base += f" | Top 5 combined: {top5:.1f}%"
+    base += " (note: may include the LP pool address, not just individual wallets)"
+    return base
+
+
 # ---------- Wallet buy detection ----------
 
 def extract_wallet_buys(tx, wallet):
@@ -776,6 +852,9 @@ def run_pump_check():
                     rug_score, rug_liq_flags = get_rugcheck_data(mint)
                     rug_note = rugcheck_label(rug_score, rug_liq_flags)
 
+                    holder_data = get_top_holder_concentration(mint)
+                    holder_note = holder_concentration_label(holder_data)
+
                     c.execute(
                         """
                         UPDATE wallet_token_history
@@ -798,7 +877,8 @@ def run_pump_check():
                         f"Price change 5m/1h/6h: {details.get('pc_5m')}% / {details.get('pc_h1')}% / {details.get('pc_h6')}%\n\n"
                         f"{liq_trend_note}\n"
                         f"{price_trend_note}\n"
-                        f"{rug_note}\n\n"
+                        f"{rug_note}\n"
+                        f"{holder_note}\n\n"
                         f"📊 DexScreener: {dexscreener_url}\n\n"
                         f"Recommending this now — tracking from this price to see if it delivers. DYOR."
                     )
@@ -2077,15 +2157,6 @@ def check_retention_patterns():
 
 @app.route("/backfill-suspect-data", methods=["GET", "POST"])
 def backfill_suspect_data():
-    """
-    One-time (or repeatable) backfill applying the suspect-data check to
-    EXISTING rows in token_scan_log. ALTER TABLE ... DEFAULT FALSE only
-    applies to new rows going forward — historical rows (including known
-    distortions like the 7700% 6h price-change outlier) were never
-    actually evaluated against the 50x/5000% thresholds until now.
-
-    Safe to run multiple times — only re-checks rows currently NOT TRUE.
-    """
     conn = get_conn()
     try:
         c = conn.cursor()
