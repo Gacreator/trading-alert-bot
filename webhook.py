@@ -26,11 +26,6 @@ SCAN_WINDOW_HOURS = int(os.environ.get("SCAN_WINDOW_HOURS", "48"))
 MAX_CONCURRENT_DEXSCREENER = int(os.environ.get("MAX_CONCURRENT_DEXSCREENER", "5"))
 DB_CONN_REFRESH_EVERY = int(os.environ.get("DB_CONN_REFRESH_EVERY", "150"))
 
-# Sanity cap for implausible reads (likely DexScreener returning stale/
-# mismatched pair data during AMM migration or multi-pair confusion,
-# rather than a genuine pump). Any scan crossing these gets flagged as
-# suspect_data — still recorded for visibility, but excluded from all
-# analysis and blocked from triggering live alerts.
 MAX_PLAUSIBLE_MULTIPLIER = float(os.environ.get("MAX_PLAUSIBLE_MULTIPLIER", "50"))
 MAX_PLAUSIBLE_PC_H6 = float(os.environ.get("MAX_PLAUSIBLE_PC_H6", "5000"))
 
@@ -490,13 +485,6 @@ def price_trend_label(current_pc_5m, prior_pc_5m):
 
 
 def is_suspect_scan(multiplier_from_first_buy, multiplier_since_recommendation, pc_h6):
-    """
-    Flags a scan as likely bad DexScreener data (stale/mismatched pair
-    during AMM migration or multi-pair confusion) rather than a genuine
-    pump. Observed pattern: implausible multipliers or 6h price changes
-    that self-correct the next cycle. These get recorded but excluded
-    from analysis and blocked from triggering live alerts.
-    """
     if multiplier_from_first_buy is not None and multiplier_from_first_buy > MAX_PLAUSIBLE_MULTIPLIER:
         return True
     if multiplier_since_recommendation is not None and multiplier_since_recommendation > MAX_PLAUSIBLE_MULTIPLIER:
@@ -766,10 +754,6 @@ def run_pump_check():
                          drawdown, current_liquidity, multiplier_since_recommendation, wallet, mint)
                     )
                 elif current_price is not None and suspect:
-                    # Still update last_checked_at/last_liquidity so the next
-                    # cycle's liquidity_delta_pct calculation stays sane, but
-                    # skip the max/min tracking fields that suspect data would
-                    # corrupt.
                     c.execute(
                         """
                         UPDATE wallet_token_history
@@ -2086,6 +2070,62 @@ def check_retention_patterns():
 
     except Exception as e:
         return f"check_retention_patterns error: {e}", 500
+
+    finally:
+        conn.close()
+
+
+@app.route("/backfill-suspect-data", methods=["GET", "POST"])
+def backfill_suspect_data():
+    """
+    One-time (or repeatable) backfill applying the suspect-data check to
+    EXISTING rows in token_scan_log. ALTER TABLE ... DEFAULT FALSE only
+    applies to new rows going forward — historical rows (including known
+    distortions like the 7700% 6h price-change outlier) were never
+    actually evaluated against the 50x/5000% thresholds until now.
+
+    Safe to run multiple times — only re-checks rows currently NOT TRUE.
+    """
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT id, multiplier_from_first_buy, multiplier_since_recommendation, pc_h6
+            FROM token_scan_log
+            WHERE suspect_data IS NOT TRUE
+        """)
+        rows = c.fetchall()
+
+        flagged = 0
+        checked = 0
+
+        for row_id, mult_first, mult_rec, pc_h6 in rows:
+            checked += 1
+            mult_first_f = float(mult_first) if mult_first is not None else None
+            mult_rec_f = float(mult_rec) if mult_rec is not None else None
+            pc_h6_f = float(pc_h6) if pc_h6 is not None else None
+
+            if is_suspect_scan(mult_first_f, mult_rec_f, pc_h6_f):
+                c.execute(
+                    "UPDATE token_scan_log SET suspect_data = TRUE WHERE id = %s",
+                    (row_id,)
+                )
+                flagged += 1
+
+        conn.commit()
+        c.close()
+
+        return (
+            f"Backfill complete — checked {checked} existing scans, "
+            f"newly flagged {flagged} as suspect data (multiplier > "
+            f"{MAX_PLAUSIBLE_MULTIPLIER}x or 6h price change beyond "
+            f"±{MAX_PLAUSIBLE_PC_H6}%). These are now excluded from all "
+            f"analysis endpoints going forward.",
+            200
+        )
+
+    except Exception as e:
+        return f"backfill_suspect_data error: {e}", 500
 
     finally:
         conn.close()
