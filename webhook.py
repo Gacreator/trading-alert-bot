@@ -58,8 +58,6 @@ def get_date_filter_params():
     return since_param, until_param
 
 
-# ---------- DB ----------
-
 def get_conn():
     return psycopg2.connect(
         DATABASE_URL,
@@ -144,8 +142,6 @@ def init_db():
 init_db()
 
 
-# ---------- Telegram helpers ----------
-
 def _send_to_one_chat(message, chat_id):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -192,8 +188,6 @@ def send_bare_address_to_rick_chat(mint):
         print(f"Failed to send Rick address ping: {e}")
 
 
-# ---------- Groq (Queen brain) ----------
-
 def ask_queen(user_message, extra_context=""):
     if not GROQ_API_KEY:
         return "My AI brain isn't wired up yet — ask my creator to add the Groq key."
@@ -222,8 +216,6 @@ def ask_queen(user_message, extra_context=""):
         print(f"Groq error: {e}")
         return "Ugh, brain fog moment — try me again in a sec."
 
-
-# ---------- Token data sources ----------
 
 def get_pumpfun_data(mint):
     try:
@@ -417,8 +409,6 @@ def explain_pump(mint, price_at_recommendation, current_price, multiplier, recom
     return ask_queen(prompt)
 
 
-# ---------- Momentum scoring ----------
-
 def score_momentum(pair, liquidity_delta_pct=None, prior_liquidity_delta_pct=None):
     score = 0
     details = {}
@@ -466,6 +456,13 @@ def score_momentum(pair, liquidity_delta_pct=None, prior_liquidity_delta_pct=Non
     elif 0.01 <= vol_to_liq_ratio <= 0.3:
         score += 10
 
+    vol_h1_to_liq_ratio = (vol_h1 / liquidity) if liquidity > 0 else 0
+    details["vol_h1_to_liq_ratio"] = vol_h1_to_liq_ratio
+    if vol_h1_to_liq_ratio > 10:
+        score -= 20
+    elif vol_h1_to_liq_ratio > 5:
+        score -= 10
+
     txns = pair.get("txns", {}) or {}
     m5 = txns.get("m5", {}) or {}
     details["buys_5m"] = m5.get("buys", 0) or 0
@@ -473,8 +470,6 @@ def score_momentum(pair, liquidity_delta_pct=None, prior_liquidity_delta_pct=Non
 
     return round(max(0, score)), details
 
-
-# ---------- Backward-looking trend labels (zero-delay, informational only) ----------
 
 def get_prior_scan_snapshot(mint):
     conn = get_conn()
@@ -528,8 +523,6 @@ def is_suspect_scan(multiplier_from_first_buy, multiplier_since_recommendation, 
     return False
 
 
-# ---------- RugCheck integration ----------
-
 def get_rugcheck_data(mint):
     try:
         url = f"https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary"
@@ -565,8 +558,6 @@ def rugcheck_label(risk_score, liquidity_flags):
         base += f" — flags: {', '.join(liquidity_flags)}"
     return base
 
-
-# ---------- Holder concentration check (free, via Helius/Solana RPC) ----------
 
 def get_top_holder_concentration(mint, pair_address=None):
     if not HELIUS_API_KEY:
@@ -655,8 +646,6 @@ def holder_concentration_label(data):
     return base
 
 
-# ---------- Wallet buy detection ----------
-
 def extract_wallet_buys(tx, wallet):
     mints_bought = []
     seen = set()
@@ -691,8 +680,6 @@ def extract_wallet_buys(tx, wallet):
 
     return mints_bought
 
-
-# ---------- Wallet monitoring webhook (Helius) ----------
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -751,8 +738,6 @@ def check_and_record_buy(wallet, mint):
     finally:
         conn.close()
 
-
-# ---------- Periodic pump/momentum check ----------
 
 def run_pump_check():
     conn = None
@@ -1025,8 +1010,6 @@ def check_pumps():
     threading.Thread(target=run_pump_check, daemon=True).start()
     return "started", 200
 
-
-# ---------- Telegram incoming messages webhook ----------
 
 @app.route("/telegram", methods=["POST"])
 def telegram_webhook():
@@ -2416,15 +2399,6 @@ def check_pump_timing_risk_6h():
 
 @app.route("/check-recommendation-value")
 def check_recommendation_value():
-    """
-    Compares hit-rate-from-FIRST-BUY (the same baseline for both groups)
-    between tokens the bot RECOMMENDED (score crossed 70) vs tokens it
-    NEVER recommended. This is the fair, apples-to-apples test of whether
-    the recommendation system is actually adding value — using the same
-    3x-from-first-buy yardstick for both groups, rather than comparing
-    the harder 3x-from-recommendation-price bar against the easier
-    3x-from-first-buy bar.
-    """
     since_param, until_param = get_date_filter_params()
     conn = get_conn()
     try:
