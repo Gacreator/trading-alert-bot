@@ -175,17 +175,6 @@ def send_telegram_alert(message, chat_id=None):
 
 
 def send_bare_address_to_rick_chat(mint):
-    """
-    Sends ONLY the raw mint address (no labels, no HTML formatting, no
-    parse_mode) to the SECOND configured chat — the group with Rick in it
-    — so Rick's bot triggers on it automatically, the same way it would
-    if a human pasted just the address with nothing else.
-
-    Deliberately separate from send_telegram_alert: must go to ONLY
-    TELEGRAM_CHAT_IDS[1] (never the first/private chat), and must never
-    be bundled with any other text, since Rick appears to only respond
-    when a message is JUST a contract address.
-    """
     if len(TELEGRAM_CHAT_IDS) < 2:
         print("No second chat ID configured — skipping Rick address ping.")
         return
@@ -580,26 +569,6 @@ def rugcheck_label(risk_score, liquidity_flags):
 # ---------- Holder concentration check (free, via Helius/Solana RPC) ----------
 
 def get_top_holder_concentration(mint, pair_address=None):
-    """
-    Uses Solana RPC via Helius (getTokenSupply + getTokenLargestAccounts) to
-    check what % of total supply the largest holders control. Free — uses
-    the existing HELIUS_API_KEY, no new service required.
-
-    Cross-references each top holder's OWNING wallet against the known
-    DexScreener pair_address (the pool's own account) — if a top holder is
-    actually just the liquidity pool itself, it's excluded from the ranking
-    so top1%/top5% reflects real external wallets, not the pool's own
-    balance.
-
-    Honest limitation: this only catches the specific pool address
-    DexScreener reports for THIS pair. It won't catch a genuine CEX wallet
-    (rare for brand-new pump.fun/Raydium tokens, but not impossible) or a
-    secondary/older pool if the token migrated between AMMs. Real bundler/
-    multi-wallet clustering (Bubblemaps' Magic Nodes) is still out of scope.
-
-    Called only at recommendation time (not every scan) to keep RPC usage
-    reasonable.
-    """
     if not HELIUS_API_KEY:
         return None
     try:
@@ -2277,6 +2246,95 @@ def backfill_suspect_data():
 
     except Exception as e:
         return f"backfill_suspect_data error: {e}", 500
+
+    finally:
+        conn.close()
+
+
+@app.route("/check-pump-timing-risk")
+def check_pump_timing_risk():
+    """
+    Buckets recommendations by their pc_h1 (1-hour price change AT THE
+    MOMENT OF RECOMMENDATION) and checks hit-rate per bucket. This is a
+    more direct proxy for "how extended was this token already" than
+    multiplier_from_first_buy, since pc_h1 is the token's own recent price
+    action, independent of when the tracked wallet happened to buy in.
+    """
+    since_param, until_param = get_date_filter_params()
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+
+        query = """
+            SELECT s.pc_h1, h.max_multiplier_since_recommendation,
+                   h.pumped_since_recommendation_alerted
+            FROM token_scan_log s
+            JOIN wallet_token_history h
+                ON h.wallet = s.wallet AND h.token_mint = s.token_mint
+            WHERE s.momentum_alert_fired = TRUE
+            AND s.suspect_data IS NOT TRUE
+            AND s.pc_h1 IS NOT NULL
+        """
+        params = []
+        if since_param:
+            query += " AND h.recommended_at >= %s"
+            params.append(since_param)
+        if until_param:
+            query += " AND h.recommended_at < %s"
+            params.append(until_param)
+
+        c.execute(query, params)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return "No recommendation data with pc_h1 yet.", 200
+
+        buckets = {
+            "under 50%": {"total": 0, "hit_3x": 0},
+            "50-150%": {"total": 0, "hit_3x": 0},
+            "150-300%": {"total": 0, "hit_3x": 0},
+            "over 300%": {"total": 0, "hit_3x": 0},
+        }
+
+        for pc_h1, max_mult, hit_3x in rows:
+            pc_h1 = float(pc_h1)
+            if pc_h1 < 50:
+                key = "under 50%"
+            elif pc_h1 < 150:
+                key = "50-150%"
+            elif pc_h1 < 300:
+                key = "150-300%"
+            else:
+                key = "over 300%"
+
+            buckets[key]["total"] += 1
+            hit = bool(hit_3x) or (max_mult and max_mult >= 3)
+            if hit:
+                buckets[key]["hit_3x"] += 1
+
+        range_label = ""
+        if since_param or until_param:
+            range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
+
+        lines = [f"<b>Recommendation hit-rate by 1h price-change AT RECOMMENDATION:</b>{range_label}<br>"]
+        for bucket, d in buckets.items():
+            total = d["total"]
+            hits = d["hit_3x"]
+            rate = f"{hits/total*100:.1f}%" if total else "n/a"
+            lines.append(f"<br>Already up {bucket} in the last hour: {hits}/{total} hit 3x+ ({rate})")
+
+        lines.append(
+            "<br><br>If lower pc_h1 buckets (under 50%, 50-150%) show "
+            "meaningfully HIGHER hit rates than the high buckets (150-300%, "
+            "over 300%), that confirms tokens are being caught too late — "
+            "already extended before recommendation — and a pc_h1 cap "
+            "should be added to the score."
+        )
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_pump_timing_risk error: {e}", 500
 
     finally:
         conn.close()
