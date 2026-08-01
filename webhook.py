@@ -103,6 +103,7 @@ def init_db():
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS market_cap_at_recommendation NUMERIC")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS rugcheck_score_at_recommendation NUMERIC")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS top1_holder_pct_at_recommendation NUMERIC")
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS cluster_count_at_recommendation INTEGER")
 
         c.execute("""
             CREATE TABLE IF NOT EXISTS token_scan_log (
@@ -648,6 +649,40 @@ def holder_concentration_label(data):
     return base
 
 
+def get_wallet_cluster_count(mint, current_wallet):
+    """
+    Checks how many DISTINCT tracked wallets (including the current one)
+    have ever bought this token. With 8 wallets now tracked, 2+ wallets
+    independently buying the same obscure token is a much stronger
+    conviction signal than any single wallet's buy alone. Informational
+    only for now — does not affect momentum score until validated with
+    real held/dumped outcome data.
+    """
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT DISTINCT wallet
+            FROM wallet_token_history
+            WHERE token_mint = %s
+        """, (mint,))
+        wallets = [row[0] for row in c.fetchall()]
+        c.close()
+        return wallets
+    finally:
+        conn.close()
+
+
+def cluster_label(wallets, current_wallet):
+    count = len(wallets)
+    if count >= 3:
+        return f"🔥🔥 STRONG CLUSTER: {count} tracked wallets bought this token independently!"
+    elif count == 2:
+        return f"🔥 Cluster detected: 2 tracked wallets bought this token independently."
+    else:
+        return "⚪ Single wallet signal — no other tracked wallets have bought this token yet."
+
+
 def extract_wallet_buys(tx, wallet):
     mints_bought = []
     seen = set()
@@ -889,6 +924,9 @@ def run_pump_check():
                     holder_data = get_top_holder_concentration(mint, pair.get("pairAddress"))
                     holder_note = holder_concentration_label(holder_data)
 
+                    cluster_wallets = get_wallet_cluster_count(mint, wallet)
+                    cluster_note = cluster_label(cluster_wallets, wallet)
+
                     c.execute(
                         """
                         UPDATE wallet_token_history
@@ -897,11 +935,13 @@ def run_pump_check():
                             recommended_at = NOW(),
                             market_cap_at_recommendation = %s,
                             rugcheck_score_at_recommendation = %s,
-                            top1_holder_pct_at_recommendation = %s
+                            top1_holder_pct_at_recommendation = %s,
+                            cluster_count_at_recommendation = %s
                         WHERE wallet=%s AND token_mint=%s
                         """,
                         (current_price, current_market_cap, rug_score,
                          holder_data.get("top1_pct") if holder_data else None,
+                         len(cluster_wallets),
                          wallet, mint)
                     )
                     send_telegram_alert(
@@ -916,7 +956,8 @@ def run_pump_check():
                         f"{liq_trend_note}\n"
                         f"{price_trend_note}\n"
                         f"{rug_note}\n"
-                        f"{holder_note}\n\n"
+                        f"{holder_note}\n"
+                        f"{cluster_note}\n\n"
                         f"📊 DexScreener: {dexscreener_url}\n\n"
                         f"Recommending this now — tracking from this price to see if it delivers. DYOR."
                     )
@@ -2616,6 +2657,80 @@ def check_time_of_day():
 
     except Exception as e:
         return f"check_time_of_day error: {e}", 500
+
+    finally:
+        conn.close()
+
+
+@app.route("/check-cluster-performance")
+def check_cluster_performance():
+    """
+    Compares hit-rate between recommendations that had a cluster (2+
+    tracked wallets independently buying the same token) vs single-wallet
+    recommendations. This validates whether cluster detection is a real
+    signal before it's ever used to affect the score.
+    """
+    since_param, until_param = get_date_filter_params()
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+
+        query = """
+            SELECT cluster_count_at_recommendation,
+                   max_multiplier_since_recommendation,
+                   pumped_since_recommendation_alerted
+            FROM wallet_token_history
+            WHERE momentum_alerted = TRUE
+            AND cluster_count_at_recommendation IS NOT NULL
+        """
+        params = []
+        if since_param:
+            query += " AND recommended_at >= %s"
+            params.append(since_param)
+        if until_param:
+            query += " AND recommended_at < %s"
+            params.append(until_param)
+
+        c.execute(query, params)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return "No recommendation data with cluster tracking yet.", 200
+
+        single = {"total": 0, "hit_3x": 0}
+        cluster = {"total": 0, "hit_3x": 0}
+
+        for cluster_count, max_mult, hit_3x in rows:
+            hit = bool(hit_3x) or (max_mult and max_mult >= 3)
+            if cluster_count and cluster_count >= 2:
+                cluster["total"] += 1
+                if hit:
+                    cluster["hit_3x"] += 1
+            else:
+                single["total"] += 1
+                if hit:
+                    single["hit_3x"] += 1
+
+        def rate(d):
+            return f"{d['hit_3x']}/{d['total']} ({d['hit_3x']/d['total']*100:.1f}%)" if d["total"] else "n/a"
+
+        range_label = ""
+        if since_param or until_param:
+            range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
+
+        lines = [f"<b>Recommendation hit-rate: cluster vs single-wallet</b>{range_label}<br>"]
+        lines.append(f"<br>Single wallet (1 tracked wallet bought): {rate(single)}")
+        lines.append(f"Cluster (2+ tracked wallets bought): {rate(cluster)}")
+        lines.append(
+            "<br><br>If cluster hit rate is meaningfully higher AND the "
+            "sample size is large enough (20-30+), that validates adding a "
+            "score boost for clusters. Too early to trust with a small sample."
+        )
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_cluster_performance error: {e}", 500
 
     finally:
         conn.close()
