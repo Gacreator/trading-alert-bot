@@ -2482,6 +2482,65 @@ def check_recommendation_value():
         conn.close()
 
 
+@app.route("/check-wallet-performance")
+def check_wallet_performance():
+    since_param, until_param = get_date_filter_params()
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+
+        query = """
+            SELECT
+                wallet,
+                COUNT(*) AS total_recommended,
+                COUNT(*) FILTER (WHERE pumped_since_recommendation_alerted = TRUE
+                                  OR COALESCE(max_multiplier_since_recommendation, 0) >= 3) AS hit_3x
+            FROM wallet_token_history
+            WHERE momentum_alerted = TRUE
+        """
+        params = []
+        if since_param:
+            query += " AND recommended_at >= %s"
+            params.append(since_param)
+        if until_param:
+            query += " AND recommended_at < %s"
+            params.append(until_param)
+        query += " GROUP BY wallet ORDER BY total_recommended DESC"
+
+        c.execute(query, params)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return "No recommendation data yet.", 200
+
+        range_label = ""
+        if since_param or until_param:
+            range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
+
+        lines = [f"<b>Recommendation hit-rate by tracked wallet:</b>{range_label}<br>"]
+        for wallet, total, hits in rows:
+            rate = f"{hits/total*100:.1f}%" if total else "n/a"
+            lines.append(
+                f"<br><code>{wallet}</code><br>"
+                f"{hits}/{total} recommendations hit 3x+ ({rate})"
+            )
+
+        lines.append(
+            "<br><br>If one wallet's hit rate is meaningfully lower than the "
+            "others, its buys may be adding noise rather than signal. If one "
+            "is meaningfully higher, that wallet's calls deserve extra "
+            "weight or priority when sourcing new wallets to track."
+        )
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_wallet_performance error: {e}", 500
+
+    finally:
+        conn.close()
+
+
 @app.route("/recommendation/<mint>")
 def recommendation_lookup(mint):
     conn = get_conn()
