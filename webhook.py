@@ -2253,13 +2253,6 @@ def backfill_suspect_data():
 
 @app.route("/check-pump-timing-risk")
 def check_pump_timing_risk():
-    """
-    Buckets recommendations by their pc_h1 (1-hour price change AT THE
-    MOMENT OF RECOMMENDATION) and checks hit-rate per bucket. This is a
-    more direct proxy for "how extended was this token already" than
-    multiplier_from_first_buy, since pc_h1 is the token's own recent price
-    action, independent of when the tracked wallet happened to buy in.
-    """
     since_param, until_param = get_date_filter_params()
     conn = get_conn()
     try:
@@ -2335,6 +2328,175 @@ def check_pump_timing_risk():
 
     except Exception as e:
         return f"check_pump_timing_risk error: {e}", 500
+
+    finally:
+        conn.close()
+
+
+@app.route("/check-pump-timing-risk-6h")
+def check_pump_timing_risk_6h():
+    since_param, until_param = get_date_filter_params()
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+
+        query = """
+            SELECT s.pc_h6, h.max_multiplier_since_recommendation,
+                   h.pumped_since_recommendation_alerted
+            FROM token_scan_log s
+            JOIN wallet_token_history h
+                ON h.wallet = s.wallet AND h.token_mint = s.token_mint
+            WHERE s.momentum_alert_fired = TRUE
+            AND s.suspect_data IS NOT TRUE
+            AND s.pc_h6 IS NOT NULL
+        """
+        params = []
+        if since_param:
+            query += " AND h.recommended_at >= %s"
+            params.append(since_param)
+        if until_param:
+            query += " AND h.recommended_at < %s"
+            params.append(until_param)
+
+        c.execute(query, params)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return "No recommendation data with pc_h6 yet.", 200
+
+        buckets = {
+            "under 100%": {"total": 0, "hit_3x": 0},
+            "100-300%": {"total": 0, "hit_3x": 0},
+            "300-600%": {"total": 0, "hit_3x": 0},
+            "over 600%": {"total": 0, "hit_3x": 0},
+        }
+
+        for pc_h6, max_mult, hit_3x in rows:
+            pc_h6 = float(pc_h6)
+            if pc_h6 < 100:
+                key = "under 100%"
+            elif pc_h6 < 300:
+                key = "100-300%"
+            elif pc_h6 < 600:
+                key = "300-600%"
+            else:
+                key = "over 600%"
+
+            buckets[key]["total"] += 1
+            hit = bool(hit_3x) or (max_mult and max_mult >= 3)
+            if hit:
+                buckets[key]["hit_3x"] += 1
+
+        range_label = ""
+        if since_param or until_param:
+            range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
+
+        lines = [f"<b>Recommendation hit-rate by 6h price-change AT RECOMMENDATION:</b>{range_label}<br>"]
+        for bucket, d in buckets.items():
+            total = d["total"]
+            hits = d["hit_3x"]
+            rate = f"{hits/total*100:.1f}%" if total else "n/a"
+            lines.append(f"<br>Already up {bucket} in the last 6h: {hits}/{total} hit 3x+ ({rate})")
+
+        lines.append(
+            "<br><br>Same idea as the 1h check, but over a longer window — "
+            "if lower pc_h6 buckets show meaningfully HIGHER hit rates than "
+            "the high buckets, that's a cleaner signal that tokens are being "
+            "caught too late in their run."
+        )
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_pump_timing_risk_6h error: {e}", 500
+
+    finally:
+        conn.close()
+
+
+@app.route("/check-recommendation-value")
+def check_recommendation_value():
+    """
+    Compares hit-rate-from-FIRST-BUY (the same baseline for both groups)
+    between tokens the bot RECOMMENDED (score crossed 70) vs tokens it
+    NEVER recommended. This is the fair, apples-to-apples test of whether
+    the recommendation system is actually adding value — using the same
+    3x-from-first-buy yardstick for both groups, rather than comparing
+    the harder 3x-from-recommendation-price bar against the easier
+    3x-from-first-buy bar.
+    """
+    since_param, until_param = get_date_filter_params()
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+
+        token_filter = "WHERE 1=1"
+        params = []
+        if since_param:
+            token_filter += " AND first_seen_at >= %s"
+            params.append(since_param)
+        if until_param:
+            token_filter += " AND first_seen_at < %s"
+            params.append(until_param)
+
+        c.execute(f"""
+            SELECT
+                momentum_alerted,
+                COUNT(*) AS total,
+                COUNT(*) FILTER (WHERE COALESCE(max_multiplier_seen, 0) >= 3) AS hit_3x
+            FROM wallet_token_history
+            {token_filter}
+            GROUP BY momentum_alerted
+        """, params)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return "No token data in this range.", 200
+
+        data = {}
+        for was_recommended, total, hit_3x in rows:
+            data[bool(was_recommended)] = {"total": total, "hit_3x": hit_3x}
+
+        range_label = ""
+        if since_param or until_param:
+            range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
+
+        lines = [f"<b>Hit-rate-from-first-buy: recommended vs never-recommended</b>{range_label}<br>"]
+
+        recommended = data.get(True, {"total": 0, "hit_3x": 0})
+        not_recommended = data.get(False, {"total": 0, "hit_3x": 0})
+
+        rec_rate = (recommended["hit_3x"] / recommended["total"] * 100) if recommended["total"] else 0
+        not_rec_rate = (not_recommended["hit_3x"] / not_recommended["total"] * 100) if not_recommended["total"] else 0
+
+        lines.append(
+            f"<br><b>RECOMMENDED</b> (score crossed 70 at some point): "
+            f"{recommended['hit_3x']}/{recommended['total']} hit 3x+ from first buy ({rec_rate:.1f}%)"
+        )
+        lines.append(
+            f"<br><b>NEVER RECOMMENDED</b>: "
+            f"{not_recommended['hit_3x']}/{not_recommended['total']} hit 3x+ from first buy ({not_rec_rate:.1f}%)"
+        )
+
+        lines.append("<br><br>")
+        if rec_rate > not_rec_rate:
+            lines.append(
+                f"✅ Recommended tokens hit 3x+ from first buy at a HIGHER rate "
+                f"than never-recommended ones — the recommendation system is "
+                f"genuinely concentrating winners, using the same baseline for both groups."
+            )
+        else:
+            lines.append(
+                f"⚠️ Recommended tokens do NOT outperform never-recommended ones "
+                f"on this fair, same-baseline comparison — worth investigating "
+                f"further before trusting the current scoring threshold."
+            )
+
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_recommendation_value error: {e}", 500
 
     finally:
         conn.close()
