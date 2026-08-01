@@ -12,7 +12,13 @@ app = Flask(__name__)
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+# TELEGRAM_CHAT_ID can be a single ID or a comma-separated list (e.g. your
+# original DM chat ID plus a group ID) — broadcast alerts go to all of them.
+# Replies to a specific person messaging the bot directly still go only to
+# that person's chat (see send_telegram_alert's chat_id override below).
+TELEGRAM_CHAT_IDS = [
+    cid.strip() for cid in os.environ.get("TELEGRAM_CHAT_ID", "").split(",") if cid.strip()
+]
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 HELIUS_API_KEY = os.environ.get("HELIUS_API_KEY")
 
@@ -144,19 +150,41 @@ init_db()
 
 # ---------- Telegram helpers ----------
 
-def send_telegram_alert(message, chat_id=None):
+def _send_to_one_chat(message, chat_id):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": chat_id or TELEGRAM_CHAT_ID,
+        "chat_id": chat_id,
         "text": message,
         "parse_mode": "HTML",
         "disable_web_page_preview": True
     }
     try:
         resp = requests.post(url, json=payload, timeout=5)
-        print(f"Telegram response: {resp.status_code} {resp.text}")
+        print(f"Telegram response ({chat_id}): {resp.status_code} {resp.text}")
     except Exception as e:
-        print(f"Failed to send Telegram alert: {e}")
+        print(f"Failed to send Telegram alert to {chat_id}: {e}")
+
+
+def send_telegram_alert(message, chat_id=None):
+    """
+    If chat_id is given (e.g. replying to whoever DM'd the bot with /lore,
+    /why, /peak, /start), send only there — a private reply should never
+    fan out to every configured chat/group.
+
+    If chat_id is None (a broadcast alert — pump/momentum alerts fired by
+    run_pump_check), send to every chat in TELEGRAM_CHAT_IDS, so you can
+    have it post to both your original DM and a group at the same time.
+    """
+    if chat_id:
+        _send_to_one_chat(message, chat_id)
+        return
+
+    if not TELEGRAM_CHAT_IDS:
+        print("No TELEGRAM_CHAT_ID configured — alert not sent.")
+        return
+
+    for cid in TELEGRAM_CHAT_IDS:
+        _send_to_one_chat(message, cid)
 
 
 # ---------- Groq (Queen brain) ----------
