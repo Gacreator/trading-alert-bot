@@ -12,10 +12,6 @@ app = Flask(__name__)
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-# TELEGRAM_CHAT_ID can be a single ID or a comma-separated list (e.g. your
-# original DM chat ID plus a group ID) — broadcast alerts go to all of them.
-# Replies to a specific person messaging the bot directly still go only to
-# that person's chat (see send_telegram_alert's chat_id override below).
 TELEGRAM_CHAT_IDS = [
     cid.strip() for cid in os.environ.get("TELEGRAM_CHAT_ID", "").split(",") if cid.strip()
 ]
@@ -166,15 +162,6 @@ def _send_to_one_chat(message, chat_id):
 
 
 def send_telegram_alert(message, chat_id=None):
-    """
-    If chat_id is given (e.g. replying to whoever DM'd the bot with /lore,
-    /why, /peak, /start), send only there — a private reply should never
-    fan out to every configured chat/group.
-
-    If chat_id is None (a broadcast alert — pump/momentum alerts fired by
-    run_pump_check), send to every chat in TELEGRAM_CHAT_IDS, so you can
-    have it post to both your original DM and a group at the same time.
-    """
     if chat_id:
         _send_to_one_chat(message, chat_id)
         return
@@ -185,6 +172,35 @@ def send_telegram_alert(message, chat_id=None):
 
     for cid in TELEGRAM_CHAT_IDS:
         _send_to_one_chat(message, cid)
+
+
+def send_bare_address_to_rick_chat(mint):
+    """
+    Sends ONLY the raw mint address (no labels, no HTML formatting, no
+    parse_mode) to the SECOND configured chat — the group with Rick in it
+    — so Rick's bot triggers on it automatically, the same way it would
+    if a human pasted just the address with nothing else.
+
+    Deliberately separate from send_telegram_alert: must go to ONLY
+    TELEGRAM_CHAT_IDS[1] (never the first/private chat), and must never
+    be bundled with any other text, since Rick appears to only respond
+    when a message is JUST a contract address.
+    """
+    if len(TELEGRAM_CHAT_IDS) < 2:
+        print("No second chat ID configured — skipping Rick address ping.")
+        return
+    rick_chat_id = TELEGRAM_CHAT_IDS[1]
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": rick_chat_id,
+        "text": mint,
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=5)
+        print(f"Rick address ping ({rick_chat_id}): {resp.status_code} {resp.text}")
+    except Exception as e:
+        print(f"Failed to send Rick address ping: {e}")
 
 
 # ---------- Groq (Queen brain) ----------
@@ -563,19 +579,23 @@ def rugcheck_label(risk_score, liquidity_flags):
 
 # ---------- Holder concentration check (free, via Helius/Solana RPC) ----------
 
-def get_top_holder_concentration(mint):
+def get_top_holder_concentration(mint, pair_address=None):
     """
     Uses Solana RPC via Helius (getTokenSupply + getTokenLargestAccounts) to
     check what % of total supply the largest holders control. Free — uses
     the existing HELIUS_API_KEY, no new service required.
 
-    Honest limitation: getTokenLargestAccounts returns TOKEN ACCOUNTS, which
-    can include the liquidity pool's own holding address as a top "holder" —
-    this is normal and doesn't mean a person controls that share. This check
-    can't yet distinguish LP addresses from real wallets, so a high top1%
-    could sometimes just be the pool itself. Treat this as a first-pass
-    signal, not a definitive verdict — genuine bundler/multi-wallet
-    detection (like Bubblemaps' Magic Nodes) would need more sophistication.
+    Cross-references each top holder's OWNING wallet against the known
+    DexScreener pair_address (the pool's own account) — if a top holder is
+    actually just the liquidity pool itself, it's excluded from the ranking
+    so top1%/top5% reflects real external wallets, not the pool's own
+    balance.
+
+    Honest limitation: this only catches the specific pool address
+    DexScreener reports for THIS pair. It won't catch a genuine CEX wallet
+    (rare for brand-new pump.fun/Raydium tokens, but not impossible) or a
+    secondary/older pool if the token migrated between AMMs. Real bundler/
+    multi-wallet clustering (Bubblemaps' Magic Nodes) is still out of scope.
 
     Called only at recommendation time (not every scan) to keep RPC usage
     reasonable.
@@ -604,13 +624,44 @@ def get_top_holder_concentration(mint):
         if not accounts:
             return None
 
+        token_account_addresses = [acc.get("address") for acc in accounts if acc.get("address")]
+        owners_by_account = {}
+        if token_account_addresses:
+            info_resp = requests.post(
+                url,
+                json={
+                    "jsonrpc": "2.0", "id": 1,
+                    "method": "getMultipleAccounts",
+                    "params": [token_account_addresses, {"encoding": "jsonParsed"}]
+                },
+                timeout=5
+            )
+            info_data = info_resp.json()
+            values = info_data.get("result", {}).get("value", []) or []
+            for addr, val in zip(token_account_addresses, values):
+                if not val:
+                    continue
+                parsed = val.get("data", {}).get("parsed", {}) or {}
+                owner = parsed.get("info", {}).get("owner")
+                if owner:
+                    owners_by_account[addr] = owner
+
         holdings_pct = []
         for acc in accounts:
+            addr = acc.get("address")
+            owner = owners_by_account.get(addr)
+
+            if pair_address and owner == pair_address:
+                continue
+
             ui_amt = float(acc.get("uiAmount") or 0)
             pct = (ui_amt / total_supply_ui) * 100 if total_supply_ui else 0
             holdings_pct.append(pct)
 
-        top1_pct = holdings_pct[0] if holdings_pct else 0
+        if not holdings_pct:
+            return None
+
+        top1_pct = holdings_pct[0]
         top5_pct = sum(holdings_pct[:5])
 
         return {"top1_pct": top1_pct, "top5_pct": top5_pct}
@@ -631,8 +682,7 @@ def holder_concentration_label(data):
         base = f"🟡 Top holder: {top1:.1f}% of supply (moderate concentration)"
     else:
         base = f"🟢 Top holder: {top1:.1f}% of supply"
-    base += f" | Top 5 combined: {top5:.1f}%"
-    base += " (note: may include the LP pool address, not just individual wallets)"
+    base += f" | Top 5 combined: {top5:.1f}% (LP pool address excluded where identifiable)"
     return base
 
 
@@ -880,7 +930,7 @@ def run_pump_check():
                     rug_score, rug_liq_flags = get_rugcheck_data(mint)
                     rug_note = rugcheck_label(rug_score, rug_liq_flags)
 
-                    holder_data = get_top_holder_concentration(mint)
+                    holder_data = get_top_holder_concentration(mint, pair.get("pairAddress"))
                     holder_note = holder_concentration_label(holder_data)
 
                     c.execute(
@@ -910,6 +960,8 @@ def run_pump_check():
                         f"📊 DexScreener: {dexscreener_url}\n\n"
                         f"Recommending this now — tracking from this price to see if it delivers. DYOR."
                     )
+
+                    send_bare_address_to_rick_chat(mint)
 
                 elif (not suspect and not pumped_since_rec_alerted and price_at_recommendation
                       and multiplier_since_recommendation and multiplier_since_recommendation >= 3):
