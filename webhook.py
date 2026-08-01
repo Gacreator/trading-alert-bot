@@ -2541,6 +2541,86 @@ def check_wallet_performance():
         conn.close()
 
 
+@app.route("/check-time-of-day")
+def check_time_of_day():
+    since_param, until_param = get_date_filter_params()
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+
+        query = """
+            SELECT recommended_at, max_multiplier_since_recommendation,
+                   pumped_since_recommendation_alerted
+            FROM wallet_token_history
+            WHERE momentum_alerted = TRUE
+            AND recommended_at IS NOT NULL
+        """
+        params = []
+        if since_param:
+            query += " AND recommended_at >= %s"
+            params.append(since_param)
+        if until_param:
+            query += " AND recommended_at < %s"
+            params.append(until_param)
+
+        c.execute(query, params)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return "No recommendation data yet.", 200
+
+        buckets = {
+            "00-05 UTC": {"total": 0, "hit_3x": 0},
+            "06-11 UTC": {"total": 0, "hit_3x": 0},
+            "12-17 UTC": {"total": 0, "hit_3x": 0},
+            "18-23 UTC": {"total": 0, "hit_3x": 0},
+        }
+
+        for recommended_at, max_mult, hit_3x in rows:
+            if recommended_at is None:
+                continue
+            hour = recommended_at.hour
+            if hour < 6:
+                key = "00-05 UTC"
+            elif hour < 12:
+                key = "06-11 UTC"
+            elif hour < 18:
+                key = "12-17 UTC"
+            else:
+                key = "18-23 UTC"
+
+            buckets[key]["total"] += 1
+            hit = bool(hit_3x) or (max_mult and max_mult >= 3)
+            if hit:
+                buckets[key]["hit_3x"] += 1
+
+        range_label = ""
+        if since_param or until_param:
+            range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
+
+        lines = [f"<b>Recommendation hit-rate by time of day (UTC):</b>{range_label}<br>"]
+        for bucket, d in buckets.items():
+            total = d["total"]
+            hits = d["hit_3x"]
+            rate = f"{hits/total*100:.1f}%" if total else "n/a"
+            lines.append(f"<br>{bucket}: {hits}/{total} hit 3x+ ({rate})")
+
+        lines.append(
+            "<br><br>If one window shows a meaningfully higher/lower rate "
+            "with a large enough sample, that could reflect real "
+            "differences in market activity/liquidity at that time — but "
+            "check sample sizes per bucket before trusting any gap."
+        )
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_time_of_day error: {e}", 500
+
+    finally:
+        conn.close()
+
+
 @app.route("/recommendation/<mint>")
 def recommendation_lookup(mint):
     conn = get_conn()
