@@ -101,6 +101,8 @@ def init_db():
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS max_multiplier_since_recommendation NUMERIC")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS pumped_since_recommendation_alerted BOOLEAN DEFAULT FALSE")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS market_cap_at_recommendation NUMERIC")
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS rugcheck_score_at_recommendation NUMERIC")
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS top1_holder_pct_at_recommendation NUMERIC")
 
         c.execute("""
             CREATE TABLE IF NOT EXISTS token_scan_log (
@@ -893,10 +895,14 @@ def run_pump_check():
                         SET momentum_alerted = TRUE,
                             price_at_recommendation = %s,
                             recommended_at = NOW(),
-                            market_cap_at_recommendation = %s
+                            market_cap_at_recommendation = %s,
+                            rugcheck_score_at_recommendation = %s,
+                            top1_holder_pct_at_recommendation = %s
                         WHERE wallet=%s AND token_mint=%s
                         """,
-                        (current_price, current_market_cap, wallet, mint)
+                        (current_price, current_market_cap, rug_score,
+                         holder_data.get("top1_pct") if holder_data else None,
+                         wallet, mint)
                     )
                     send_telegram_alert(
                         f"🚀 Heating up (score {score}/100)\n"
