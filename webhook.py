@@ -650,14 +650,6 @@ def holder_concentration_label(data):
 
 
 def get_wallet_cluster_count(mint, current_wallet):
-    """
-    Checks how many DISTINCT tracked wallets (including the current one)
-    have ever bought this token. With 8 wallets now tracked, 2+ wallets
-    independently buying the same obscure token is a much stronger
-    conviction signal than any single wallet's buy alone. Informational
-    only for now — does not affect momentum score until validated with
-    real held/dumped outcome data.
-    """
     conn = get_conn()
     try:
         c = conn.cursor()
@@ -2664,12 +2656,6 @@ def check_time_of_day():
 
 @app.route("/check-cluster-performance")
 def check_cluster_performance():
-    """
-    Compares hit-rate between recommendations that had a cluster (2+
-    tracked wallets independently buying the same token) vs single-wallet
-    recommendations. This validates whether cluster detection is a real
-    signal before it's ever used to affect the score.
-    """
     since_param, until_param = get_date_filter_params()
     conn = get_conn()
     try:
@@ -2731,6 +2717,162 @@ def check_cluster_performance():
 
     except Exception as e:
         return f"check_cluster_performance error: {e}", 500
+
+    finally:
+        conn.close()
+
+
+@app.route("/check-rugcheck-vs-outcome")
+def check_rugcheck_vs_outcome():
+    since_param, until_param = get_date_filter_params()
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+
+        query = """
+            SELECT rugcheck_score_at_recommendation,
+                   max_multiplier_since_recommendation,
+                   pumped_since_recommendation_alerted
+            FROM wallet_token_history
+            WHERE momentum_alerted = TRUE
+            AND rugcheck_score_at_recommendation IS NOT NULL
+        """
+        params = []
+        if since_param:
+            query += " AND recommended_at >= %s"
+            params.append(since_param)
+        if until_param:
+            query += " AND recommended_at < %s"
+            params.append(until_param)
+
+        c.execute(query, params)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return "No recommendation data with RugCheck score yet.", 200
+
+        buckets = {
+            "0-30 (low risk)": {"total": 0, "hit_3x": 0},
+            "31-60 (moderate risk)": {"total": 0, "hit_3x": 0},
+            "61-100 (high risk)": {"total": 0, "hit_3x": 0},
+        }
+
+        for rug_score, max_mult, hit_3x in rows:
+            rug_score = float(rug_score)
+            if rug_score <= 30:
+                key = "0-30 (low risk)"
+            elif rug_score <= 60:
+                key = "31-60 (moderate risk)"
+            else:
+                key = "61-100 (high risk)"
+
+            buckets[key]["total"] += 1
+            hit = bool(hit_3x) or (max_mult and max_mult >= 3)
+            if hit:
+                buckets[key]["hit_3x"] += 1
+
+        range_label = ""
+        if since_param or until_param:
+            range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
+
+        lines = [f"<b>Recommendation hit-rate by RugCheck score AT RECOMMENDATION:</b>{range_label}<br>"]
+        for bucket, d in buckets.items():
+            total = d["total"]
+            hits = d["hit_3x"]
+            rate = f"{hits/total*100:.1f}%" if total else "n/a"
+            lines.append(f"<br>{bucket}: {hits}/{total} hit 3x+ ({rate})")
+
+        lines.append(
+            "<br><br>If low-risk (0-30) shows a meaningfully HIGHER hit rate "
+            "than high-risk (61-100), that validates using RugCheck as a "
+            "real scoring factor. If rates are similar, RugCheck score isn't "
+            "adding predictive value for this bot's use case."
+        )
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_rugcheck_vs_outcome error: {e}", 500
+
+    finally:
+        conn.close()
+
+
+@app.route("/check-holder-vs-outcome")
+def check_holder_vs_outcome():
+    since_param, until_param = get_date_filter_params()
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+
+        query = """
+            SELECT top1_holder_pct_at_recommendation,
+                   max_multiplier_since_recommendation,
+                   pumped_since_recommendation_alerted
+            FROM wallet_token_history
+            WHERE momentum_alerted = TRUE
+            AND top1_holder_pct_at_recommendation IS NOT NULL
+        """
+        params = []
+        if since_param:
+            query += " AND recommended_at >= %s"
+            params.append(since_param)
+        if until_param:
+            query += " AND recommended_at < %s"
+            params.append(until_param)
+
+        c.execute(query, params)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return "No recommendation data with holder concentration yet.", 200
+
+        buckets = {
+            "under 5%": {"total": 0, "hit_3x": 0},
+            "5-7%": {"total": 0, "hit_3x": 0},
+            "7-10%": {"total": 0, "hit_3x": 0},
+            "over 10%": {"total": 0, "hit_3x": 0},
+        }
+
+        for top1_pct, max_mult, hit_3x in rows:
+            top1_pct = float(top1_pct)
+            if top1_pct < 5:
+                key = "under 5%"
+            elif top1_pct < 7:
+                key = "5-7%"
+            elif top1_pct < 10:
+                key = "7-10%"
+            else:
+                key = "over 10%"
+
+            buckets[key]["total"] += 1
+            hit = bool(hit_3x) or (max_mult and max_mult >= 3)
+            if hit:
+                buckets[key]["hit_3x"] += 1
+
+        range_label = ""
+        if since_param or until_param:
+            range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
+
+        lines = [f"<b>Recommendation hit-rate by top1 holder % AT RECOMMENDATION:</b>{range_label}<br>"]
+        for bucket, d in buckets.items():
+            total = d["total"]
+            hits = d["hit_3x"]
+            rate = f"{hits/total*100:.1f}%" if total else "n/a"
+            lines.append(f"<br>Top holder {bucket}: {hits}/{total} hit 3x+ ({rate})")
+
+        lines.append(
+            "<br><br>If lower-concentration buckets show meaningfully "
+            "HIGHER hit rates than the over-10% bucket, that validates the "
+            "current 7%/10% alert thresholds and suggests holder "
+            "concentration should factor into the score directly, not just "
+            "be shown as an info label."
+        )
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_holder_vs_outcome error: {e}", 500
 
     finally:
         conn.close()
