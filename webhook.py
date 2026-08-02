@@ -911,7 +911,7 @@ def run_pump_check():
                     top1_pct = holder_data.get("top1_pct") if holder_data else None
 
                     rug_blocks = rug_score is not None and rug_score > 30
-                    holder_blocks = top1_pct is not None and top1_pct >= 10
+                    holder_blocks = top1_pct is not None and top1_pct >= 7
 
                     if rug_blocks or holder_blocks:
                         print(f"⛔ Recommendation blocked for {mint}: "
