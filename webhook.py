@@ -905,56 +905,62 @@ def run_pump_check():
                 pump_alert_fired = False
 
                 if not suspect and not momentum_alerted and score >= 70:
-                    momentum_alert_fired = True
-
-                    liq_trend_note = liquidity_trend_label(liquidity_delta_pct, prior_liq_delta)
-                    price_trend_note = price_trend_label(details.get("pc_5m"), prior_pc_5m)
 
                     rug_score, rug_liq_flags = get_rugcheck_data(mint)
-                    rug_note = rugcheck_label(rug_score, rug_liq_flags)
-
                     holder_data = get_top_holder_concentration(mint, pair.get("pairAddress"))
-                    holder_note = holder_concentration_label(holder_data)
+                    top1_pct = holder_data.get("top1_pct") if holder_data else None
 
-                    cluster_wallets = get_wallet_cluster_count(mint, wallet)
-                    cluster_note = cluster_label(cluster_wallets, wallet)
+                    rug_blocks = rug_score is not None and rug_score > 30
+                    holder_blocks = top1_pct is not None and top1_pct >= 10
 
-                    c.execute(
-                        """
-                        UPDATE wallet_token_history
-                        SET momentum_alerted = TRUE,
-                            price_at_recommendation = %s,
-                            recommended_at = NOW(),
-                            market_cap_at_recommendation = %s,
-                            rugcheck_score_at_recommendation = %s,
-                            top1_holder_pct_at_recommendation = %s,
-                            cluster_count_at_recommendation = %s
-                        WHERE wallet=%s AND token_mint=%s
-                        """,
-                        (current_price, current_market_cap, rug_score,
-                         holder_data.get("top1_pct") if holder_data else None,
-                         len(cluster_wallets),
-                         wallet, mint)
-                    )
-                    send_telegram_alert(
-                        f"🚀 Heating up (score {score}/100)\n"
-                        f"Wallet: <code>{wallet}</code>\n"
-                        f"Token: <code>{mint}</code>\n\n"
-                        f"Market cap: ${current_market_cap:,.0f}\n"
-                        f"Liquidity: ${details.get('liquidity', 0):.0f}"
-                        + (f" (Δ {liquidity_delta_pct*100:.1f}% since last scan)" if liquidity_delta_pct is not None else "")
-                        + f"\n5m volume: ${details.get('vol_5m', 0):.0f} (1h: ${details.get('vol_h1', 0):.0f})\n"
-                        f"Price change 5m/1h/6h: {details.get('pc_5m')}% / {details.get('pc_h1')}% / {details.get('pc_h6')}%\n\n"
-                        f"{liq_trend_note}\n"
-                        f"{price_trend_note}\n"
-                        f"{rug_note}\n"
-                        f"{holder_note}\n"
-                        f"{cluster_note}\n\n"
-                        f"📊 DexScreener: {dexscreener_url}\n\n"
-                        f"Recommending this now — tracking from this price to see if it delivers. DYOR."
-                    )
+                    if rug_blocks or holder_blocks:
+                        print(f"⛔ Recommendation blocked for {mint}: "
+                              f"rug_score={rug_score} (blocks={rug_blocks}), "
+                              f"top1_pct={top1_pct} (blocks={holder_blocks})")
+                    else:
+                        momentum_alert_fired = True
 
-                    send_bare_address_to_rick_chat(mint)
+                        liq_trend_note = liquidity_trend_label(liquidity_delta_pct, prior_liq_delta)
+                        price_trend_note = price_trend_label(details.get("pc_5m"), prior_pc_5m)
+                        rug_note = rugcheck_label(rug_score, rug_liq_flags)
+                        holder_note = holder_concentration_label(holder_data)
+                        cluster_wallets = get_wallet_cluster_count(mint, wallet)
+                        cluster_note = cluster_label(cluster_wallets, wallet)
+
+                        c.execute(
+                            """
+                            UPDATE wallet_token_history
+                            SET momentum_alerted = TRUE,
+                                price_at_recommendation = %s,
+                                recommended_at = NOW(),
+                                market_cap_at_recommendation = %s,
+                                rugcheck_score_at_recommendation = %s,
+                                top1_holder_pct_at_recommendation = %s,
+                                cluster_count_at_recommendation = %s
+                            WHERE wallet=%s AND token_mint=%s
+                            """,
+                            (current_price, current_market_cap, rug_score,
+                             top1_pct, len(cluster_wallets), wallet, mint)
+                        )
+                        send_telegram_alert(
+                            f"🚀 Heating up (score {score}/100)\n"
+                            f"Wallet: <code>{wallet}</code>\n"
+                            f"Token: <code>{mint}</code>\n\n"
+                            f"Market cap: ${current_market_cap:,.0f}\n"
+                            f"Liquidity: ${details.get('liquidity', 0):.0f}"
+                            + (f" (Δ {liquidity_delta_pct*100:.1f}% since last scan)" if liquidity_delta_pct is not None else "")
+                            + f"\n5m volume: ${details.get('vol_5m', 0):.0f} (1h: ${details.get('vol_h1', 0):.0f})\n"
+                            f"Price change 5m/1h/6h: {details.get('pc_5m')}% / {details.get('pc_h1')}% / {details.get('pc_h6')}%\n\n"
+                            f"{liq_trend_note}\n"
+                            f"{price_trend_note}\n"
+                            f"{rug_note}\n"
+                            f"{holder_note}\n"
+                            f"{cluster_note}\n\n"
+                            f"📊 DexScreener: {dexscreener_url}\n\n"
+                            f"Recommending this now — tracking from this price to see if it delivers. DYOR."
+                        )
+
+                        send_bare_address_to_rick_chat(mint)
 
                 elif (not suspect and not pumped_since_rec_alerted and price_at_recommendation
                       and multiplier_since_recommendation and multiplier_since_recommendation >= 3):
