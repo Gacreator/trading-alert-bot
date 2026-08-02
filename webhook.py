@@ -462,9 +462,9 @@ def score_momentum(pair, liquidity_delta_pct=None, prior_liquidity_delta_pct=Non
     vol_h1_to_liq_ratio = (vol_h1 / liquidity) if liquidity > 0 else 0
     details["vol_h1_to_liq_ratio"] = vol_h1_to_liq_ratio
     if vol_h1_to_liq_ratio > 10:
-        score -= 20
+        score -= 35
     elif vol_h1_to_liq_ratio > 5:
-        score -= 10
+        score -= 20
 
     txns = pair.get("txns", {}) or {}
     m5 = txns.get("m5", {}) or {}
