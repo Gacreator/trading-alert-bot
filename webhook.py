@@ -2727,6 +2727,97 @@ def check_cluster_performance():
     finally:
         conn.close()
 
+        
+@app.route("/check-volume-ratio-vs-outcome")
+def check_volume_ratio_vs_outcome():
+    """
+    Buckets recommendations by their vol_h1_to_liq_ratio AT THE MOMENT OF
+    RECOMMENDATION and checks hit-rate per bucket. Tests whether high
+    1h-volume-to-liquidity ratio actually predicts worse outcomes strongly
+    enough to justify a hard gate, rather than just the current soft
+    penalty in score_momentum().
+    """
+    since_param, until_param = get_date_filter_params()
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+
+        query = """
+            SELECT s.liquidity, s.vol_h1,
+                   h.max_multiplier_since_recommendation,
+                   h.pumped_since_recommendation_alerted
+            FROM token_scan_log s
+            JOIN wallet_token_history h
+                ON h.wallet = s.wallet AND h.token_mint = s.token_mint
+            WHERE s.momentum_alert_fired = TRUE
+            AND s.suspect_data IS NOT TRUE
+            AND s.liquidity IS NOT NULL AND s.liquidity > 0
+            AND s.vol_h1 IS NOT NULL
+        """
+        params = []
+        if since_param:
+            query += " AND h.recommended_at >= %s"
+            params.append(since_param)
+        if until_param:
+            query += " AND h.recommended_at < %s"
+            params.append(until_param)
+
+        c.execute(query, params)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return "No recommendation data with liquidity/volume yet.", 200
+
+        buckets = {
+            "under 3x": {"total": 0, "hit_3x": 0},
+            "3-5x": {"total": 0, "hit_3x": 0},
+            "5-10x": {"total": 0, "hit_3x": 0},
+            "over 10x": {"total": 0, "hit_3x": 0},
+        }
+
+        for liquidity, vol_h1, max_mult, hit_3x in rows:
+            ratio = float(vol_h1) / float(liquidity) if liquidity else 0
+            if ratio < 3:
+                key = "under 3x"
+            elif ratio < 5:
+                key = "3-5x"
+            elif ratio < 10:
+                key = "5-10x"
+            else:
+                key = "over 10x"
+
+            buckets[key]["total"] += 1
+            hit = bool(hit_3x) or (max_mult and max_mult >= 3)
+            if hit:
+                buckets[key]["hit_3x"] += 1
+
+        range_label = ""
+        if since_param or until_param:
+            range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
+
+        lines = [f"<b>Recommendation hit-rate by 1h-volume/liquidity ratio AT RECOMMENDATION:</b>{range_label}<br>"]
+        for bucket, d in buckets.items():
+            total = d["total"]
+            hits = d["hit_3x"]
+            rate = f"{hits/total*100:.1f}%" if total else "n/a"
+            lines.append(f"<br>Ratio {bucket}: {hits}/{total} hit 3x+ ({rate})")
+
+        lines.append(
+            "<br><br>If ratio buckets above 5x show meaningfully LOWER hit "
+            "rates than under-3x, that validates strengthening the current "
+            "penalty into a hard gate. If rates are similar across buckets, "
+            "the soft penalty is already doing enough and a hard gate isn't "
+            "justified."
+        )
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_volume_ratio_vs_outcome error: {e}", 500
+
+    finally:
+        conn.close()
+
 
 @app.route("/check-rugcheck-vs-outcome")
 def check_rugcheck_vs_outcome():
