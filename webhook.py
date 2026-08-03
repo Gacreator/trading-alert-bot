@@ -2819,6 +2819,143 @@ def check_volume_ratio_vs_outcome():
         conn.close()
 
 
+@app.route("/check-volume-ratio-vs-outcome-sustained")
+def check_volume_ratio_vs_outcome_sustained():
+    """
+    Same bucketing as /check-volume-ratio-vs-outcome, but uses a STRICTER
+    definition of "hit": the token must have peaked at 3x+ from first buy
+    AND still held at least 50% of that peak some hours later — not just
+    touched 3x briefly. This distinguishes genuine sustained winners from
+    spike-and-dump tokens that briefly cross 3x due to manufactured volume.
+
+    Purely a background analytical metric — does NOT change what triggers
+    the live "PAID OFF" alert, which still fires on any 3x touch.
+    """
+    since_param, until_param = get_date_filter_params()
+    hours = request.args.get("hours", "1")
+    try:
+        hours = float(hours)
+    except (TypeError, ValueError):
+        hours = 1.0
+
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+
+        query = """
+            WITH scans AS (
+                SELECT wallet, token_mint, scanned_at, multiplier_from_first_buy,
+                       liquidity, vol_h1
+                FROM token_scan_log
+                WHERE multiplier_from_first_buy IS NOT NULL
+                AND suspect_data IS NOT TRUE
+            ),
+            peak AS (
+                SELECT DISTINCT ON (wallet, token_mint)
+                    wallet, token_mint, scanned_at AS peak_at,
+                    multiplier_from_first_buy AS peak_mult
+                FROM scans
+                ORDER BY wallet, token_mint, multiplier_from_first_buy DESC, scanned_at ASC
+            ),
+            qualifying AS (
+                SELECT * FROM peak WHERE peak_mult >= 3
+            ),
+            latest AS (
+                SELECT DISTINCT ON (wallet, token_mint)
+                    wallet, token_mint, scanned_at AS latest_at,
+                    multiplier_from_first_buy AS latest_mult
+                FROM scans
+                ORDER BY wallet, token_mint, scanned_at DESC
+            ),
+            outcomes AS (
+                SELECT q.wallet, q.token_mint, q.peak_mult, q.peak_at,
+                       l.latest_mult, l.latest_at,
+                       CASE WHEN l.latest_mult >= q.peak_mult * 0.5
+                            THEN TRUE ELSE FALSE END AS held_sustained
+                FROM qualifying q
+                JOIN latest l ON l.wallet = q.wallet AND l.token_mint = q.token_mint
+                WHERE l.latest_at >= q.peak_at + (INTERVAL '1 hour' * %s)
+            ),
+            recommendation_scan AS (
+                SELECT s.wallet, s.token_mint, s.liquidity, s.vol_h1
+                FROM token_scan_log s
+                WHERE s.momentum_alert_fired = TRUE
+                AND s.suspect_data IS NOT TRUE
+            )
+            SELECT r.liquidity, r.vol_h1, o.held_sustained
+            FROM recommendation_scan r
+            JOIN outcomes o
+                ON o.wallet = r.wallet AND o.token_mint = r.token_mint
+        """
+        params = [hours]
+        if since_param:
+            query += " WHERE o.peak_at >= %s"
+            params.append(since_param)
+        if until_param:
+            query += (" AND" if since_param else " WHERE") + " o.peak_at < %s"
+            params.append(until_param)
+
+        c.execute(query, params)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return f"No tokens peaked at 3x+ AND had {hours}+ hours pass since, with recommendation liquidity/volume data.", 200
+
+        buckets = {
+            "under 3x": {"total": 0, "held": 0},
+            "3-5x": {"total": 0, "held": 0},
+            "5-10x": {"total": 0, "held": 0},
+            "over 10x": {"total": 0, "held": 0},
+        }
+
+        for liquidity, vol_h1, held in rows:
+            if not liquidity or liquidity == 0:
+                continue
+            ratio = float(vol_h1) / float(liquidity) if vol_h1 else 0
+            if ratio < 3:
+                key = "under 3x"
+            elif ratio < 5:
+                key = "3-5x"
+            elif ratio < 10:
+                key = "5-10x"
+            else:
+                key = "over 10x"
+
+            buckets[key]["total"] += 1
+            if held:
+                buckets[key]["held"] += 1
+
+        range_label = ""
+        if since_param or until_param:
+            range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
+
+        lines = [
+            f"<b>SUSTAINED hit-rate (peaked 3x+ AND held 50%+ after {hours}h) "
+            f"by 1h-volume/liquidity ratio AT RECOMMENDATION:</b>{range_label}<br>"
+        ]
+        for bucket, d in buckets.items():
+            total = d["total"]
+            held = d["held"]
+            rate = f"{held/total*100:.1f}%" if total else "n/a"
+            lines.append(f"<br>Ratio {bucket}: {held}/{total} held 50%+ ({rate})")
+
+        lines.append(
+            "<br><br>Compare this against /check-volume-ratio-vs-outcome "
+            "(which only checks if 3x was ever touched). If high-ratio "
+            "buckets show a much bigger drop here than in the touch-only "
+            "version, that confirms high volume ratio predicts spike-and-dump "
+            "behavior specifically, not failure to move at all."
+        )
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_volume_ratio_vs_outcome_sustained error: {e}", 500
+
+    finally:
+        conn.close()
+
+
 @app.route("/check-rugcheck-vs-outcome")
 def check_rugcheck_vs_outcome():
     since_param, until_param = get_date_filter_params()
