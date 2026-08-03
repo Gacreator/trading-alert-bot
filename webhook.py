@@ -740,29 +740,38 @@ def check_and_record_buy(wallet, mint):
     conn = get_conn()
     try:
         c = conn.cursor()
+
         c.execute(
-            "SELECT buy_count, price_at_first_buy FROM wallet_token_history WHERE wallet=%s AND token_mint=%s",
+            "SELECT 1 FROM wallet_token_history WHERE wallet=%s AND token_mint=%s",
             (wallet, mint)
         )
-        row = c.fetchone()
+        exists = c.fetchone() is not None
 
-        if row is None:
+        if not exists:
             price = get_current_price(mint)
             c.execute(
-                "INSERT INTO wallet_token_history (wallet, token_mint, buy_count, price_at_first_buy) VALUES (%s, %s, 1, %s)",
+                """
+                INSERT INTO wallet_token_history (wallet, token_mint, buy_count, price_at_first_buy)
+                VALUES (%s, %s, 1, %s)
+                ON CONFLICT (wallet, token_mint) DO NOTHING
+                """,
                 (wallet, mint, price)
             )
             conn.commit()
             print(f"🟢 FIRST BUY DETECTED (recorded, no alert): wallet={wallet} token={mint} price={price}")
-
         else:
-            buy_count, price_at_first_buy = row
-            new_count = buy_count + 1
             c.execute(
-                "UPDATE wallet_token_history SET buy_count = %s WHERE wallet=%s AND token_mint=%s",
-                (new_count, wallet, mint)
+                """
+                UPDATE wallet_token_history
+                SET buy_count = buy_count + 1
+                WHERE wallet=%s AND token_mint=%s
+                RETURNING buy_count
+                """,
+                (wallet, mint)
             )
+            new_count_row = c.fetchone()
             conn.commit()
+            new_count = new_count_row[0] if new_count_row else "?"
             print(f"🔁 Repeat buy #{new_count} (recorded, no alert): wallet={wallet} token={mint}")
 
         c.close()
