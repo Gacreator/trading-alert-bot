@@ -461,10 +461,12 @@ def score_momentum(pair, liquidity_delta_pct=None, prior_liquidity_delta_pct=Non
 
     vol_h1_to_liq_ratio = (vol_h1 / liquidity) if liquidity > 0 else 0
     details["vol_h1_to_liq_ratio"] = vol_h1_to_liq_ratio
-    if vol_h1_to_liq_ratio > 10:
-        score -= 35
-    elif vol_h1_to_liq_ratio > 5:
+    if vol_h1_to_liq_ratio > 5:
         score -= 20
+    # Over-10x is now a hard gate (blocked entirely at recommendation time,
+    # see run_pump_check) since /check-volume-ratio-vs-outcome-sustained
+    # showed these tokens touch 3x normally (8.6%) but almost never HOLD
+    # it (2.1% vs 24.2% for under-3x) — classic spike-and-dump signature.
 
     txns = pair.get("txns", {}) or {}
     m5 = txns.get("m5", {}) or {}
@@ -910,13 +912,17 @@ def run_pump_check():
                     holder_data = get_top_holder_concentration(mint, pair.get("pairAddress"))
                     top1_pct = holder_data.get("top1_pct") if holder_data else None
 
+                    vol_h1_to_liq_ratio = details.get("vol_h1_to_liq_ratio", 0)
+
                     rug_blocks = rug_score is not None and rug_score > 30
                     holder_blocks = top1_pct is not None and top1_pct >= 7
+                    volume_blocks = vol_h1_to_liq_ratio is not None and vol_h1_to_liq_ratio > 10
 
-                    if rug_blocks or holder_blocks:
+                    if rug_blocks or holder_blocks or volume_blocks:
                         print(f"⛔ Recommendation blocked for {mint}: "
                               f"rug_score={rug_score} (blocks={rug_blocks}), "
-                              f"top1_pct={top1_pct} (blocks={holder_blocks})")
+                              f"top1_pct={top1_pct} (blocks={holder_blocks}), "
+                              f"vol_h1_to_liq_ratio={vol_h1_to_liq_ratio:.1f} (blocks={volume_blocks})")
                     else:
                         momentum_alert_fired = True
 
