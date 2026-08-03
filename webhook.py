@@ -778,8 +778,8 @@ def check_and_record_buy(wallet, mint):
         c.close()
     finally:
         conn.close()
-
-
+        
+        
 def run_pump_check():
     conn = None
     c = None
@@ -944,29 +944,29 @@ def run_pump_check():
                         cluster_note = cluster_label(cluster_wallets, wallet)
 
                         c.execute(
-                        "SELECT buy_count FROM wallet_token_history WHERE wallet=%s AND token_mint=%s",
-                        (wallet, mint)
-                    )
-                    current_buy_count_row = c.fetchone()
-                    current_buy_count = current_buy_count_row[0] if current_buy_count_row else None
+                            "SELECT buy_count FROM wallet_token_history WHERE wallet=%s AND token_mint=%s",
+                            (wallet, mint)
+                        )
+                        current_buy_count_row = c.fetchone()
+                        current_buy_count = current_buy_count_row[0] if current_buy_count_row else None
 
-                    c.execute(
-                        """
-                        UPDATE wallet_token_history
-                        SET momentum_alerted = TRUE,
-                            price_at_recommendation = %s,
-                            recommended_at = NOW(),
-                            market_cap_at_recommendation = %s,
-                            rugcheck_score_at_recommendation = %s,
-                            top1_holder_pct_at_recommendation = %s,
-                            cluster_count_at_recommendation = %s,
-                            buy_count_at_recommendation = %s
-                        WHERE wallet=%s AND token_mint=%s
-                        """,
-                        (current_price, current_market_cap, rug_score,
-                         top1_pct, len(cluster_wallets), current_buy_count,
-                         wallet, mint)
-                    )
+                        c.execute(
+                            """
+                            UPDATE wallet_token_history
+                            SET momentum_alerted = TRUE,
+                                price_at_recommendation = %s,
+                                recommended_at = NOW(),
+                                market_cap_at_recommendation = %s,
+                                rugcheck_score_at_recommendation = %s,
+                                top1_holder_pct_at_recommendation = %s,
+                                cluster_count_at_recommendation = %s,
+                                buy_count_at_recommendation = %s
+                            WHERE wallet=%s AND token_mint=%s
+                            """,
+                            (current_price, current_market_cap, rug_score,
+                             top1_pct, len(cluster_wallets), current_buy_count,
+                             wallet, mint)
+                        )
                         send_telegram_alert(
                             f"🚀 Heating up (score {score}/100)\n"
                             f"Wallet: <code>{wallet}</code>\n"
@@ -1069,8 +1069,8 @@ def run_pump_check():
             except Exception:
                 pass
         _check_pumps_lock.release()
-
-
+        
+        
 @app.route("/check-pumps", methods=["GET", "POST"])
 def check_pumps():
     if not _check_pumps_lock.acquire(blocking=False):
