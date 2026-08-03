@@ -2962,6 +2962,163 @@ def check_volume_ratio_vs_outcome_sustained():
         conn.close()
 
 
+@app.route("/check-combined-signal-vs-outcome")
+def check_combined_signal_vs_outcome():
+    """
+    Classifies each recommendation by how cleanly it cleared ALL THREE
+    gates (RugCheck, holder %, volume ratio) simultaneously, then compares
+    both touched-3x and held-3x-after-1h hit rates across those combined
+    buckets. Tests whether stacking clean signals compounds into better
+    picks, or whether the signals are largely redundant.
+    """
+    since_param, until_param = get_date_filter_params()
+    hours = request.args.get("hours", "1")
+    try:
+        hours = float(hours)
+    except (TypeError, ValueError):
+        hours = 1.0
+
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+
+        query = """
+            SELECT
+                h.wallet, h.token_mint,
+                h.rugcheck_score_at_recommendation,
+                h.top1_holder_pct_at_recommendation,
+                s.liquidity, s.vol_h1,
+                h.max_multiplier_since_recommendation,
+                h.pumped_since_recommendation_alerted
+            FROM wallet_token_history h
+            JOIN token_scan_log s
+                ON s.wallet = h.wallet AND s.token_mint = h.token_mint
+                AND s.momentum_alert_fired = TRUE
+            WHERE h.momentum_alerted = TRUE
+            AND h.rugcheck_score_at_recommendation IS NOT NULL
+            AND h.top1_holder_pct_at_recommendation IS NOT NULL
+            AND s.liquidity IS NOT NULL AND s.liquidity > 0
+            AND s.vol_h1 IS NOT NULL
+        """
+        params = []
+        if since_param:
+            query += " AND h.recommended_at >= %s"
+            params.append(since_param)
+        if until_param:
+            query += " AND h.recommended_at < %s"
+            params.append(until_param)
+
+        c.execute(query, params)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return "No recommendations with all three signal values yet.", 200
+
+        # Fetch "held" outcomes separately (reuse peak/held logic)
+        conn2 = get_conn()
+        c2 = conn2.cursor()
+        c2.execute("""
+            WITH scans AS (
+                SELECT wallet, token_mint, scanned_at, multiplier_from_first_buy
+                FROM token_scan_log
+                WHERE multiplier_from_first_buy IS NOT NULL
+                AND suspect_data IS NOT TRUE
+            ),
+            peak AS (
+                SELECT DISTINCT ON (wallet, token_mint)
+                    wallet, token_mint, scanned_at AS peak_at,
+                    multiplier_from_first_buy AS peak_mult
+                FROM scans
+                ORDER BY wallet, token_mint, multiplier_from_first_buy DESC, scanned_at ASC
+            ),
+            qualifying AS (
+                SELECT * FROM peak WHERE peak_mult >= 3
+            ),
+            latest AS (
+                SELECT DISTINCT ON (wallet, token_mint)
+                    wallet, token_mint, scanned_at AS latest_at,
+                    multiplier_from_first_buy AS latest_mult
+                FROM scans
+                ORDER BY wallet, token_mint, scanned_at DESC
+            )
+            SELECT q.wallet, q.token_mint,
+                   CASE WHEN l.latest_mult >= q.peak_mult * 0.5 THEN TRUE ELSE FALSE END AS held
+            FROM qualifying q
+            JOIN latest l ON l.wallet = q.wallet AND l.token_mint = q.token_mint
+            WHERE l.latest_at >= q.peak_at + (INTERVAL '1 hour' * %s)
+        """, (hours,))
+        held_rows = c2.fetchall()
+        c2.close()
+        conn2.close()
+
+        held_map = {(w, m): held for w, m, held in held_rows}
+
+        buckets = {
+            "all clean": {"touched_total": 0, "touched_hit": 0, "held_total": 0, "held_hit": 0},
+            "mostly clean": {"touched_total": 0, "touched_hit": 0, "held_total": 0, "held_hit": 0},
+            "marginal": {"touched_total": 0, "touched_hit": 0, "held_total": 0, "held_hit": 0},
+        }
+
+        for wallet, mint, rug_score, top1_pct, liquidity, vol_h1, max_mult, hit_3x in rows:
+            rug_score = float(rug_score)
+            top1_pct = float(top1_pct)
+            ratio = float(vol_h1) / float(liquidity) if liquidity else 0
+
+            rug_clean = rug_score <= 15
+            holder_clean = top1_pct < 5
+            vol_clean = ratio < 3
+
+            clean_count = sum([rug_clean, holder_clean, vol_clean])
+            if clean_count == 3:
+                key = "all clean"
+            elif clean_count == 2:
+                key = "mostly clean"
+            else:
+                key = "marginal"
+
+            touched = bool(hit_3x) or (max_mult and max_mult >= 3)
+            buckets[key]["touched_total"] += 1
+            if touched:
+                buckets[key]["touched_hit"] += 1
+
+            if (wallet, mint) in held_map:
+                buckets[key]["held_total"] += 1
+                if held_map[(wallet, mint)]:
+                    buckets[key]["held_hit"] += 1
+
+        range_label = ""
+        if since_param or until_param:
+            range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
+
+        lines = [f"<b>Combined signal (RugCheck ≤15, holder &lt;5%, vol ratio &lt;3x) vs outcome:</b>{range_label}<br>"]
+        for bucket, d in buckets.items():
+            t_total, t_hit = d["touched_total"], d["touched_hit"]
+            h_total, h_hit = d["held_total"], d["held_hit"]
+            t_rate = f"{t_hit/t_total*100:.1f}%" if t_total else "n/a"
+            h_rate = f"{h_hit/h_total*100:.1f}%" if h_total else "n/a"
+            lines.append(
+                f"<br><b>{bucket.upper()}</b><br>"
+                f"Touched 3x+: {t_hit}/{t_total} ({t_rate})<br>"
+                f"Held 50%+ after {hours}h: {h_hit}/{h_total} ({h_rate})"
+            )
+
+        lines.append(
+            "<br><br>If 'all clean' shows meaningfully higher rates (especially "
+            "the HELD metric) than 'marginal', that validates rewarding "
+            "tokens that clear all three gates comfortably, not just barely. "
+            "If rates are similar across buckets, the signals are largely "
+            "redundant and stacking them adds little."
+        )
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_combined_signal_vs_outcome error: {e}", 500
+
+    finally:
+        conn.close()
+
+
 @app.route("/check-rugcheck-vs-outcome")
 def check_rugcheck_vs_outcome():
     since_param, until_param = get_date_filter_params()
