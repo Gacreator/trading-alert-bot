@@ -104,7 +104,8 @@ def init_db():
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS rugcheck_score_at_recommendation NUMERIC")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS top1_holder_pct_at_recommendation NUMERIC")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS cluster_count_at_recommendation INTEGER")
-
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS buy_count_at_recommendation INTEGER")
+        
         c.execute("""
             CREATE TABLE IF NOT EXISTS token_scan_log (
                 id SERIAL PRIMARY KEY,
@@ -943,20 +944,29 @@ def run_pump_check():
                         cluster_note = cluster_label(cluster_wallets, wallet)
 
                         c.execute(
-                            """
-                            UPDATE wallet_token_history
-                            SET momentum_alerted = TRUE,
-                                price_at_recommendation = %s,
-                                recommended_at = NOW(),
-                                market_cap_at_recommendation = %s,
-                                rugcheck_score_at_recommendation = %s,
-                                top1_holder_pct_at_recommendation = %s,
-                                cluster_count_at_recommendation = %s
-                            WHERE wallet=%s AND token_mint=%s
-                            """,
-                            (current_price, current_market_cap, rug_score,
-                             top1_pct, len(cluster_wallets), wallet, mint)
-                        )
+                        "SELECT buy_count FROM wallet_token_history WHERE wallet=%s AND token_mint=%s",
+                        (wallet, mint)
+                    )
+                    current_buy_count_row = c.fetchone()
+                    current_buy_count = current_buy_count_row[0] if current_buy_count_row else None
+
+                    c.execute(
+                        """
+                        UPDATE wallet_token_history
+                        SET momentum_alerted = TRUE,
+                            price_at_recommendation = %s,
+                            recommended_at = NOW(),
+                            market_cap_at_recommendation = %s,
+                            rugcheck_score_at_recommendation = %s,
+                            top1_holder_pct_at_recommendation = %s,
+                            cluster_count_at_recommendation = %s,
+                            buy_count_at_recommendation = %s
+                        WHERE wallet=%s AND token_mint=%s
+                        """,
+                        (current_price, current_market_cap, rug_score,
+                         top1_pct, len(cluster_wallets), current_buy_count,
+                         wallet, mint)
+                    )
                         send_telegram_alert(
                             f"🚀 Heating up (score {score}/100)\n"
                             f"Wallet: <code>{wallet}</code>\n"
@@ -3151,12 +3161,12 @@ def check_conviction_vs_outcome():
         c = conn.cursor()
 
         query = """
-            SELECT h.wallet, h.token_mint, h.buy_count,
+            SELECT h.wallet, h.token_mint, h.buy_count_at_recommendation,
                    h.max_multiplier_since_recommendation,
                    h.pumped_since_recommendation_alerted
             FROM wallet_token_history h
             WHERE h.momentum_alerted = TRUE
-            AND h.buy_count IS NOT NULL
+            AND h.buy_count_at_recommendation IS NOT NULL
         """
         params = []
         if since_param:
@@ -3171,7 +3181,7 @@ def check_conviction_vs_outcome():
         c.close()
 
         if not rows:
-            return "No recommendation data with buy_count yet.", 200
+            return "No recommendation data with buy_count_at_recommendation yet.", 200
 
         conn2 = get_conn()
         c2 = conn2.cursor()
@@ -3252,11 +3262,8 @@ def check_conviction_vs_outcome():
             )
 
         lines.append(
-            "<br><br>⚠️ Rough proxy only — buy_count is CURRENT, not "
-            "snapshotted at recommendation time, so older recommendations "
-            "may show inflated counts from buys that happened AFTER "
-            "recommendation. If a clear pattern shows anyway, it's worth "
-            "building a proper snapshotted version."
+            "<br><br>✅ Using buy_count snapshotted AT recommendation time — "
+            "accurate reflection of conviction at the moment the alert fired."
         )
         return "<br>".join(lines), 200
 
