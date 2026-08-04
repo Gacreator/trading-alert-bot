@@ -3794,6 +3794,59 @@ def check_price_velocity_by_score():
         conn.close()
 
 
+@app.route("/check-recommendation-timing")
+def check_recommendation_timing():
+    """
+    Checks how long it typically takes (from first_seen_at to
+    recommended_at) for tokens that eventually got recommended. Use this
+    BEFORE shrinking SCAN_WINDOW_HOURS, to confirm a shorter window won't
+    silently cut off legitimate slower-moving tokens before they mature.
+    """
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT EXTRACT(EPOCH FROM (recommended_at - first_seen_at)) / 3600 AS hours_to_recommend
+            FROM wallet_token_history
+            WHERE momentum_alerted = TRUE
+            AND recommended_at IS NOT NULL
+            AND first_seen_at IS NOT NULL
+        """)
+        rows = [r[0] for r in c.fetchall() if r[0] is not None]
+        c.close()
+
+        if not rows:
+            return "No recommendation timing data yet.", 200
+
+        rows.sort()
+        n = len(rows)
+
+        def percentile(p):
+            idx = int(n * p)
+            idx = min(idx, n - 1)
+            return rows[idx]
+
+        lines = [
+            f"<b>Time from first_seen_at to recommended_at</b> (n={n})<br>",
+            f"<br>Median: {percentile(0.5):.1f}h",
+            f"75th percentile: {percentile(0.75):.1f}h",
+            f"90th percentile: {percentile(0.90):.1f}h",
+            f"95th percentile: {percentile(0.95):.1f}h",
+            f"Max: {max(rows):.1f}h",
+            "<br><br>If your current SCAN_WINDOW_HOURS is comfortably above "
+            "the 90-95th percentile here, shrinking it is safe. If a "
+            "meaningful chunk of recommendations happen close to or beyond "
+            "your proposed new window, shrinking it would cut them off."
+        ]
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_recommendation_timing error: {e}", 500
+
+    finally:
+        conn.close()
+
+
 @app.route("/recommendation/<mint>")
 def recommendation_lookup(mint):
     conn = get_conn()
