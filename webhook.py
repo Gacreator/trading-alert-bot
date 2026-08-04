@@ -2926,10 +2926,14 @@ def check_volume_ratio_vs_outcome():
 def check_volume_ratio_vs_outcome_sustained():
     """
     Same bucketing as /check-volume-ratio-vs-outcome, but uses a STRICTER
-    definition of "hit": the token must have peaked at 3x+ from first buy
+    definition of 'hit': the token must have peaked at 3x+ from first buy
     AND still held at least 50% of that peak some hours later — not just
     touched 3x briefly. This distinguishes genuine sustained winners from
     spike-and-dump tokens that briefly cross 3x due to manufactured volume.
+
+    Purely a background analytical metric — does NOT change what triggers
+    the live 'PAID OFF' alert, which still fires on any 3x touch.
+    """
 
     Purely a background analytical metric — does NOT change what triggers
     the live "PAID OFF" alert, which still fires on any 3x touch.
