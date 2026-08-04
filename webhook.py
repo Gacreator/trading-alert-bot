@@ -2836,7 +2836,7 @@ def check_volume_ratio_vs_outcome():
     """
     Buckets recommendations by their vol_h1_to_liq_ratio AT THE MOMENT OF
     RECOMMENDATION and checks hit-rate per bucket. Tests whether high
-    1h-volume-to-liquidity ratio actually predicts worse outcomes strongly
+    volume relative to liquidity actually predicts worse outcomes strongly
     enough to justify a hard gate, rather than just the current soft
     penalty in score_momentum().
     """
