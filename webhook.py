@@ -123,9 +123,6 @@ def init_db():
 
         c.execute("""
             CREATE TABLE IF NOT EXISTS token_scan_log (
-        
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS token_scan_log (
                 id SERIAL PRIMARY KEY,
                 wallet TEXT,
                 token_mint TEXT,
@@ -468,7 +465,7 @@ def score_momentum(pair, liquidity_delta_pct=None, prior_liquidity_delta_pct=Non
     price_window_points = positive_windows * (20 / 3)
     score += price_window_points
     details["price_window_points"] = price_window_points
-    
+
     volume = pair.get("volume", {}) or {}
     vol_5m = volume.get("m5", 0) or 0
     vol_h1 = volume.get("h1", 0) or 0
@@ -484,7 +481,7 @@ def score_momentum(pair, liquidity_delta_pct=None, prior_liquidity_delta_pct=Non
         volume_sanity_points = 10
     score += volume_sanity_points
     details["volume_sanity_points"] = volume_sanity_points
-    
+
     vol_h1_to_liq_ratio = (vol_h1 / liquidity) if liquidity > 0 else 0
     details["vol_h1_to_liq_ratio"] = vol_h1_to_liq_ratio
     if vol_h1_to_liq_ratio > 5:
@@ -814,8 +811,8 @@ def check_and_record_buy(wallet, mint):
 
         c.close()
     finally:
-        conn.close()  
-        
+        conn.close()
+
 
 def get_buy_trajectory(wallet, mint):
     """
@@ -849,8 +846,8 @@ def get_buy_trajectory(wallet, mint):
             return "flat"
     finally:
         conn.close()
-        
-        
+
+
 def run_pump_check():
     conn = None
     c = None
@@ -1037,15 +1034,19 @@ def run_pump_check():
                                 top1_holder_pct_at_recommendation = %s,
                                 cluster_count_at_recommendation = %s,
                                 buy_count_at_recommendation = %s,
+                                liquidity_trend_points_at_recommendation = %s,
+                                liquidity_level_points_at_recommendation = %s,
+                                price_window_points_at_recommendation = %s,
+                                volume_sanity_points_at_recommendation = %s,
                                 buy_trajectory_at_recommendation = %s
                             WHERE wallet=%s AND token_mint=%s
                             """,
                             (current_price, current_market_cap, rug_score,
                              top1_pct, len(cluster_wallets), current_buy_count,
+                             liquidity_trend_pts, liquidity_level_pts, price_window_pts, volume_sanity_pts,
                              buy_trajectory, wallet, mint)
                         )
-                        
-                     send_telegram_alert(
+                        send_telegram_alert(
                             f"🚀 Heating up (score {score}/100)\n"
                             f"Wallet: <code>{wallet}</code>\n"
                             f"Token: <code>{mint}</code>\n\n"
@@ -1147,8 +1148,8 @@ def run_pump_check():
             except Exception:
                 pass
         _check_pumps_lock.release()
-        
-        
+
+
 @app.route("/check-pumps", methods=["GET", "POST"])
 def check_pumps():
     if not _check_pumps_lock.acquire(blocking=False):
@@ -2830,7 +2831,7 @@ def check_cluster_performance():
     finally:
         conn.close()
 
-        
+
 @app.route("/check-volume-ratio-vs-outcome")
 def check_volume_ratio_vs_outcome():
     """
@@ -3112,7 +3113,6 @@ def check_combined_signal_vs_outcome():
         if not rows:
             return "No recommendations with all three signal values yet.", 200
 
-        # Fetch "held" outcomes separately (reuse peak/held logic)
         conn2 = get_conn()
         c2 = conn2.cursor()
         c2.execute("""
@@ -3220,7 +3220,7 @@ def check_combined_signal_vs_outcome():
 def check_conviction_vs_outcome():
     """
     Rough, imperfect check: buckets recommendations by the tracked
-    wallet's CURRENT buy_count for that token (not count-at-recommendation-
+    wallet CURRENT buy_count for that token (not count-at-recommendation-
     time, since that wasn't historically snapshotted). This overstates
     conviction for older recommendations that had more time to accumulate
     repeat buys after the fact — but serves as a quick gut-check for
@@ -3350,7 +3350,7 @@ def check_conviction_vs_outcome():
 
     finally:
         conn.close()
-        
+
 
 @app.route("/check-rugcheck-vs-outcome")
 def check_rugcheck_vs_outcome():
@@ -3512,8 +3512,8 @@ def check_holder_vs_outcome():
 def check_marketcap_growth_vs_score():
     """
     Checks market cap AT RECOMMENDATION, and how much it grew from the
-    market cap at each wallet's first buy, broken down by score bucket.
-    Tests the user's eye-test observation: do 90-100 score recommendations
+    market cap at each wallet first buy, broken down by score bucket.
+    Tests the eye-test observation: do 90-100 score recommendations
     tend to fire only after market cap has already ballooned significantly
     (e.g. 200k -> 769k), rather than closer to the original entry point?
     """
@@ -3625,9 +3625,9 @@ def check_marketcap_growth_vs_score():
 def check_marketcap_vs_outcome_detailed():
     """
     Same as /check-marketcap-vs-outcome, but with finer-grained buckets
-    above 500k instead of one broad "over 500k" catch-all — since a $600k
+    above 500k instead of one broad over-500k catch-all — since a $600k
     token and a $5M token are likely very different situations that
-    shouldn't be averaged together.
+    should not be averaged together.
     """
     since_param, until_param = get_date_filter_params()
     hours = request.args.get("hours", "1")
@@ -4228,12 +4228,12 @@ def check_full_profile_vs_outcome():
 
     finally:
         conn.close()
-  
-  
+
+
 @app.route("/check-buy-trajectory-vs-outcome")
 def check_buy_trajectory_vs_outcome():
     """
-    Tests whether a wallet's buy PRICE TRAJECTORY (rising vs falling vs
+    Tests whether the wallet buy PRICE TRAJECTORY (rising vs falling vs
     flat) predicts outcome better than raw buy_count alone — addresses
     the DCA-down confound where more buys could mean conviction OR
     loss-cutting. Optionally filters to market cap <= threshold via
@@ -4363,7 +4363,8 @@ def check_buy_trajectory_vs_outcome():
         return f"check_buy_trajectory_vs_outcome error: {e}", 500
 
     finally:
-        conn.close()     
+        conn.close()
+
 
 @app.route("/recommendation/<mint>")
 def recommendation_lookup(mint):
