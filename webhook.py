@@ -3690,7 +3690,109 @@ def check_marketcap_vs_outcome_detailed():
 
     finally:
         conn.close()
-        
+
+
+@app.route("/check-price-velocity-by-score")
+def check_price_velocity_by_score():
+    """
+    Checks pc_h1 and pc_h6 (recent price change AT RECOMMENDATION) by
+    score bucket. Tests whether 90-100 tokens specifically tend to have
+    already pumped hard in the recent past compared to 70-79, which
+    would support the theory that maxing multiple scoring components
+    simultaneously correlates with catching tokens right after their
+    biggest move rather than at the start of it.
+    """
+    since_param, until_param = get_date_filter_params()
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+
+        query = """
+            SELECT s.momentum_score, s.pc_h1, s.pc_h6
+            FROM token_scan_log s
+            WHERE s.momentum_alert_fired = TRUE
+            AND s.suspect_data IS NOT TRUE
+            AND s.pc_h1 IS NOT NULL
+            AND s.pc_h6 IS NOT NULL
+        """
+        params = []
+        if since_param:
+            query += " AND s.scanned_at >= %s"
+            params.append(since_param)
+        if until_param:
+            query += " AND s.scanned_at < %s"
+            params.append(until_param)
+
+        c.execute(query, params)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return "No recommendation data with pc_h1/pc_h6 yet.", 200
+
+        buckets = {
+            "70-79": {"pc_h1": [], "pc_h6": []},
+            "80-89": {"pc_h1": [], "pc_h6": []},
+            "90-100": {"pc_h1": [], "pc_h6": []},
+        }
+
+        for score, pc_h1, pc_h6 in rows:
+            if score is None:
+                continue
+            if 70 <= score < 80:
+                key = "70-79"
+            elif 80 <= score < 90:
+                key = "80-89"
+            elif score >= 90:
+                key = "90-100"
+            else:
+                continue
+
+            buckets[key]["pc_h1"].append(float(pc_h1))
+            buckets[key]["pc_h6"].append(float(pc_h6))
+
+        def median(vals):
+            s = sorted(vals)
+            n = len(s)
+            if n == 0:
+                return None
+            mid = n // 2
+            return (s[mid - 1] + s[mid]) / 2 if n % 2 == 0 else s[mid]
+
+        range_label = ""
+        if since_param or until_param:
+            range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
+
+        lines = [f"<b>Recent price velocity AT RECOMMENDATION, by score bucket:</b>{range_label}<br>"]
+        for bucket, d in buckets.items():
+            n = len(d["pc_h1"])
+            if n == 0:
+                lines.append(f"<br>{bucket}: no data")
+                continue
+            avg_h1 = sum(d["pc_h1"]) / n
+            med_h1 = median(d["pc_h1"])
+            avg_h6 = sum(d["pc_h6"]) / n
+            med_h6 = median(d["pc_h6"])
+            lines.append(
+                f"<br><b>Score {bucket}</b> (n={n})<br>"
+                f"1h price change — avg: {avg_h1:.1f}%, median: {med_h1:.1f}%<br>"
+                f"6h price change — avg: {avg_h6:.1f}%, median: {med_h6:.1f}%"
+            )
+
+        lines.append(
+            "<br><br>If 90-100 shows a noticeably higher pc_h1/pc_h6 than "
+            "70-79, that confirms high scores are catching tokens right "
+            "after their biggest recent move — supporting a price-velocity "
+            "cap specifically for the highest score tier."
+        )
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_price_velocity_by_score error: {e}", 500
+
+    finally:
+        conn.close()
+
 
 @app.route("/recommendation/<mint>")
 def recommendation_lookup(mint):
