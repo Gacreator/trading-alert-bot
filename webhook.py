@@ -3847,6 +3847,103 @@ def check_recommendation_timing():
         conn.close()
 
 
+@app.route("/check-timing-by-score")
+def check_timing_by_score():
+    """
+    Checks time-to-recommendation (first_seen_at to recommended_at) broken
+    down by score bucket. Tests whether 90-100 tokens systematically take
+    LONGER to mature into a recommendation than 70-79 — which would mean
+    they've had more scan cycles for momentum/volume to build up and
+    align across every scoring dimension simultaneously, a different
+    angle from market cap, price velocity, or extension multiplier
+    (all previously ruled out).
+    """
+    since_param, until_param = get_date_filter_params()
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+
+        query = """
+            SELECT s.momentum_score,
+                   EXTRACT(EPOCH FROM (h.recommended_at - h.first_seen_at)) / 3600 AS hours_to_rec
+            FROM token_scan_log s
+            JOIN wallet_token_history h
+                ON h.wallet = s.wallet AND h.token_mint = s.token_mint
+            WHERE s.momentum_alert_fired = TRUE
+            AND s.suspect_data IS NOT TRUE
+            AND h.recommended_at IS NOT NULL
+            AND h.first_seen_at IS NOT NULL
+        """
+        params = []
+        if since_param:
+            query += " AND h.recommended_at >= %s"
+            params.append(since_param)
+        if until_param:
+            query += " AND h.recommended_at < %s"
+            params.append(until_param)
+
+        c.execute(query, params)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return "No recommendation data with timing yet.", 200
+
+        buckets = {"70-79": [], "80-89": [], "90-100": []}
+
+        for score, hours in rows:
+            if score is None or hours is None:
+                continue
+            if 70 <= score < 80:
+                key = "70-79"
+            elif 80 <= score < 90:
+                key = "80-89"
+            elif score >= 90:
+                key = "90-100"
+            else:
+                continue
+            buckets[key].append(float(hours))
+
+        def median(vals):
+            s = sorted(vals)
+            n = len(s)
+            if n == 0:
+                return None
+            mid = n // 2
+            return (s[mid - 1] + s[mid]) / 2 if n % 2 == 0 else s[mid]
+
+        range_label = ""
+        if since_param or until_param:
+            range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
+
+        lines = [f"<b>Time from first_seen_at to recommended_at, by score bucket:</b>{range_label}<br>"]
+        for bucket, vals in buckets.items():
+            if not vals:
+                lines.append(f"<br>{bucket}: no data")
+                continue
+            avg_h = sum(vals) / len(vals)
+            med_h = median(vals)
+            lines.append(
+                f"<br><b>Score {bucket}</b> (n={len(vals)})<br>"
+                f"avg: {avg_h:.1f}h, median: {med_h:.1f}h"
+            )
+
+        lines.append(
+            "<br><br>If 90-100 shows a noticeably higher median time-to-"
+            "recommendation than 70-79, that suggests high scores are "
+            "systematically catching tokens that took longer to mature — "
+            "possibly meaning momentum built up (or was manufactured) "
+            "over more scan cycles, rather than genuine early strength."
+        )
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_timing_by_score error: {e}", 500
+
+    finally:
+        conn.close()
+
+
 @app.route("/recommendation/<mint>")
 def recommendation_lookup(mint):
     conn = get_conn()
