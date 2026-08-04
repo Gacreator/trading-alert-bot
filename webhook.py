@@ -4046,6 +4046,127 @@ def check_score_components_by_bucket():
         conn.close()
 
 
+@app.route("/check-full-profile-vs-outcome")
+def check_full_profile_vs_outcome():
+    """
+    Pulls every stored attribute at recommendation time (RugCheck score,
+    holder %, volume ratio, market cap, buy count, cluster count) for
+    every recommendation, split by whether the token eventually hit 3x+
+    or not. Gives a single comprehensive comparison instead of checking
+    each factor separately.
+    """
+    since_param, until_param = get_date_filter_params()
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+
+        query = """
+            SELECT
+                h.rugcheck_score_at_recommendation,
+                h.top1_holder_pct_at_recommendation,
+                h.market_cap_at_recommendation,
+                h.buy_count_at_recommendation,
+                h.cluster_count_at_recommendation,
+                s.liquidity, s.vol_h1,
+                h.max_multiplier_since_recommendation,
+                h.pumped_since_recommendation_alerted
+            FROM wallet_token_history h
+            JOIN token_scan_log s
+                ON s.wallet = h.wallet AND s.token_mint = h.token_mint
+                AND s.momentum_alert_fired = TRUE
+            WHERE h.momentum_alerted = TRUE
+        """
+        params = []
+        if since_param:
+            query += " AND h.recommended_at >= %s"
+            params.append(since_param)
+        if until_param:
+            query += " AND h.recommended_at < %s"
+            params.append(until_param)
+
+        c.execute(query, params)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return "No recommendation data yet.", 200
+
+        winners = {"rug": [], "holder": [], "mc": [], "buy_count": [], "cluster": [], "vol_ratio": []}
+        losers = {"rug": [], "holder": [], "mc": [], "buy_count": [], "cluster": [], "vol_ratio": []}
+
+        for rug, holder, mc, buy_count, cluster, liquidity, vol_h1, max_mult, hit_3x in rows:
+            hit = bool(hit_3x) or (max_mult and max_mult >= 3)
+            bucket = winners if hit else losers
+
+            if rug is not None:
+                bucket["rug"].append(float(rug))
+            if holder is not None:
+                bucket["holder"].append(float(holder))
+            if mc is not None:
+                bucket["mc"].append(float(mc))
+            if buy_count is not None:
+                bucket["buy_count"].append(float(buy_count))
+            if cluster is not None:
+                bucket["cluster"].append(float(cluster))
+            if liquidity and vol_h1 is not None:
+                bucket["vol_ratio"].append(float(vol_h1) / float(liquidity))
+
+        winner_count = sum(1 for r, h, m, b, c, l, v, mm, hh in rows if bool(hh) or (mm and mm >= 3))
+        loser_count = len(rows) - winner_count
+
+        def median(vals):
+            if not vals:
+                return None
+            s = sorted(vals)
+            n = len(s)
+            mid = n // 2
+            return (s[mid - 1] + s[mid]) / 2 if n % 2 == 0 else s[mid]
+
+        def fmt(vals, kind="num"):
+            m = median(vals)
+            if m is None:
+                return "n/a"
+            if kind == "usd":
+                return f"${m:,.0f}"
+            return f"{m:.2f}"
+
+        range_label = ""
+        if since_param or until_param:
+            range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
+
+        lines = [f"<b>Full profile comparison: 3x+ winners vs losers</b>{range_label}<br>"]
+
+        lines.append(f"<br><b>WINNERS</b> (n={winner_count})")
+        lines.append(f"RugCheck score — median: {fmt(winners['rug'])}")
+        lines.append(f"Top holder % — median: {fmt(winners['holder'])}")
+        lines.append(f"Market cap — median: {fmt(winners['mc'], 'usd')}")
+        lines.append(f"Buy count — median: {fmt(winners['buy_count'])}")
+        lines.append(f"Cluster count — median: {fmt(winners['cluster'])}")
+        lines.append(f"Vol/liq ratio — median: {fmt(winners['vol_ratio'])}")
+
+        lines.append(f"<br><br><b>LOSERS</b> (n={loser_count})")
+        lines.append(f"RugCheck score — median: {fmt(losers['rug'])}")
+        lines.append(f"Top holder % — median: {fmt(losers['holder'])}")
+        lines.append(f"Market cap — median: {fmt(losers['mc'], 'usd')}")
+        lines.append(f"Buy count — median: {fmt(losers['buy_count'])}")
+        lines.append(f"Cluster count — median: {fmt(losers['cluster'])}")
+        lines.append(f"Vol/liq ratio — median: {fmt(losers['vol_ratio'])}")
+
+        lines.append(
+            "<br><br>Compare each row between WINNERS and LOSERS — a "
+            "metric with a clear, consistent gap is a genuine candidate "
+            "signal. Small samples in either group should be treated "
+            "cautiously per usual."
+        )
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_full_profile_vs_outcome error: {e}", 500
+
+    finally:
+        conn.close()
+        
+
 @app.route("/recommendation/<mint>")
 def recommendation_lookup(mint):
     conn = get_conn()
