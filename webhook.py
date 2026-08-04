@@ -2934,10 +2934,6 @@ def check_volume_ratio_vs_outcome_sustained():
     Purely a background analytical metric — does NOT change what triggers
     the live 'PAID OFF' alert, which still fires on any 3x touch.
     """
-
-    Purely a background analytical metric — does NOT change what triggers
-    the live "PAID OFF" alert, which still fires on any 3x touch.
-    """
     since_param, until_param = get_date_filter_params()
     hours = request.args.get("hours", "1")
     try:
