@@ -105,10 +105,24 @@ def init_db():
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS top1_holder_pct_at_recommendation NUMERIC")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS cluster_count_at_recommendation INTEGER")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS buy_count_at_recommendation INTEGER")
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS buy_trajectory_at_recommendation TEXT")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS liquidity_trend_points_at_recommendation NUMERIC")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS liquidity_level_points_at_recommendation NUMERIC")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS price_window_points_at_recommendation NUMERIC")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS volume_sanity_points_at_recommendation NUMERIC")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS wallet_buy_events (
+                id SERIAL PRIMARY KEY,
+                wallet TEXT,
+                token_mint TEXT,
+                buy_number INTEGER,
+                price NUMERIC,
+                bought_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS token_scan_log (
         
         c.execute("""
             CREATE TABLE IF NOT EXISTS token_scan_log (
@@ -759,8 +773,9 @@ def check_and_record_buy(wallet, mint):
         )
         exists = c.fetchone() is not None
 
+        price = get_current_price(mint)
+
         if not exists:
-            price = get_current_price(mint)
             c.execute(
                 """
                 INSERT INTO wallet_token_history (wallet, token_mint, buy_count, price_at_first_buy)
@@ -770,6 +785,7 @@ def check_and_record_buy(wallet, mint):
                 (wallet, mint, price)
             )
             conn.commit()
+            buy_number = 1
             print(f"🟢 FIRST BUY DETECTED (recorded, no alert): wallet={wallet} token={mint} price={price}")
         else:
             c.execute(
@@ -783,12 +799,56 @@ def check_and_record_buy(wallet, mint):
             )
             new_count_row = c.fetchone()
             conn.commit()
-            new_count = new_count_row[0] if new_count_row else "?"
-            print(f"🔁 Repeat buy #{new_count} (recorded, no alert): wallet={wallet} token={mint}")
+            buy_number = new_count_row[0] if new_count_row else None
+            print(f"🔁 Repeat buy #{buy_number} (recorded, no alert): wallet={wallet} token={mint}")
+
+        if price is not None:
+            c.execute(
+                """
+                INSERT INTO wallet_buy_events (wallet, token_mint, buy_number, price)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (wallet, mint, buy_number, price)
+            )
+            conn.commit()
 
         c.close()
     finally:
-        conn.close()
+        conn.close()  
+        
+
+def get_buy_trajectory(wallet, mint):
+    """
+    Returns 'rising', 'falling', 'flat', or None (insufficient data) based
+    on whether this wallet's buy prices for this token have been trending
+    up (real conviction) or down (DCA/loss-cutting behavior).
+    """
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT price FROM wallet_buy_events
+            WHERE wallet=%s AND token_mint=%s
+            ORDER BY buy_number ASC
+            """,
+            (wallet, mint)
+        )
+        prices = [float(r[0]) for r in c.fetchall() if r[0] is not None]
+        c.close()
+
+        if len(prices) < 2:
+            return None
+
+        first, last = prices[0], prices[-1]
+        if last > first * 1.05:
+            return "rising"
+        elif last < first * 0.95:
+            return "falling"
+        else:
+            return "flat"
+    finally:
+        conn.close()  
         
         
 def run_pump_check():
@@ -964,6 +1024,7 @@ def run_pump_check():
                         liquidity_level_pts = details.get("liquidity_level_points")
                         price_window_pts = details.get("price_window_points")
                         volume_sanity_pts = details.get("volume_sanity_points")
+                        buy_trajectory = get_buy_trajectory(wallet, mint)
 
                         c.execute(
                             """
@@ -975,14 +1036,16 @@ def run_pump_check():
                                 rugcheck_score_at_recommendation = %s,
                                 top1_holder_pct_at_recommendation = %s,
                                 cluster_count_at_recommendation = %s,
-                                buy_count_at_recommendation = %s
+                                buy_count_at_recommendation = %s,
+                                buy_trajectory_at_recommendation = %s
                             WHERE wallet=%s AND token_mint=%s
                             """,
                             (current_price, current_market_cap, rug_score,
                              top1_pct, len(cluster_wallets), current_buy_count,
-                             wallet, mint)
+                             buy_trajectory, wallet, mint)
                         )
-                        send_telegram_alert(
+                        
+                     send_telegram_alert(
                             f"🚀 Heating up (score {score}/100)\n"
                             f"Wallet: <code>{wallet}</code>\n"
                             f"Token: <code>{mint}</code>\n\n"
@@ -4165,7 +4228,142 @@ def check_full_profile_vs_outcome():
 
     finally:
         conn.close()
-        
+  
+  
+@app.route("/check-buy-trajectory-vs-outcome")
+def check_buy_trajectory_vs_outcome():
+    """
+    Tests whether a wallet's buy PRICE TRAJECTORY (rising vs falling vs
+    flat) predicts outcome better than raw buy_count alone — addresses
+    the DCA-down confound where more buys could mean conviction OR
+    loss-cutting. Optionally filters to market cap <= threshold via
+    ?max_mc=, since the hypothesis is this matters most at low market cap.
+    """
+    since_param, until_param = get_date_filter_params()
+    max_mc = request.args.get("max_mc")
+    hours = request.args.get("hours", "1")
+    try:
+        hours = float(hours)
+    except (TypeError, ValueError):
+        hours = 1.0
+
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+
+        query = """
+            SELECT h.wallet, h.token_mint, h.buy_trajectory_at_recommendation,
+                   h.market_cap_at_recommendation,
+                   h.max_multiplier_since_recommendation,
+                   h.pumped_since_recommendation_alerted
+            FROM wallet_token_history h
+            WHERE h.momentum_alerted = TRUE
+            AND h.buy_trajectory_at_recommendation IS NOT NULL
+        """
+        params = []
+        if since_param:
+            query += " AND h.recommended_at >= %s"
+            params.append(since_param)
+        if until_param:
+            query += " AND h.recommended_at < %s"
+            params.append(until_param)
+        if max_mc:
+            query += " AND h.market_cap_at_recommendation <= %s"
+            params.append(float(max_mc))
+
+        c.execute(query, params)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return "No recommendation data with buy trajectory yet.", 200
+
+        conn2 = get_conn()
+        c2 = conn2.cursor()
+        c2.execute("""
+            WITH scans AS (
+                SELECT wallet, token_mint, scanned_at, multiplier_from_first_buy
+                FROM token_scan_log
+                WHERE multiplier_from_first_buy IS NOT NULL
+                AND suspect_data IS NOT TRUE
+            ),
+            peak AS (
+                SELECT DISTINCT ON (wallet, token_mint)
+                    wallet, token_mint, scanned_at AS peak_at,
+                    multiplier_from_first_buy AS peak_mult
+                FROM scans
+                ORDER BY wallet, token_mint, multiplier_from_first_buy DESC, scanned_at ASC
+            ),
+            qualifying AS (
+                SELECT * FROM peak WHERE peak_mult >= 3
+            ),
+            latest AS (
+                SELECT DISTINCT ON (wallet, token_mint)
+                    wallet, token_mint, scanned_at AS latest_at,
+                    multiplier_from_first_buy AS latest_mult
+                FROM scans
+                ORDER BY wallet, token_mint, scanned_at DESC
+            )
+            SELECT q.wallet, q.token_mint,
+                   CASE WHEN l.latest_mult >= q.peak_mult * 0.5 THEN TRUE ELSE FALSE END AS held
+            FROM qualifying q
+            JOIN latest l ON l.wallet = q.wallet AND l.token_mint = q.token_mint
+            WHERE l.latest_at >= q.peak_at + (INTERVAL '1 hour' * %s)
+        """, (hours,))
+        held_rows = c2.fetchall()
+        c2.close()
+        conn2.close()
+
+        held_map = {(w, m): held for w, m, held in held_rows}
+
+        buckets = {
+            "rising": {"touched_total": 0, "touched_hit": 0, "held_total": 0, "held_hit": 0},
+            "falling": {"touched_total": 0, "touched_hit": 0, "held_total": 0, "held_hit": 0},
+            "flat": {"touched_total": 0, "touched_hit": 0, "held_total": 0, "held_hit": 0},
+        }
+
+        for wallet, mint, trajectory, mc, max_mult, hit_3x in rows:
+            if trajectory not in buckets:
+                continue
+            touched = bool(hit_3x) or (max_mult and max_mult >= 3)
+            buckets[trajectory]["touched_total"] += 1
+            if touched:
+                buckets[trajectory]["touched_hit"] += 1
+            if (wallet, mint) in held_map:
+                buckets[trajectory]["held_total"] += 1
+                if held_map[(wallet, mint)]:
+                    buckets[trajectory]["held_hit"] += 1
+
+        range_label = ""
+        if since_param or until_param:
+            range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
+        mc_label = f"<br>Market cap filter: ≤${float(max_mc):,.0f}<br>" if max_mc else ""
+
+        lines = [f"<b>Buy trajectory vs outcome:</b>{range_label}{mc_label}<br>"]
+        for bucket, d in buckets.items():
+            t_total, t_hit = d["touched_total"], d["touched_hit"]
+            h_total, h_hit = d["held_total"], d["held_hit"]
+            t_rate = f"{t_hit/t_total*100:.1f}%" if t_total else "n/a"
+            h_rate = f"{h_hit/h_total*100:.1f}%" if h_total else "n/a"
+            lines.append(
+                f"<br><b>{bucket.upper()}</b><br>"
+                f"Touched 3x+: {t_hit}/{t_total} ({t_rate})<br>"
+                f"Held 50%+ after {hours}h: {h_hit}/{h_total} ({h_rate})"
+            )
+
+        lines.append(
+            "<br><br>If RISING outperforms FALLING/FLAT, that confirms buy "
+            "trajectory (not just raw count) is the real signal — conviction "
+            "on the way up, not damage control on the way down. Try "
+            "?max_mc=50000 to test specifically at low market cap."
+        )
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_buy_trajectory_vs_outcome error: {e}", 500
+
+    finally:
+        conn.close()     
 
 @app.route("/recommendation/<mint>")
 def recommendation_lookup(mint):
