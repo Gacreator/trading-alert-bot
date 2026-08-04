@@ -820,7 +820,7 @@ def check_and_record_buy(wallet, mint):
 def get_buy_trajectory(wallet, mint):
     """
     Returns 'rising', 'falling', 'flat', or None (insufficient data) based
-    on whether this wallet's buy prices for this token have been trending
+    on whether the wallet buy prices for this token have been trending
     up (real conviction) or down (DCA/loss-cutting behavior).
     """
     conn = get_conn()
