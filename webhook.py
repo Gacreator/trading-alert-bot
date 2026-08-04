@@ -3430,6 +3430,119 @@ def check_holder_vs_outcome():
         conn.close()
 
 
+@app.route("/check-marketcap-growth-vs-score")
+def check_marketcap_growth_vs_score():
+    """
+    Checks market cap AT RECOMMENDATION, and how much it grew from the
+    market cap at each wallet's first buy, broken down by score bucket.
+    Tests the user's eye-test observation: do 90-100 score recommendations
+    tend to fire only after market cap has already ballooned significantly
+    (e.g. 200k -> 769k), rather than closer to the original entry point?
+    """
+    since_param, until_param = get_date_filter_params()
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+
+        query = """
+            SELECT s.momentum_score, h.market_cap_at_recommendation,
+                   fs.market_cap AS market_cap_at_first_buy
+            FROM token_scan_log s
+            JOIN wallet_token_history h
+                ON h.wallet = s.wallet AND h.token_mint = s.token_mint
+            JOIN LATERAL (
+                SELECT market_cap
+                FROM token_scan_log fs2
+                WHERE fs2.wallet = h.wallet AND fs2.token_mint = h.token_mint
+                ORDER BY fs2.scanned_at ASC
+                LIMIT 1
+            ) fs ON TRUE
+            WHERE s.momentum_alert_fired = TRUE
+            AND s.suspect_data IS NOT TRUE
+            AND h.market_cap_at_recommendation IS NOT NULL
+            AND fs.market_cap IS NOT NULL AND fs.market_cap > 0
+        """
+        params = []
+        if since_param:
+            query += " AND h.recommended_at >= %s"
+            params.append(since_param)
+        if until_param:
+            query += " AND h.recommended_at < %s"
+            params.append(until_param)
+
+        c.execute(query, params)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return "No recommendation data with market cap history yet.", 200
+
+        buckets = {
+            "70-79": [],
+            "80-89": [],
+            "90-100": [],
+        }
+
+        for score, mc_at_rec, mc_at_first_buy in rows:
+            if score is None:
+                continue
+            growth_mult = float(mc_at_rec) / float(mc_at_first_buy) if mc_at_first_buy else None
+            if growth_mult is None:
+                continue
+
+            if 70 <= score < 80:
+                key = "70-79"
+            elif 80 <= score < 90:
+                key = "80-89"
+            elif score >= 90:
+                key = "90-100"
+            else:
+                continue
+
+            buckets[key].append((float(mc_at_first_buy), float(mc_at_rec), growth_mult))
+
+        def median(vals):
+            s = sorted(vals)
+            n = len(s)
+            if n == 0:
+                return None
+            mid = n // 2
+            return (s[mid - 1] + s[mid]) / 2 if n % 2 == 0 else s[mid]
+
+        range_label = ""
+        if since_param or until_param:
+            range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
+
+        lines = [f"<b>Market cap growth (first buy → recommendation) by score bucket:</b>{range_label}<br>"]
+        for bucket, vals in buckets.items():
+            if not vals:
+                lines.append(f"<br>{bucket}: no data")
+                continue
+            first_buys = [v[0] for v in vals]
+            recs = [v[1] for v in vals]
+            growths = [v[2] for v in vals]
+            lines.append(
+                f"<br><b>Score {bucket}</b> (n={len(vals)})<br>"
+                f"Market cap at first buy — median: ${median(first_buys):,.0f}<br>"
+                f"Market cap at recommendation — median: ${median(recs):,.0f}<br>"
+                f"Growth multiplier — median: {median(growths):.2f}x"
+            )
+
+        lines.append(
+            "<br><br>If 90-100 shows a much higher market-cap-at-recommendation "
+            "and growth multiplier than 70-79, that confirms high scores are "
+            "systematically firing after market cap has already ballooned — "
+            "validating a market cap cap/gate for high scores specifically."
+        )
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_marketcap_growth_vs_score error: {e}", 500
+
+    finally:
+        conn.close()
+
+
 @app.route("/recommendation/<mint>")
 def recommendation_lookup(mint):
     conn = get_conn()
