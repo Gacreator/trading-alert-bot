@@ -3543,7 +3543,7 @@ def check_marketcap_growth_vs_score():
         conn.close()
 
 
-@@app.route("/check-marketcap-vs-outcome-detailed")
+@app.route("/check-marketcap-vs-outcome-detailed")
 def check_marketcap_vs_outcome_detailed():
     """
     Same as /check-marketcap-vs-outcome, but with finer-grained buckets
