@@ -3543,14 +3543,13 @@ def check_marketcap_growth_vs_score():
         conn.close()
 
 
-@app.route("/check-marketcap-vs-outcome")
-def check_marketcap_vs_outcome():
+@@app.route("/check-marketcap-vs-outcome-detailed")
+def check_marketcap_vs_outcome_detailed():
     """
-    Buckets recommendations by market_cap_at_recommendation directly
-    (regardless of score) and compares both touched-3x and
-    held-3x-after-1h hit rates. Tests whether high market cap at the
-    moment of recommendation predicts worse outcomes — the direct
-    question behind the proposed $500k market cap gate.
+    Same as /check-marketcap-vs-outcome, but with finer-grained buckets
+    above 500k instead of one broad "over 500k" catch-all — since a $600k
+    token and a $5M token are likely very different situations that
+    shouldn't be averaged together.
     """
     since_param, until_param = get_date_filter_params()
     hours = request.args.get("hours", "1")
@@ -3628,7 +3627,10 @@ def check_marketcap_vs_outcome():
             "under 100k": {"touched_total": 0, "touched_hit": 0, "held_total": 0, "held_hit": 0},
             "100k-300k": {"touched_total": 0, "touched_hit": 0, "held_total": 0, "held_hit": 0},
             "300k-500k": {"touched_total": 0, "touched_hit": 0, "held_total": 0, "held_hit": 0},
-            "over 500k": {"touched_total": 0, "touched_hit": 0, "held_total": 0, "held_hit": 0},
+            "500k-750k": {"touched_total": 0, "touched_hit": 0, "held_total": 0, "held_hit": 0},
+            "750k-1M": {"touched_total": 0, "touched_hit": 0, "held_total": 0, "held_hit": 0},
+            "1M-2M": {"touched_total": 0, "touched_hit": 0, "held_total": 0, "held_hit": 0},
+            "over 2M": {"touched_total": 0, "touched_hit": 0, "held_total": 0, "held_hit": 0},
         }
 
         for wallet, mint, mc, max_mult, hit_3x in rows:
@@ -3639,8 +3641,14 @@ def check_marketcap_vs_outcome():
                 key = "100k-300k"
             elif mc < 500000:
                 key = "300k-500k"
+            elif mc < 750000:
+                key = "500k-750k"
+            elif mc < 1000000:
+                key = "750k-1M"
+            elif mc < 2000000:
+                key = "1M-2M"
             else:
-                key = "over 500k"
+                key = "over 2M"
 
             touched = bool(hit_3x) or (max_mult and max_mult >= 3)
             buckets[key]["touched_total"] += 1
@@ -3656,10 +3664,12 @@ def check_marketcap_vs_outcome():
         if since_param or until_param:
             range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
 
-        lines = [f"<b>Recommendation hit-rate by market cap AT RECOMMENDATION:</b>{range_label}<br>"]
+        lines = [f"<b>Recommendation hit-rate by market cap AT RECOMMENDATION (detailed):</b>{range_label}<br>"]
         for bucket, d in buckets.items():
             t_total, t_hit = d["touched_total"], d["touched_hit"]
             h_total, h_hit = d["held_total"], d["held_hit"]
+            if t_total == 0:
+                continue
             t_rate = f"{t_hit/t_total*100:.1f}%" if t_total else "n/a"
             h_rate = f"{h_hit/h_total*100:.1f}%" if h_total else "n/a"
             lines.append(
@@ -3669,14 +3679,14 @@ def check_marketcap_vs_outcome():
             )
 
         lines.append(
-            "<br><br>If 'over 500k' shows meaningfully LOWER rates (especially "
-            "the HELD metric) than lower buckets, that validates a market cap "
-            "gate. If rates are similar, market cap alone isn't a useful filter."
+            "<br><br>⚠️ Sample sizes shrink fast in the higher buckets — treat "
+            "any single bucket's numbers cautiously unless it has 20-30+ "
+            "in the HELD column specifically."
         )
         return "<br>".join(lines), 200
 
     except Exception as e:
-        return f"check_marketcap_vs_outcome error: {e}", 500
+        return f"check_marketcap_vs_outcome_detailed error: {e}", 500
 
     finally:
         conn.close()
