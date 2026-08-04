@@ -848,7 +848,7 @@ def get_buy_trajectory(wallet, mint):
         else:
             return "flat"
     finally:
-        conn.close()  
+        conn.close()
         
         
 def run_pump_check():
