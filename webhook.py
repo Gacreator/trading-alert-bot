@@ -105,6 +105,10 @@ def init_db():
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS top1_holder_pct_at_recommendation NUMERIC")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS cluster_count_at_recommendation INTEGER")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS buy_count_at_recommendation INTEGER")
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS liquidity_trend_points_at_recommendation NUMERIC")
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS liquidity_level_points_at_recommendation NUMERIC")
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS price_window_points_at_recommendation NUMERIC")
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS volume_sanity_points_at_recommendation NUMERIC")
         
         c.execute("""
             CREATE TABLE IF NOT EXISTS token_scan_log (
@@ -435,6 +439,8 @@ def score_momentum(pair, liquidity_delta_pct=None, prior_liquidity_delta_pct=Non
     score += trend_score
 
     liquidity_score = min(1.0, liquidity / 15000) * 25
+    details["liquidity_trend_points"] = trend_score
+    details["liquidity_level_points"] = liquidity_score
     score += liquidity_score
 
     price_change = pair.get("priceChange", {}) or {}
@@ -445,8 +451,10 @@ def score_momentum(pair, liquidity_delta_pct=None, prior_liquidity_delta_pct=Non
     details["pc_h1"] = pc_h1
     details["pc_h6"] = pc_h6
     positive_windows = sum(1 for x in [pc_5m, pc_h1, pc_h6] if x and x > 0)
-    score += positive_windows * (20 / 3)
-
+    price_window_points = positive_windows * (20 / 3)
+    score += price_window_points
+    details["price_window_points"] = price_window_points
+    
     volume = pair.get("volume", {}) or {}
     vol_5m = volume.get("m5", 0) or 0
     vol_h1 = volume.get("h1", 0) or 0
@@ -455,11 +463,14 @@ def score_momentum(pair, liquidity_delta_pct=None, prior_liquidity_delta_pct=Non
 
     vol_to_liq_ratio = (vol_5m / liquidity) if liquidity > 0 else 0
     details["vol_to_liq_ratio"] = vol_to_liq_ratio
+    volume_sanity_points = 0
     if vol_to_liq_ratio > 0.5:
-        score -= 10
+        volume_sanity_points = -10
     elif 0.01 <= vol_to_liq_ratio <= 0.3:
-        score += 10
-
+        volume_sanity_points = 10
+    score += volume_sanity_points
+    details["volume_sanity_points"] = volume_sanity_points
+    
     vol_h1_to_liq_ratio = (vol_h1 / liquidity) if liquidity > 0 else 0
     details["vol_h1_to_liq_ratio"] = vol_h1_to_liq_ratio
     if vol_h1_to_liq_ratio > 5:
@@ -949,6 +960,10 @@ def run_pump_check():
                         )
                         current_buy_count_row = c.fetchone()
                         current_buy_count = current_buy_count_row[0] if current_buy_count_row else None
+                        liquidity_trend_pts = details.get("liquidity_trend_points")
+                        liquidity_level_pts = details.get("liquidity_level_points")
+                        price_window_pts = details.get("price_window_points")
+                        volume_sanity_pts = details.get("volume_sanity_points")
 
                         c.execute(
                             """
@@ -3939,6 +3954,93 @@ def check_timing_by_score():
 
     except Exception as e:
         return f"check_timing_by_score error: {e}", 500
+
+    finally:
+        conn.close()
+
+
+@app.route("/check-score-components-by-bucket")
+def check_score_components_by_bucket():
+    since_param, until_param = get_date_filter_params()
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        query = """
+            SELECT s.momentum_score,
+                   h.liquidity_trend_points_at_recommendation,
+                   h.liquidity_level_points_at_recommendation,
+                   h.price_window_points_at_recommendation,
+                   h.volume_sanity_points_at_recommendation
+            FROM token_scan_log s
+            JOIN wallet_token_history h
+                ON h.wallet = s.wallet AND h.token_mint = s.token_mint
+            WHERE s.momentum_alert_fired = TRUE
+            AND s.suspect_data IS NOT TRUE
+            AND h.liquidity_trend_points_at_recommendation IS NOT NULL
+        """
+        params = []
+        if since_param:
+            query += " AND h.recommended_at >= %s"
+            params.append(since_param)
+        if until_param:
+            query += " AND h.recommended_at < %s"
+            params.append(until_param)
+
+        c.execute(query, params)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return "No recommendation data with component breakdown yet.", 200
+
+        buckets = {"70-79": [], "80-89": [], "90-100": []}
+        for score, trend, level, window, vol in rows:
+            if score is None:
+                continue
+            if 70 <= score < 80:
+                key = "70-79"
+            elif 80 <= score < 90:
+                key = "80-89"
+            elif score >= 90:
+                key = "90-100"
+            else:
+                continue
+            buckets[key].append((trend or 0, level or 0, window or 0, vol or 0))
+
+        def avg(vals):
+            return sum(vals) / len(vals) if vals else None
+
+        range_label = ""
+        if since_param or until_param:
+            range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
+
+        lines = [f"<b>Score component breakdown by bucket:</b>{range_label}<br>"]
+        for bucket, vals in buckets.items():
+            if not vals:
+                lines.append(f"<br>{bucket}: no data")
+                continue
+            trends = [v[0] for v in vals]
+            levels = [v[1] for v in vals]
+            windows = [v[2] for v in vals]
+            vols = [v[3] for v in vals]
+            lines.append(
+                f"<br><b>Score {bucket}</b> (n={len(vals)})<br>"
+                f"Liquidity trend pts (max 45) — avg: {avg(trends):.1f}<br>"
+                f"Liquidity level pts (max 25) — avg: {avg(levels):.1f}<br>"
+                f"Price window pts (max 20) — avg: {avg(windows):.1f}<br>"
+                f"Volume sanity pts (-10 to +10) — avg: {avg(vols):.1f}"
+            )
+
+        lines.append(
+            "<br><br>Look for which component(s) 90-100 maxes out disproportionately "
+            "more than 70-79 — that's the specific factor most associated "
+            "with reaching the highest score tier, and a candidate for "
+            "re-examining if it's genuinely predictive or not."
+        )
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_score_components_by_bucket error: {e}", 500
 
     finally:
         conn.close()
