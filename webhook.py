@@ -4796,8 +4796,10 @@ def token_history(mint):
                 f"Multiplier from first buy: {f'{multiplier:.2f}x' if multiplier else 'n/a'}"
                 + (f" | Since recommendation: {mult_since_rec:.2f}x" if mult_since_rec else "")
                 + f"<br>"
-                f"Liquidity: ${liquidity:,.0f} (Δ {f'{liq_delta*100:.1f}%' if liq_delta is not None else 'n/a'})<br>"
-                f"Volume 5m/1h: ${vol_5m:,.0f} / ${vol_h1:,.0f}<br>"
+                f"Liquidity: {f'${liquidity:,.0f}' if liquidity is not None else 'n/a'} "
+                f"(Δ {f'{liq_delta*100:.1f}%' if liq_delta is not None else 'n/a'})<br>"
+                f"Volume 5m/1h: {f'${vol_5m:,.0f}' if vol_5m is not None else 'n/a'} / "
+                f"{f'${vol_h1:,.0f}' if vol_h1 is not None else 'n/a'}<br>"
                 f"Price change 5m/1h/6h: {pc_5m}% / {pc_h1}% / {pc_h6}%<br>"
                 f"Buys/Sells (5m): {buys_5m}/{sells_5m}<br>"
                 f"Momentum score: {score}"
