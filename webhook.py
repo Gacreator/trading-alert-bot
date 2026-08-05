@@ -4689,6 +4689,162 @@ def check_too_perfect_vs_outcome():
         conn.close()
 
 
+@app.route("/check-historical-peak-ratio-vs-outcome")
+def check_historical_peak_ratio_vs_outcome():
+    """
+    For each recommendation, calculates the PEAK vol_h1_to_liq_ratio seen
+    in that token's scan history BEFORE the recommendation fired (not just
+    the ratio at the moment of recommendation). Tests whether tokens that
+    were ever dangerously hot on volume early on (even if calm by the time
+    they got recommended) perform worse than tokens that were always calm.
+    Prompted by a real case: a token peaked at 18.25x ratio early, cooled
+    to 2.11x by recommendation time, passed every gate, then dropped to
+    0.39x (61% loss) afterward.
+    """
+    since_param, until_param = get_date_filter_params()
+    hours = request.args.get("hours", "1")
+    try:
+        hours = float(hours)
+    except (TypeError, ValueError):
+        hours = 1.0
+
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+
+        query = """
+            SELECT h.wallet, h.token_mint, h.recommended_at,
+                   h.max_multiplier_since_recommendation,
+                   h.pumped_since_recommendation_alerted
+            FROM wallet_token_history h
+            WHERE h.momentum_alerted = TRUE
+            AND h.recommended_at IS NOT NULL
+        """
+        params = []
+        if since_param:
+            query += " AND h.recommended_at >= %s"
+            params.append(since_param)
+        if until_param:
+            query += " AND h.recommended_at < %s"
+            params.append(until_param)
+
+        c.execute(query, params)
+        recs = c.fetchall()
+        c.close()
+
+        if not recs:
+            return "No recommendation data yet.", 200
+
+        conn2 = get_conn()
+        c2 = conn2.cursor()
+        c2.execute("""
+            WITH scans AS (
+                SELECT wallet, token_mint, scanned_at, multiplier_from_first_buy
+                FROM token_scan_log
+                WHERE multiplier_from_first_buy IS NOT NULL
+                AND suspect_data IS NOT TRUE
+            ),
+            peak AS (
+                SELECT DISTINCT ON (wallet, token_mint)
+                    wallet, token_mint, scanned_at AS peak_at,
+                    multiplier_from_first_buy AS peak_mult
+                FROM scans
+                ORDER BY wallet, token_mint, multiplier_from_first_buy DESC, scanned_at ASC
+            ),
+            qualifying AS (
+                SELECT * FROM peak WHERE peak_mult >= 3
+            ),
+            latest AS (
+                SELECT DISTINCT ON (wallet, token_mint)
+                    wallet, token_mint, scanned_at AS latest_at,
+                    multiplier_from_first_buy AS latest_mult
+                FROM scans
+                ORDER BY wallet, token_mint, scanned_at DESC
+            )
+            SELECT q.wallet, q.token_mint,
+                   CASE WHEN l.latest_mult >= q.peak_mult * 0.5 THEN TRUE ELSE FALSE END AS held
+            FROM qualifying q
+            JOIN latest l ON l.wallet = q.wallet AND l.token_mint = q.token_mint
+            WHERE l.latest_at >= q.peak_at + (INTERVAL '1 hour' * %s)
+        """, (hours,))
+        held_rows = c2.fetchall()
+        c2.close()
+        conn2.close()
+        held_map = {(w, m): held for w, m, held in held_rows}
+
+        buckets = {
+            "never over 10x": {"touched_total": 0, "touched_hit": 0, "held_total": 0, "held_hit": 0},
+            "peaked over 10x": {"touched_total": 0, "touched_hit": 0, "held_total": 0, "held_hit": 0},
+        }
+
+        conn3 = get_conn()
+        c3 = conn3.cursor()
+
+        for wallet, mint, recommended_at, max_mult, hit_3x in recs:
+            c3.execute("""
+                SELECT liquidity, vol_h1
+                FROM token_scan_log
+                WHERE wallet = %s AND token_mint = %s
+                AND scanned_at <= %s
+                AND liquidity IS NOT NULL AND liquidity > 0
+                AND vol_h1 IS NOT NULL
+            """, (wallet, mint, recommended_at))
+            prior_scans = c3.fetchall()
+
+            if not prior_scans:
+                continue
+
+            peak_ratio = max(
+                (float(vol_h1) / float(liq)) for liq, vol_h1 in prior_scans if liq
+            )
+
+            key = "peaked over 10x" if peak_ratio > 10 else "never over 10x"
+
+            touched = bool(hit_3x) or (max_mult and max_mult >= 3)
+            buckets[key]["touched_total"] += 1
+            if touched:
+                buckets[key]["touched_hit"] += 1
+
+            if (wallet, mint) in held_map:
+                buckets[key]["held_total"] += 1
+                if held_map[(wallet, mint)]:
+                    buckets[key]["held_hit"] += 1
+
+        c3.close()
+        conn3.close()
+
+        range_label = ""
+        if since_param or until_param:
+            range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
+
+        lines = [f"<b>Historical peak vol/liq ratio vs outcome:</b>{range_label}<br>"]
+        for bucket, d in buckets.items():
+            t_total, t_hit = d["touched_total"], d["touched_hit"]
+            h_total, h_hit = d["held_total"], d["held_hit"]
+            t_rate = f"{t_hit/t_total*100:.1f}%" if t_total else "n/a"
+            h_rate = f"{h_hit/h_total*100:.1f}%" if h_total else "n/a"
+            lines.append(
+                f"<br><b>{bucket.upper()}</b><br>"
+                f"Touched 3x+: {t_hit}/{t_total} ({t_rate})<br>"
+                f"Held 50%+ after {hours}h: {h_hit}/{h_total} ({h_rate})"
+            )
+
+        lines.append(
+            "<br><br>If 'peaked over 10x' shows meaningfully LOWER rates "
+            "(especially HELD) than 'never over 10x', that validates "
+            "gating on historical peak ratio, not just the current-scan "
+            "ratio. This confirms whether a token that was ever "
+            "dangerously hot on volume stays risky even after cooling down."
+        )
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_historical_peak_ratio_vs_outcome error: {e}", 500
+
+    finally:
+        conn.close()
+
+
 @app.route("/recommendation/<mint>")
 def recommendation_lookup(mint):
     conn = get_conn()
