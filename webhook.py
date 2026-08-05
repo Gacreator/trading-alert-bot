@@ -110,6 +110,7 @@ def init_db():
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS liquidity_level_points_at_recommendation NUMERIC")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS price_window_points_at_recommendation NUMERIC")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS volume_sanity_points_at_recommendation NUMERIC")
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS clean_signal_tier_at_recommendation TEXT")
         c.execute("""
             CREATE TABLE IF NOT EXISTS wallet_buy_events (
                 id SERIAL PRIMARY KEY,
@@ -700,6 +701,31 @@ def cluster_label(wallets, current_wallet):
         return "⚪ Single wallet signal — no other tracked wallets have bought this token yet."
 
 
+def clean_signal_tier(rug_score, top1_pct, vol_h1_to_liq_ratio):
+    """
+    Classifies a recommendation by how comfortably it cleared all three
+    gates (RugCheck, holder %, volume ratio), not just barely passing.
+    Informational tier only — does not affect whether the alert fires,
+    since it can only be computed after the token already crossed 70 and
+    passed the hard gates. Validated via /check-combined-signal-vs-outcome:
+    all-clean tokens held 13.8% vs mostly-clean's 5.9% (real samples).
+    """
+    if rug_score is None or top1_pct is None:
+        return "unknown"
+
+    rug_clean = rug_score <= 15
+    holder_clean = top1_pct < 5
+    vol_clean = vol_h1_to_liq_ratio is not None and vol_h1_to_liq_ratio < 3
+
+    clean_count = sum([rug_clean, holder_clean, vol_clean])
+    if clean_count == 3:
+        return "strong"
+    elif clean_count == 2:
+        return "mostly clean"
+    else:
+        return "marginal"
+
+
 def extract_wallet_buys(tx, wallet):
     mints_bought = []
     seen = set()
@@ -1022,6 +1048,8 @@ def run_pump_check():
                         price_window_pts = details.get("price_window_points")
                         volume_sanity_pts = details.get("volume_sanity_points")
                         buy_trajectory = get_buy_trajectory(wallet, mint)
+                        clean_tier = clean_signal_tier(rug_score, top1_pct, vol_h1_to_liq_ratio)
+                        clean_tier_note = "🌟 STRONG SETUP (cleared all gates comfortably)\n" if clean_tier == "strong" else ""
 
                         c.execute(
                             """
@@ -1038,16 +1066,18 @@ def run_pump_check():
                                 liquidity_level_points_at_recommendation = %s,
                                 price_window_points_at_recommendation = %s,
                                 volume_sanity_points_at_recommendation = %s,
-                                buy_trajectory_at_recommendation = %s
+                                buy_trajectory_at_recommendation = %s,
+                                clean_signal_tier_at_recommendation = %s
                             WHERE wallet=%s AND token_mint=%s
                             """,
                             (current_price, current_market_cap, rug_score,
                              top1_pct, len(cluster_wallets), current_buy_count,
                              liquidity_trend_pts, liquidity_level_pts, price_window_pts, volume_sanity_pts,
-                             buy_trajectory, wallet, mint)
+                             buy_trajectory, clean_tier, wallet, mint)
                         )
                         send_telegram_alert(
                             f"🚀 Heating up (score {score}/100)\n"
+                            f"{clean_tier_note}"
                             f"Wallet: <code>{wallet}</code>\n"
                             f"Token: <code>{mint}</code>\n\n"
                             f"Market cap: ${current_market_cap:,.0f}\n"
