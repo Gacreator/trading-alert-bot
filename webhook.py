@@ -790,7 +790,7 @@ def check_sellable_via_jupiter(mint, test_amount_lamports=10000000):
             "amount": test_amount_lamports,
             "slippageBps": 500,
         }
-        resp = requests.get(url, params=params, timeout=5)
+        resp = requests.get(url, params=params, timeout=(3, 4))
         if resp.status_code != 200:
             print(f"Jupiter quote failed for {mint}: HTTP {resp.status_code}")
             return None
@@ -1140,8 +1140,15 @@ def run_pump_check():
                     # this exact token was recommended a second time).
                     already_recommended_elsewhere = has_token_been_recommended_before(mint)
 
-                    rug_score, rug_liq_flags = get_rugcheck_data(mint)
-                    holder_data = get_top_holder_concentration(mint, pair.get("pairAddress"))
+                    with ThreadPoolExecutor(max_workers=3) as gate_executor:
+                        rug_future = gate_executor.submit(get_rugcheck_data, mint)
+                        holder_future = gate_executor.submit(get_top_holder_concentration, mint, pair.get("pairAddress"))
+                        sellable_future = gate_executor.submit(check_sellable_via_jupiter, mint)
+
+                        rug_score, rug_liq_flags = rug_future.result()
+                        holder_data = holder_future.result()
+                        sellable_result = sellable_future.result()
+
                     top1_pct = holder_data.get("top1_pct") if holder_data else None
 
                     vol_h1_to_liq_ratio = details.get("vol_h1_to_liq_ratio", 0)
@@ -1149,8 +1156,6 @@ def run_pump_check():
                     rug_blocks = rug_score is not None and rug_score > 30
                     holder_blocks = top1_pct is not None and top1_pct >= 7
                     volume_blocks = vol_h1_to_liq_ratio is not None and vol_h1_to_liq_ratio > 10
-
-                    sellable_result = check_sellable_via_jupiter(mint)
                     sellable_str = (
                         "sellable" if sellable_result is True
                         else "not_sellable" if sellable_result is False
