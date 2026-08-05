@@ -817,6 +817,30 @@ def check_sellable_via_jupiter(mint, test_amount_lamports=10000000):
         return None
 
 
+def has_token_been_recommended_before(mint):
+    """
+    Checks if ANY tracked wallet has already recommended this exact
+    token_mint, ever — not just this specific wallet+token pair. Prevents
+    a second wallet (or the same wallet on a later scan) from overwriting
+    price_at_recommendation and resetting max_multiplier_since_recommendation,
+    which was silently destroying real historical performance data (a
+    confirmed ~49x recommendation got overwritten and displayed as 3x
+    after a second, unrelated recommendation reset the baseline).
+    """
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute(
+            "SELECT 1 FROM wallet_token_history WHERE token_mint = %s AND momentum_alerted = TRUE",
+            (mint,)
+        )
+        exists = c.fetchone() is not None
+        c.close()
+        return exists
+    finally:
+        conn.close()
+
+
 def extract_wallet_buys(tx, wallet):
     mints_bought = []
     seen = set()
@@ -1106,6 +1130,16 @@ def run_pump_check():
 
                 if not suspect and not momentum_alerted and score >= 70:
 
+                    # Prevents this exact token_mint from being recommended
+                    # a second time by a different wallet (or the same
+                    # wallet re-triggering) — which was silently overwriting
+                    # price_at_recommendation and resetting the tracked
+                    # all-time-high multiplier, destroying real historical
+                    # performance data (confirmed: a genuine ~49x
+                    # recommendation got wiped and displayed as 3x after
+                    # this exact token was recommended a second time).
+                    already_recommended_elsewhere = has_token_been_recommended_before(mint)
+
                     rug_score, rug_liq_flags = get_rugcheck_data(mint)
                     holder_data = get_top_holder_concentration(mint, pair.get("pairAddress"))
                     top1_pct = holder_data.get("top1_pct") if holder_data else None
@@ -1116,12 +1150,6 @@ def run_pump_check():
                     holder_blocks = top1_pct is not None and top1_pct >= 7
                     volume_blocks = vol_h1_to_liq_ratio is not None and vol_h1_to_liq_ratio > 10
 
-                    # Jupiter sell-simulation check — the real honeypot test.
-                    # Only blocks on an explicit False (no sell route, or
-                    # zero/near-zero output). A None result (network error,
-                    # timeout) is treated as inconclusive and does NOT block,
-                    # since a temporary Jupiter API hiccup shouldn't silently
-                    # kill every recommendation.
                     sellable_result = check_sellable_via_jupiter(mint)
                     sellable_str = (
                         "sellable" if sellable_result is True
@@ -1130,12 +1158,13 @@ def run_pump_check():
                     )
                     sell_blocks = sellable_result is False
 
-                    if rug_blocks or holder_blocks or volume_blocks or sell_blocks:
+                    if rug_blocks or holder_blocks or volume_blocks or sell_blocks or already_recommended_elsewhere:
                         print(f"⛔ Recommendation blocked for {mint}: "
                               f"rug_score={rug_score} (blocks={rug_blocks}), "
                               f"top1_pct={top1_pct} (blocks={holder_blocks}), "
                               f"vol_h1_to_liq_ratio={vol_h1_to_liq_ratio:.1f} (blocks={volume_blocks}), "
-                              f"sellable_check={sellable_str} (blocks={sell_blocks})")
+                              f"sellable_check={sellable_str} (blocks={sell_blocks}), "
+                              f"already_recommended_elsewhere={already_recommended_elsewhere}")
                     else:
                         momentum_alert_fired = True
 
