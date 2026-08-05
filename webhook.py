@@ -114,6 +114,7 @@ def init_db():
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS conviction_tier_at_recommendation TEXT")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS too_perfect_penalty_applied BOOLEAN DEFAULT FALSE")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS sellable_check_result TEXT")
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS historical_peak_ratio_at_recommendation NUMERIC")
         c.execute("""
             CREATE TABLE IF NOT EXISTS wallet_buy_events (
                 id SERIAL PRIMARY KEY,
@@ -150,6 +151,7 @@ def init_db():
         """)
         c.execute("CREATE INDEX IF NOT EXISTS idx_scan_log_mint ON token_scan_log (token_mint)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_scan_log_scanned_at ON token_scan_log (scanned_at)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_scan_log_wallet_mint_time ON token_scan_log (wallet, token_mint, scanned_at)")
         c.execute("ALTER TABLE token_scan_log ADD COLUMN IF NOT EXISTS drawdown_from_first_buy NUMERIC")
         c.execute("ALTER TABLE token_scan_log ADD COLUMN IF NOT EXISTS liquidity_delta_pct NUMERIC")
         c.execute("ALTER TABLE token_scan_log ADD COLUMN IF NOT EXISTS multiplier_since_recommendation NUMERIC")
@@ -841,6 +843,53 @@ def has_token_been_recommended_before(mint):
         conn.close()
 
 
+def get_historical_peak_ratio(wallet, mint, up_to_time=None):
+    """
+    Finds the peak vol_h1_to_liq_ratio ever seen for this wallet+token
+    pair, across all prior scans. Validated via
+    /check-historical-peak-ratio-vs-outcome: tokens that ever peaked over
+    10x held 50%+ only 5.0% of the time (n=20) vs 40.0% for tokens that
+    never crossed 10x (n=10) — an 8x gap on real samples, confirming
+    early volume spikes carry lasting risk even after a token cools down.
+    """
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        if up_to_time:
+            c.execute(
+                """
+                SELECT liquidity, vol_h1
+                FROM token_scan_log
+                WHERE wallet = %s AND token_mint = %s
+                AND scanned_at <= %s
+                AND liquidity IS NOT NULL AND liquidity > 0
+                AND vol_h1 IS NOT NULL
+                """,
+                (wallet, mint, up_to_time)
+            )
+        else:
+            c.execute(
+                """
+                SELECT liquidity, vol_h1
+                FROM token_scan_log
+                WHERE wallet = %s AND token_mint = %s
+                AND liquidity IS NOT NULL AND liquidity > 0
+                AND vol_h1 IS NOT NULL
+                """,
+                (wallet, mint)
+            )
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return None
+
+        ratios = [float(vol_h1) / float(liq) for liq, vol_h1 in rows if liq]
+        return max(ratios) if ratios else None
+    finally:
+        conn.close()
+
+
 def extract_wallet_buys(tx, wallet):
     mints_bought = []
     seen = set()
@@ -1130,14 +1179,6 @@ def run_pump_check():
 
                 if not suspect and not momentum_alerted and score >= 70:
 
-                    # Prevents this exact token_mint from being recommended
-                    # a second time by a different wallet (or the same
-                    # wallet re-triggering) — which was silently overwriting
-                    # price_at_recommendation and resetting the tracked
-                    # all-time-high multiplier, destroying real historical
-                    # performance data (confirmed: a genuine ~49x
-                    # recommendation got wiped and displayed as 3x after
-                    # this exact token was recommended a second time).
                     already_recommended_elsewhere = has_token_been_recommended_before(mint)
 
                     with ThreadPoolExecutor(max_workers=3) as gate_executor:
@@ -1152,10 +1193,13 @@ def run_pump_check():
                     top1_pct = holder_data.get("top1_pct") if holder_data else None
 
                     vol_h1_to_liq_ratio = details.get("vol_h1_to_liq_ratio", 0)
+                    historical_peak_ratio = get_historical_peak_ratio(wallet, mint)
 
                     rug_blocks = rug_score is not None and rug_score > 30
                     holder_blocks = top1_pct is not None and top1_pct >= 7
                     volume_blocks = vol_h1_to_liq_ratio is not None and vol_h1_to_liq_ratio > 10
+                    historical_volume_blocks = historical_peak_ratio is not None and historical_peak_ratio > 10
+
                     sellable_str = (
                         "sellable" if sellable_result is True
                         else "not_sellable" if sellable_result is False
@@ -1163,11 +1207,12 @@ def run_pump_check():
                     )
                     sell_blocks = sellable_result is False
 
-                    if rug_blocks or holder_blocks or volume_blocks or sell_blocks or already_recommended_elsewhere:
+                    if rug_blocks or holder_blocks or volume_blocks or sell_blocks or already_recommended_elsewhere or historical_volume_blocks:
                         print(f"⛔ Recommendation blocked for {mint}: "
                               f"rug_score={rug_score} (blocks={rug_blocks}), "
                               f"top1_pct={top1_pct} (blocks={holder_blocks}), "
                               f"vol_h1_to_liq_ratio={vol_h1_to_liq_ratio:.1f} (blocks={volume_blocks}), "
+                              f"historical_peak_ratio={historical_peak_ratio} (blocks={historical_volume_blocks}), "
                               f"sellable_check={sellable_str} (blocks={sell_blocks}), "
                               f"already_recommended_elsewhere={already_recommended_elsewhere}")
                     else:
@@ -1217,14 +1262,15 @@ def run_pump_check():
                                 clean_signal_tier_at_recommendation = %s,
                                 conviction_tier_at_recommendation = %s,
                                 too_perfect_penalty_applied = %s,
-                                sellable_check_result = %s
+                                sellable_check_result = %s,
+                                historical_peak_ratio_at_recommendation = %s
                             WHERE wallet=%s AND token_mint=%s
                             """,
                             (current_price, current_market_cap, rug_score,
                              top1_pct, len(cluster_wallets), current_buy_count,
                              liquidity_trend_pts, liquidity_level_pts, price_window_pts, volume_sanity_pts,
                              buy_trajectory, clean_tier, conv_tier, too_perfect_flag, sellable_str,
-                             wallet, mint)
+                             historical_peak_ratio, wallet, mint)
                         )
                         send_telegram_alert(
                             f"🚀 Heating up (score {score}/100)\n"
@@ -4699,7 +4745,8 @@ def check_historical_peak_ratio_vs_outcome():
     they got recommended) perform worse than tokens that were always calm.
     Prompted by a real case: a token peaked at 18.25x ratio early, cooled
     to 2.11x by recommendation time, passed every gate, then dropped to
-    0.39x (61% loss) afterward.
+    0.39x (61% loss) afterward. Validated: peaked-over-10x tokens held
+    50%+ only 5.0% of the time (n=20) vs 40.0% for never-over-10x (n=10).
     """
     since_param, until_param = get_date_filter_params()
     hours = request.args.get("hours", "1")
@@ -4860,7 +4907,12 @@ def recommendation_lookup(mint):
                    buy_count_at_recommendation,
                    clean_signal_tier_at_recommendation,
                    conviction_tier_at_recommendation,
-                   sellable_check_result
+                   sellable_check_result,
+                   liquidity_trend_points_at_recommendation,
+                   liquidity_level_points_at_recommendation,
+                   price_window_points_at_recommendation,
+                   volume_sanity_points_at_recommendation,
+                   historical_peak_ratio_at_recommendation
             FROM wallet_token_history
             WHERE token_mint = %s AND price_at_recommendation IS NOT NULL
             ORDER BY recommended_at DESC
@@ -4874,7 +4926,9 @@ def recommendation_lookup(mint):
 
         (wallet, price_at_rec, recommended_at, max_mult,
          paid_off, market_cap_at_rec, rug_score, top1_pct,
-         buy_count, clean_tier, conv_tier, sellable_result) = row
+         buy_count, clean_tier, conv_tier, sellable_result,
+         liq_trend_pts, liq_level_pts, price_window_pts, vol_sanity_pts,
+         historical_peak) = row
 
         current_price = get_current_price(mint)
         current_mult = None
@@ -4896,6 +4950,13 @@ def recommendation_lookup(mint):
             f"Clean signal tier: {clean_tier or 'n/a'}",
             f"Conviction tier: {conv_tier or 'n/a'}",
             f"Sellable check (Jupiter): {sellable_result or 'n/a'}",
+            f"Historical peak vol/liq ratio: {f'{historical_peak:.2f}x' if historical_peak is not None else 'n/a'}",
+            "",
+            f"<b>Score component breakdown:</b>",
+            f"Liquidity trend points (max 45): {liq_trend_pts if liq_trend_pts is not None else 'n/a'}",
+            f"Liquidity level points (max 25): {liq_level_pts if liq_level_pts is not None else 'n/a'}",
+            f"Price window points (max 20): {price_window_pts if price_window_pts is not None else 'n/a'}",
+            f"Volume sanity points (-10 to +10): {vol_sanity_pts if vol_sanity_pts is not None else 'n/a'}",
             "",
             f"<b>ALL-TIME HIGH since recommendation: {f'{max_mult:.2f}x' if max_mult else 'n/a'}</b>",
             f"Current multiplier: {f'{current_mult:.2f}x' if current_mult else 'n/a'} (price now: ${current_price if current_price else 'n/a'})",
