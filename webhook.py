@@ -111,6 +111,9 @@ def init_db():
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS price_window_points_at_recommendation NUMERIC")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS volume_sanity_points_at_recommendation NUMERIC")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS clean_signal_tier_at_recommendation TEXT")
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS conviction_tier_at_recommendation TEXT")
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS too_perfect_penalty_applied BOOLEAN DEFAULT FALSE")
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS sellable_check_result TEXT")
         c.execute("""
             CREATE TABLE IF NOT EXISTS wallet_buy_events (
                 id SERIAL PRIMARY KEY,
@@ -483,14 +486,35 @@ def score_momentum(pair, liquidity_delta_pct=None, prior_liquidity_delta_pct=Non
     score += volume_sanity_points
     details["volume_sanity_points"] = volume_sanity_points
 
+    # "Too perfect simultaneously" penalty — validated across two checks via
+    # /check-score-components-by-bucket: the 90-100 score tier consistently
+    # maxes out liquidity trend, liquidity level, AND price window points
+    # near-simultaneously, far more often than 70-79. Organic growth rarely
+    # maxes every independent dimension at once; this pattern is more
+    # consistent with manufactured/coordinated activity designed to look
+    # attractive on every visible metric. If 3+ of the 4 components sit at
+    # or above 90% of their individual max, apply a penalty rather than
+    # letting them compound freely toward the top of the score range.
+    component_ratios = [
+        trend_score / 45,
+        liquidity_score / 25,
+        price_window_points / 20,
+        max(0, volume_sanity_points) / 10,
+    ]
+    near_max_count = sum(1 for r in component_ratios if r >= 0.9)
+    too_perfect = near_max_count >= 3
+    details["too_perfect_simultaneously"] = too_perfect
+    if too_perfect:
+        score -= 15
+
     vol_h1_to_liq_ratio = (vol_h1 / liquidity) if liquidity > 0 else 0
     details["vol_h1_to_liq_ratio"] = vol_h1_to_liq_ratio
     if vol_h1_to_liq_ratio > 5:
         score -= 20
-    # Over-10x is now a hard gate (blocked entirely at recommendation time,
-    # see run_pump_check) since /check-volume-ratio-vs-outcome-sustained
-    # showed these tokens touch 3x normally (8.6%) but almost never HOLD
-    # it (2.1% vs 24.2% for under-3x) — classic spike-and-dump signature.
+    # Over-10x is a hard gate (blocked entirely at recommendation time, see
+    # run_pump_check) since /check-volume-ratio-vs-outcome-sustained showed
+    # these tokens touch 3x normally (8.6%) but almost never HOLD it (2.1%
+    # vs 24.2% for under-3x) — classic spike-and-dump signature.
 
     txns = pair.get("txns", {}) or {}
     m5 = txns.get("m5", {}) or {}
@@ -707,8 +731,9 @@ def clean_signal_tier(rug_score, top1_pct, vol_h1_to_liq_ratio):
     gates (RugCheck, holder %, volume ratio), not just barely passing.
     Informational tier only — does not affect whether the alert fires,
     since it can only be computed after the token already crossed 70 and
-    passed the hard gates. Validated via /check-combined-signal-vs-outcome:
-    all-clean tokens held 13.8% vs mostly-clean's 5.9% (real samples).
+    passed the hard gates. Validated via /check-combined-signal-vs-outcome
+    across two checks with growing samples: all-clean tokens held 13.8%
+    then 21.2%, vs mostly-clean's 5.9% then 7.9%.
     """
     if rug_score is None or top1_pct is None:
         return "unknown"
@@ -724,6 +749,72 @@ def clean_signal_tier(rug_score, top1_pct, vol_h1_to_liq_ratio):
         return "mostly clean"
     else:
         return "marginal"
+
+
+def conviction_tier(buy_count):
+    """
+    Classifies conviction level based on how many times the wallet bought
+    this token before it crossed 70. Informational only — buy_count is
+    only available after the token already qualifies for recommendation,
+    so this cannot change whether an alert fires. Validated across three
+    consecutive checks with growing samples: winners' median buy count
+    climbed from 12.5 -> 16.0 -> 24.5 while losers stayed flat at 6-7.
+    """
+    if buy_count is None:
+        return "unknown"
+    if buy_count >= 15:
+        return "high conviction"
+    elif buy_count >= 3:
+        return "moderate conviction"
+    else:
+        return "low conviction"
+
+
+def check_sellable_via_jupiter(mint, test_amount_lamports=10000000):
+    """
+    Simulates a sell of this token via Jupiter's quote API to directly
+    test honeypot risk — RugCheck's summary score can miss honeypots
+    entirely (confirmed: a real honeypot scored 18/100, single low-
+    liquidity flag, nothing else). This tests the actual failure mode:
+    can this token be sold right now, at a sane price.
+
+    Returns True if sellable with reasonable output, False if the quote
+    fails or looks broken (near-zero output), None if the check itself
+    failed (network error, etc — treated as inconclusive, not blocking).
+    """
+    try:
+        url = "https://quote-api.jup.ag/v6/quote"
+        params = {
+            "inputMint": mint,
+            "outputMint": WSOL_MINT,
+            "amount": test_amount_lamports,
+            "slippageBps": 500,
+        }
+        resp = requests.get(url, params=params, timeout=5)
+        if resp.status_code != 200:
+            print(f"Jupiter quote failed for {mint}: HTTP {resp.status_code}")
+            return None
+
+        data = resp.json()
+        out_amount = data.get("outAmount")
+        if out_amount is None:
+            print(f"⛔ Jupiter returned no sell route for {mint} — likely honeypot")
+            return False
+
+        try:
+            out_val = float(out_amount)
+        except (TypeError, ValueError):
+            return None
+
+        if out_val <= 0:
+            print(f"⛔ Jupiter sell quote for {mint} returned zero/near-zero output — likely honeypot")
+            return False
+
+        return True
+
+    except Exception as e:
+        print(f"Jupiter sellability check error for {mint}: {e}")
+        return None
 
 
 def extract_wallet_buys(tx, wallet):
@@ -844,7 +935,10 @@ def get_buy_trajectory(wallet, mint):
     """
     Returns 'rising', 'falling', 'flat', or None (insufficient data) based
     on whether the wallet buy prices for this token have been trending
-    up (real conviction) or down (DCA/loss-cutting behavior).
+    up (real conviction) or down (DCA/loss-cutting behavior). Still
+    inconclusive as of last check — touched-3x favors falling/flat while
+    held-50% favors rising, on a still-small sample. Tracked but not
+    acted upon.
     """
     conn = get_conn()
     try:
@@ -1022,11 +1116,26 @@ def run_pump_check():
                     holder_blocks = top1_pct is not None and top1_pct >= 7
                     volume_blocks = vol_h1_to_liq_ratio is not None and vol_h1_to_liq_ratio > 10
 
-                    if rug_blocks or holder_blocks or volume_blocks:
+                    # Jupiter sell-simulation check — the real honeypot test.
+                    # Only blocks on an explicit False (no sell route, or
+                    # zero/near-zero output). A None result (network error,
+                    # timeout) is treated as inconclusive and does NOT block,
+                    # since a temporary Jupiter API hiccup shouldn't silently
+                    # kill every recommendation.
+                    sellable_result = check_sellable_via_jupiter(mint)
+                    sellable_str = (
+                        "sellable" if sellable_result is True
+                        else "not_sellable" if sellable_result is False
+                        else "inconclusive"
+                    )
+                    sell_blocks = sellable_result is False
+
+                    if rug_blocks or holder_blocks or volume_blocks or sell_blocks:
                         print(f"⛔ Recommendation blocked for {mint}: "
                               f"rug_score={rug_score} (blocks={rug_blocks}), "
                               f"top1_pct={top1_pct} (blocks={holder_blocks}), "
-                              f"vol_h1_to_liq_ratio={vol_h1_to_liq_ratio:.1f} (blocks={volume_blocks})")
+                              f"vol_h1_to_liq_ratio={vol_h1_to_liq_ratio:.1f} (blocks={volume_blocks}), "
+                              f"sellable_check={sellable_str} (blocks={sell_blocks})")
                     else:
                         momentum_alert_fired = True
 
@@ -1047,9 +1156,13 @@ def run_pump_check():
                         liquidity_level_pts = details.get("liquidity_level_points")
                         price_window_pts = details.get("price_window_points")
                         volume_sanity_pts = details.get("volume_sanity_points")
+                        too_perfect_flag = details.get("too_perfect_simultaneously", False)
                         buy_trajectory = get_buy_trajectory(wallet, mint)
                         clean_tier = clean_signal_tier(rug_score, top1_pct, vol_h1_to_liq_ratio)
+                        conv_tier = conviction_tier(current_buy_count)
+
                         clean_tier_note = "🌟 STRONG SETUP (cleared all gates comfortably)\n" if clean_tier == "strong" else ""
+                        conv_tier_note = "💪 HIGH CONVICTION (wallet bought 15+ times)\n" if conv_tier == "high conviction" else ""
 
                         c.execute(
                             """
@@ -1067,17 +1180,22 @@ def run_pump_check():
                                 price_window_points_at_recommendation = %s,
                                 volume_sanity_points_at_recommendation = %s,
                                 buy_trajectory_at_recommendation = %s,
-                                clean_signal_tier_at_recommendation = %s
+                                clean_signal_tier_at_recommendation = %s,
+                                conviction_tier_at_recommendation = %s,
+                                too_perfect_penalty_applied = %s,
+                                sellable_check_result = %s
                             WHERE wallet=%s AND token_mint=%s
                             """,
                             (current_price, current_market_cap, rug_score,
                              top1_pct, len(cluster_wallets), current_buy_count,
                              liquidity_trend_pts, liquidity_level_pts, price_window_pts, volume_sanity_pts,
-                             buy_trajectory, clean_tier, wallet, mint)
+                             buy_trajectory, clean_tier, conv_tier, too_perfect_flag, sellable_str,
+                             wallet, mint)
                         )
                         send_telegram_alert(
                             f"🚀 Heating up (score {score}/100)\n"
                             f"{clean_tier_note}"
+                            f"{conv_tier_note}"
                             f"Wallet: <code>{wallet}</code>\n"
                             f"Token: <code>{mint}</code>\n\n"
                             f"Market cap: ${current_market_cap:,.0f}\n"
@@ -3249,13 +3367,10 @@ def check_combined_signal_vs_outcome():
 @app.route("/check-conviction-vs-outcome")
 def check_conviction_vs_outcome():
     """
-    Rough, imperfect check: buckets recommendations by the tracked
-    wallet CURRENT buy_count for that token (not count-at-recommendation-
-    time, since that wasn't historically snapshotted). This overstates
-    conviction for older recommendations that had more time to accumulate
-    repeat buys after the fact — but serves as a quick gut-check for
-    whether this is worth building properly (with a real snapshot column)
-    before investing more effort.
+    Buckets recommendations by the tracked wallet's buy_count SNAPSHOTTED
+    AT RECOMMENDATION TIME, and compares both touched-3x and
+    held-3x-after-1h hit rates. Tests whether repeat buys before a
+    recommendation fires (conviction) predict better outcomes.
     """
     since_param, until_param = get_date_filter_params()
     hours = request.args.get("hours", "1")
@@ -3357,7 +3472,7 @@ def check_conviction_vs_outcome():
         if since_param or until_param:
             range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
 
-        lines = [f"<b>Rough conviction check (current buy_count, not snapshotted at recommendation time):</b>{range_label}<br>"]
+        lines = [f"<b>Conviction check (buy_count snapshotted AT recommendation time):</b>{range_label}<br>"]
         for bucket, d in buckets.items():
             t_total, t_hit = d["touched_total"], d["touched_hit"]
             h_total, h_hit = d["held_total"], d["held_hit"]
@@ -3377,6 +3492,79 @@ def check_conviction_vs_outcome():
 
     except Exception as e:
         return f"check_conviction_vs_outcome error: {e}", 500
+
+    finally:
+        conn.close()
+
+
+@app.route("/check-conviction-tier-vs-outcome")
+def check_conviction_tier_vs_outcome():
+    """
+    Checks hit-rate by conviction_tier (low/moderate/high, based on
+    buy_count_at_recommendation thresholds of 3 and 15) to validate
+    whether those specific tier boundaries are well-calibrated.
+    """
+    since_param, until_param = get_date_filter_params()
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+
+        query = """
+            SELECT conviction_tier_at_recommendation,
+                   max_multiplier_since_recommendation,
+                   pumped_since_recommendation_alerted
+            FROM wallet_token_history
+            WHERE momentum_alerted = TRUE
+            AND conviction_tier_at_recommendation IS NOT NULL
+        """
+        params = []
+        if since_param:
+            query += " AND recommended_at >= %s"
+            params.append(since_param)
+        if until_param:
+            query += " AND recommended_at < %s"
+            params.append(until_param)
+
+        c.execute(query, params)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return "No recommendation data with conviction tier yet.", 200
+
+        buckets = {
+            "low conviction": {"total": 0, "hit_3x": 0},
+            "moderate conviction": {"total": 0, "hit_3x": 0},
+            "high conviction": {"total": 0, "hit_3x": 0},
+        }
+
+        for tier, max_mult, hit_3x in rows:
+            if tier not in buckets:
+                continue
+            buckets[tier]["total"] += 1
+            hit = bool(hit_3x) or (max_mult and max_mult >= 3)
+            if hit:
+                buckets[tier]["hit_3x"] += 1
+
+        range_label = ""
+        if since_param or until_param:
+            range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
+
+        lines = [f"<b>Recommendation hit-rate by conviction tier:</b>{range_label}<br>"]
+        for bucket, d in buckets.items():
+            total = d["total"]
+            hits = d["hit_3x"]
+            rate = f"{hits/total*100:.1f}%" if total else "n/a"
+            lines.append(f"<br>{bucket.upper()}: {hits}/{total} hit 3x+ ({rate})")
+
+        lines.append(
+            "<br><br>Confirms whether the buy-count tier boundaries (3+ / 15+) "
+            "are well-calibrated, using the same touched-3x metric as other checks."
+        )
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_conviction_tier_vs_outcome error: {e}", 500
 
     finally:
         conn.close()
@@ -4268,6 +4456,7 @@ def check_buy_trajectory_vs_outcome():
     the DCA-down confound where more buys could mean conviction OR
     loss-cutting. Optionally filters to market cap <= threshold via
     ?max_mc=, since the hypothesis is this matters most at low market cap.
+    Still inconclusive as of last check — treated as informational only.
     """
     since_param, until_param = get_date_filter_params()
     max_mc = request.args.get("max_mc")
@@ -4396,6 +4585,76 @@ def check_buy_trajectory_vs_outcome():
         conn.close()
 
 
+@app.route("/check-too-perfect-vs-outcome")
+def check_too_perfect_vs_outcome():
+    """
+    Checks hit-rate for recommendations flagged with the too_perfect_penalty
+    (3+ of 4 score components near their individual max simultaneously) vs
+    those not flagged. Validates whether the penalty is actually filtering
+    out worse-performing tokens as intended.
+    """
+    since_param, until_param = get_date_filter_params()
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+
+        query = """
+            SELECT too_perfect_penalty_applied,
+                   max_multiplier_since_recommendation,
+                   pumped_since_recommendation_alerted
+            FROM wallet_token_history
+            WHERE momentum_alerted = TRUE
+        """
+        params = []
+        if since_param:
+            query += " AND recommended_at >= %s"
+            params.append(since_param)
+        if until_param:
+            query += " AND recommended_at < %s"
+            params.append(until_param)
+
+        c.execute(query, params)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return "No recommendation data yet.", 200
+
+        flagged = {"total": 0, "hit_3x": 0}
+        not_flagged = {"total": 0, "hit_3x": 0}
+
+        for too_perfect, max_mult, hit_3x in rows:
+            bucket = flagged if too_perfect else not_flagged
+            bucket["total"] += 1
+            hit = bool(hit_3x) or (max_mult and max_mult >= 3)
+            if hit:
+                bucket["hit_3x"] += 1
+
+        def rate(d):
+            return f"{d['hit_3x']}/{d['total']} ({d['hit_3x']/d['total']*100:.1f}%)" if d["total"] else "n/a"
+
+        range_label = ""
+        if since_param or until_param:
+            range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
+
+        lines = [f"<b>Hit-rate: too-perfect-simultaneously flagged vs not</b>{range_label}<br>"]
+        lines.append(f"<br>Flagged (3+ components near max): {rate(flagged)}")
+        lines.append(f"Not flagged: {rate(not_flagged)}")
+        lines.append(
+            "<br><br>If flagged tokens still manage to get recommended (they "
+            "can, the penalty is soft, -15 points, not a hard block) and "
+            "underperform, that validates the theory. If rates are similar, "
+            "the penalty may need to be stronger or the theory reconsidered."
+        )
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_too_perfect_vs_outcome error: {e}", 500
+
+    finally:
+        conn.close()
+
+
 @app.route("/recommendation/<mint>")
 def recommendation_lookup(mint):
     conn = get_conn()
@@ -4405,7 +4664,13 @@ def recommendation_lookup(mint):
             SELECT wallet, price_at_recommendation, recommended_at,
                    max_multiplier_since_recommendation,
                    pumped_since_recommendation_alerted,
-                   market_cap_at_recommendation
+                   market_cap_at_recommendation,
+                   rugcheck_score_at_recommendation,
+                   top1_holder_pct_at_recommendation,
+                   buy_count_at_recommendation,
+                   clean_signal_tier_at_recommendation,
+                   conviction_tier_at_recommendation,
+                   sellable_check_result
             FROM wallet_token_history
             WHERE token_mint = %s AND price_at_recommendation IS NOT NULL
             ORDER BY recommended_at DESC
@@ -4418,7 +4683,8 @@ def recommendation_lookup(mint):
             return f"No recommendation found for {mint} — this token was never recommended.", 200
 
         (wallet, price_at_rec, recommended_at, max_mult,
-         paid_off, market_cap_at_rec) = row
+         paid_off, market_cap_at_rec, rug_score, top1_pct,
+         buy_count, clean_tier, conv_tier, sellable_result) = row
 
         current_price = get_current_price(mint)
         current_mult = None
@@ -4434,6 +4700,12 @@ def recommendation_lookup(mint):
             f"Recommended at: {recommended_at}",
             f"Price at recommendation: ${price_at_rec}",
             f"Market cap at recommendation: ${float(market_cap_at_rec):,.0f}" if market_cap_at_rec else "Market cap at recommendation: n/a",
+            f"RugCheck score: {rug_score if rug_score is not None else 'n/a'}",
+            f"Top holder %: {top1_pct if top1_pct is not None else 'n/a'}",
+            f"Buy count: {buy_count if buy_count is not None else 'n/a'}",
+            f"Clean signal tier: {clean_tier or 'n/a'}",
+            f"Conviction tier: {conv_tier or 'n/a'}",
+            f"Sellable check (Jupiter): {sellable_result or 'n/a'}",
             "",
             f"<b>ALL-TIME HIGH since recommendation: {f'{max_mult:.2f}x' if max_mult else 'n/a'}</b>",
             f"Current multiplier: {f'{current_mult:.2f}x' if current_mult else 'n/a'} (price now: ${current_price if current_price else 'n/a'})",
