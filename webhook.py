@@ -5391,42 +5391,79 @@ def check_buysell_ratio_vs_rug_rate():
 @app.route("/check-never-recommended-winners")
 def check_never_recommended_winners():
     """
-    Lists tokens that hit 3x+ from first buy but were NEVER recommended,
-    showing whether their score ever crossed 70 (meaning they were
-    blocked by a hard gate at some point) or never crossed 70 (meaning
-    the scoring formula itself never rated them highly enough). If a
-    hard gate blocked it AFTER this feature was deployed, the specific
-    reason (RugCheck/holder/volume/historical/sellable/already-
-    recommended) is shown via block_reason_at_last_attempt. Blocks that
-    happened before this deploy will show as reason not recorded, since
-    that detail was only ever printed to logs previously, never stored.
+    Lists tokens that peaked at 3x+ from first buy AND held at least 50%
+    of that peak after N hours (default 1h), but were NEVER recommended.
+    Uses the same held-metric as other validated checks, rather than raw
+    max_multiplier_seen >= 3 — that earlier version was pulling in tokens
+    that briefly touched 3x then immediately rugged to near-zero (a
+    confirmed real case: a token hit 6.52x, then collapsed 99%+ within
+    one scan cycle and stayed dead for 5+ hours), which isn't a genuine
+    missed winner, just a spike that happened to cross the touch
+    threshold before dying.
     """
     since_param, until_param = get_date_filter_params()
+    hours = request.args.get("hours", "1")
+    try:
+        hours = float(hours)
+    except (TypeError, ValueError):
+        hours = 1.0
+
     conn = get_conn()
     try:
         c = conn.cursor()
 
         query = """
-            SELECT wallet, token_mint, max_multiplier_seen
-            FROM wallet_token_history
-            WHERE momentum_alerted = FALSE
-            AND COALESCE(max_multiplier_seen, 0) >= 3
+            WITH scans AS (
+                SELECT wallet, token_mint, scanned_at, multiplier_from_first_buy
+                FROM token_scan_log
+                WHERE multiplier_from_first_buy IS NOT NULL
+                AND suspect_data IS NOT TRUE
+            ),
+            peak AS (
+                SELECT DISTINCT ON (wallet, token_mint)
+                    wallet, token_mint, scanned_at AS peak_at,
+                    multiplier_from_first_buy AS peak_mult
+                FROM scans
+                ORDER BY wallet, token_mint, multiplier_from_first_buy DESC, scanned_at ASC
+            ),
+            qualifying AS (
+                SELECT * FROM peak WHERE peak_mult >= 3
+            ),
+            latest AS (
+                SELECT DISTINCT ON (wallet, token_mint)
+                    wallet, token_mint, scanned_at AS latest_at,
+                    multiplier_from_first_buy AS latest_mult
+                FROM scans
+                ORDER BY wallet, token_mint, scanned_at DESC
+            ),
+            held_tokens AS (
+                SELECT q.wallet, q.token_mint, q.peak_mult
+                FROM qualifying q
+                JOIN latest l ON l.wallet = q.wallet AND l.token_mint = q.token_mint
+                WHERE l.latest_at >= q.peak_at + (INTERVAL '1 hour' * %s)
+                AND l.latest_mult >= q.peak_mult * 0.5
+            )
+            SELECT h.wallet, h.token_mint, h.peak_mult, w.first_seen_at
+            FROM held_tokens h
+            JOIN wallet_token_history w
+                ON w.wallet = h.wallet AND w.token_mint = h.token_mint
+            WHERE w.momentum_alerted = FALSE
         """
-        params = []
+        params = [hours]
         if since_param:
-            query += " AND first_seen_at >= %s"
+            query += " AND w.first_seen_at >= %s"
             params.append(since_param)
         if until_param:
-            query += " AND first_seen_at < %s"
+            query += " AND w.first_seen_at < %s"
             params.append(until_param)
-        query += " ORDER BY max_multiplier_seen DESC"
+        query += " ORDER BY h.peak_mult DESC"
 
         c.execute(query, params)
         winners = c.fetchall()
         c.close()
 
         if not winners:
-            return "No never-recommended winners in this range.", 200
+            return f"No never-recommended tokens that both peaked 3x+ AND held 50%+ after {hours}h in this range.", 200
 
         conn2 = get_conn()
         c2 = conn2.cursor()
@@ -5435,9 +5472,9 @@ def check_never_recommended_winners():
         range_label = ""
         if since_param or until_param:
             range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
-        lines.append(f"<b>Never-recommended tokens that hit 3x+:</b>{range_label}<br>")
+        lines.append(f"<b>Never-recommended tokens that peaked 3x+ AND held 50%+ after {hours}h:</b>{range_label}<br>")
 
-        for wallet, mint, max_mult in winners:
+        for wallet, mint, peak_mult, first_seen in winners:
             c2.execute("""
                 SELECT MAX(momentum_score)
                 FROM token_scan_log
@@ -5462,7 +5499,7 @@ def check_never_recommended_winners():
                 reason = f"📉 Score never crossed 70 (peak: {peak_score})"
 
             lines.append(
-                f"<br><code>{mint}</code> — hit {max_mult:.2f}x<br>"
+                f"<br><code>{mint}</code> — peaked {float(peak_mult):.2f}x, HELD 50%+ after {hours}h<br>"
                 f"{reason}"
             )
 
@@ -5470,11 +5507,9 @@ def check_never_recommended_winners():
         conn2.close()
 
         lines.append(
-            "<br><br>Look for patterns: were these consistently just below "
-            "70 (a threshold-tuning issue), or fundamentally different "
-            "profiles (low liquidity, quiet volume) that legitimately "
-            "shouldn't have qualified? For BLOCKED entries, the reason "
-            "shows exactly which gate stopped them."
+            "<br><br>These are genuine sustained winners (not just brief spikes), "
+            "so any near-miss here is a real, meaningful research lead — "
+            "worth pulling full scan history to see what held them back."
         )
         return "<br>".join(lines), 200
 
