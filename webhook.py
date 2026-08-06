@@ -5146,6 +5146,103 @@ def check_buysell_ratio_at_recommendation():
         conn.close()
 
 
+@app.route("/check-buysell-ratio-vs-rug-rate")
+def check_buysell_ratio_vs_rug_rate():
+    """
+    Buckets recommendations by buys_5m/sells_5m ratio AT RECOMMENDATION
+    TIME and compares RUG rate (max_drawdown_seen >= 0.8), not pump
+    success. Tests the theory that extreme buy/sell skew is a risk/
+    manipulation signal (predicts collapse) rather than a pump signal
+    (predicts 3x) — these are different questions. A token can have a
+    perfectly normal ratio and still fail to pump due to unrelated
+    factors (attention, sentiment, external buying) without that being
+    a red flag; but an extreme skew specifically suggests wash trading,
+    which is a collapse/rug risk regardless of whether it ever pumps.
+    """
+    since_param, until_param = get_date_filter_params()
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+
+        query = """
+            SELECT s.buys_5m, s.sells_5m,
+                   h.max_drawdown_seen
+            FROM wallet_token_history h
+            JOIN token_scan_log s
+                ON s.wallet = h.wallet AND s.token_mint = h.token_mint
+                AND s.momentum_alert_fired = TRUE
+            WHERE h.momentum_alerted = TRUE
+            AND s.buys_5m IS NOT NULL AND s.sells_5m IS NOT NULL
+        """
+        params = []
+        if since_param:
+            query += " AND h.recommended_at >= %s"
+            params.append(since_param)
+        if until_param:
+            query += " AND h.recommended_at < %s"
+            params.append(until_param)
+
+        c.execute(query, params)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return "No recommendation data with buy/sell counts yet.", 200
+
+        buckets = {
+            "under 2x": {"total": 0, "rugged": 0},
+            "2-5x": {"total": 0, "rugged": 0},
+            "5-10x": {"total": 0, "rugged": 0},
+            "over 10x": {"total": 0, "rugged": 0},
+        }
+
+        for buys, sells, max_drawdown in rows:
+            if sells == 0:
+                ratio = float(buys) if buys else 0
+            else:
+                ratio = buys / sells
+
+            if ratio < 2:
+                key = "under 2x"
+            elif ratio < 5:
+                key = "2-5x"
+            elif ratio < 10:
+                key = "5-10x"
+            else:
+                key = "over 10x"
+
+            buckets[key]["total"] += 1
+            rugged = max_drawdown is not None and float(max_drawdown) >= 0.8
+            if rugged:
+                buckets[key]["rugged"] += 1
+
+        range_label = ""
+        if since_param or until_param:
+            range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
+
+        lines = [f"<b>Buy/sell ratio at recommendation vs RUG rate (80%+ drawdown):</b>{range_label}<br>"]
+        for bucket, d in buckets.items():
+            total = d["total"]
+            rugged = d["rugged"]
+            rate = f"{rugged/total*100:.1f}%" if total else "n/a"
+            lines.append(f"<br>Ratio {bucket}: {rugged}/{total} rugged ({rate})")
+
+        lines.append(
+            "<br><br>If 'over 10x' shows meaningfully HIGHER rug rate than "
+            "the other buckets, that confirms extreme buy/sell skew is a "
+            "genuine manipulation/collapse signal — separate from whether "
+            "the token ever pumps. Treat any bucket under 20-30 samples "
+            "cautiously."
+        )
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_buysell_ratio_vs_rug_rate error: {e}", 500
+
+    finally:
+        conn.close()
+
+
 @app.route("/recommendation/<mint>")
 def recommendation_lookup(mint):
     conn = get_conn()
