@@ -1255,7 +1255,7 @@ def run_pump_check():
                               f"historical_peak_ratio={historical_peak_ratio} (blocks={historical_volume_blocks}), "
                               f"buysell_ratio={buy_sell_ratio_at_rec:.1f} (blocks={buysell_blocks}), "
                               f"sellable_check={sellable_str} (blocks={sell_blocks}), "
-                              f"already_recommended_elsewhere={already_recommended_elsewhere}")={already_recommended_elsewhere}")
+                              f"already_recommended_elsewhere={already_recommended_elsewhere}")
                     else:
                         momentum_alert_fired = True
 
