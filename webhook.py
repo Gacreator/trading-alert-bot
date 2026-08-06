@@ -525,12 +525,11 @@ def score_momentum(pair, liquidity_delta_pct=None, prior_liquidity_delta_pct=Non
     # these tokens touch 3x normally (8.6%) but almost never HOLD it (2.1%
     # vs 24.2% for under-3x) — classic spike-and-dump signature.
 
-    # Buy/sell skew penalty — validated via /check-buysell-ratio-vs-rug-rate:
-    # extreme buy/sell imbalance (possible wash-trading signature) showed a
-    # real, if moderate, rug-rate increase (54.8% vs 42.1% baseline, n=42
-    # vs n=949). Soft penalty, not a hard gate, given the effect size is
-    # meaningful but not dramatic — one contributing risk factor among
-    # several, not a disqualifying one on its own.
+    # Buy/sell ratio calculated here, gated (not penalized) at recommendation
+    # time in run_pump_check — validated via /check-buysell-ratio-vs-outcome:
+    # 0/42 tokens with ratio ≥10x ever hit 3x (vs ~6% baseline), plus
+    # elevated rug rate (54.8% vs 42.1%) — clean enough evidence for a
+    # hard gate rather than a soft penalty.
     buys_5m_val = details["buys_5m"]
     sells_5m_val = details["sells_5m"]
     if sells_5m_val > 0:
@@ -538,8 +537,6 @@ def score_momentum(pair, liquidity_delta_pct=None, prior_liquidity_delta_pct=Non
     else:
         buy_sell_ratio = float(buys_5m_val) if buys_5m_val else 0
     details["buy_sell_ratio"] = buy_sell_ratio
-    if buy_sell_ratio >= 10:
-        score -= 15
 
     return round(max(0, score)), details
 
@@ -1217,6 +1214,8 @@ def run_pump_check():
                     holder_blocks = top1_pct is not None and top1_pct >= 7
                     volume_blocks = vol_h1_to_liq_ratio is not None and vol_h1_to_liq_ratio > 10
                     historical_volume_blocks = historical_peak_ratio is not None and historical_peak_ratio > 10
+                    buy_sell_ratio_at_rec = details.get("buy_sell_ratio", 0)
+                    buysell_blocks = buy_sell_ratio_at_rec is not None and buy_sell_ratio_at_rec >= 10
 
                     sellable_str = (
                         "sellable" if sellable_result is True
@@ -1225,7 +1224,7 @@ def run_pump_check():
                     )
                     sell_blocks = sellable_result is False
 
-                    if rug_blocks or holder_blocks or volume_blocks or sell_blocks or already_recommended_elsewhere or historical_volume_blocks:
+                    if rug_blocks or holder_blocks or volume_blocks or sell_blocks or already_recommended_elsewhere or historical_volume_blocks or buysell_blocks:
                         block_reasons = []
                         if rug_blocks:
                             block_reasons.append(f"rugcheck({rug_score})")
@@ -1235,6 +1234,8 @@ def run_pump_check():
                             block_reasons.append(f"vol_ratio({vol_h1_to_liq_ratio:.1f}x)")
                         if historical_volume_blocks:
                             block_reasons.append(f"historical_peak_ratio({historical_peak_ratio:.1f}x)")
+                        if buysell_blocks:
+                            block_reasons.append(f"buysell_ratio({buy_sell_ratio_at_rec:.1f}x)")
                         if sell_blocks:
                             block_reasons.append("not_sellable")
                         if already_recommended_elsewhere:
@@ -1248,12 +1249,13 @@ def run_pump_check():
                         conn.commit()
 
                         print(f"⛔ Recommendation blocked for {mint}: "
-                              f"rug_score={rug_score} (blocks={rug_blocks}), "
+                               f"rug_score={rug_score} (blocks={rug_blocks}), "
                               f"top1_pct={top1_pct} (blocks={holder_blocks}), "
                               f"vol_h1_to_liq_ratio={vol_h1_to_liq_ratio:.1f} (blocks={volume_blocks}), "
                               f"historical_peak_ratio={historical_peak_ratio} (blocks={historical_volume_blocks}), "
+                              f"buysell_ratio={buy_sell_ratio_at_rec:.1f} (blocks={buysell_blocks}), "
                               f"sellable_check={sellable_str} (blocks={sell_blocks}), "
-                              f"already_recommended_elsewhere={already_recommended_elsewhere}")
+                              f"already_recommended_elsewhere={already_recommended_elsewhere}")={already_recommended_elsewhere}")
                     else:
                         momentum_alert_fired = True
 
