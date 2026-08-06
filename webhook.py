@@ -2650,6 +2650,49 @@ def backfill_suspect_data():
         conn.close()
 
 
+@app.route("/cleanup-old-scans", methods=["GET", "POST"])
+def cleanup_old_scans():
+    """
+    Deletes token_scan_log rows older than a retention window (default 5
+    days) to prevent database storage from growing unbounded. Built after
+    hitting Neon's 512MB free-tier limit — token_scan_log had grown to
+    466MB, causing "could not extend file" write failures and dropped
+    DB connections mid-scan. Meant to be triggered on a regular schedule
+    (e.g. daily via cron-job.org) so this never silently recurs.
+    """
+    days = request.args.get("days", "5")
+    try:
+        days = float(days)
+    except (TypeError, ValueError):
+        days = 5.0
+
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+
+        c.execute("SELECT COUNT(*) FROM token_scan_log WHERE scanned_at < NOW() - (INTERVAL '1 day' * %s)", (days,))
+        to_delete = c.fetchone()[0]
+
+        c.execute("DELETE FROM token_scan_log WHERE scanned_at < NOW() - (INTERVAL '1 day' * %s)", (days,))
+        deleted = c.rowcount
+        conn.commit()
+        c.close()
+
+        return (
+            f"Cleanup complete — deleted {deleted} scan log rows older than "
+            f"{days} days. Note: run VACUUM FULL token_scan_log manually in "
+            f"Neon's SQL editor periodically to actually reclaim disk space "
+            f"(DELETE alone frees rows for reuse but doesn't shrink the file).",
+            200
+        )
+
+    except Exception as e:
+        return f"cleanup_old_scans error: {e}", 500
+
+    finally:
+        conn.close()
+
+
 @app.route("/check-pump-timing-risk")
 def check_pump_timing_risk():
     since_param, until_param = get_date_filter_params()
