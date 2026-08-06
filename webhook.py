@@ -115,6 +115,7 @@ def init_db():
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS too_perfect_penalty_applied BOOLEAN DEFAULT FALSE")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS sellable_check_result TEXT")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS historical_peak_ratio_at_recommendation NUMERIC")
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS block_reason_at_last_attempt TEXT")
         c.execute("""
             CREATE TABLE IF NOT EXISTS wallet_buy_events (
                 id SERIAL PRIMARY KEY,
@@ -865,9 +866,11 @@ def get_historical_peak_ratio(wallet, mint, up_to_time=None):
     Finds the peak vol_h1_to_liq_ratio ever seen for this wallet+token
     pair, across all prior scans. Validated via
     /check-historical-peak-ratio-vs-outcome: tokens that ever peaked over
-    10x held 50%+ only 5.0% of the time (n=20) vs 40.0% for tokens that
-    never crossed 10x (n=10) — an 8x gap on real samples, confirming
-    early volume spikes carry lasting risk even after a token cools down.
+    10x held 50%+ only 5.0-6.9% of the time vs 24.7-40.0% for tokens that
+    never crossed 10x, on real samples — confirming early volume spikes
+    carry lasting risk even after a token cools down. Finer bucketing
+    later showed the real cliff sits closer to 8x, but 10x remains a
+    reasonable, defensible cutoff.
     """
     conn = get_conn()
     try:
@@ -1026,9 +1029,7 @@ def get_buy_trajectory(wallet, mint):
     Returns 'rising', 'falling', 'flat', or None (insufficient data) based
     on whether the wallet buy prices for this token have been trending
     up (real conviction) or down (DCA/loss-cutting behavior). Still
-    inconclusive as of last check — touched-3x favors falling/flat while
-    held-50% favors rising, on a still-small sample. Tracked but not
-    acted upon.
+    inconclusive as of last check — treated as informational only.
     """
     conn = get_conn()
     try:
@@ -1225,6 +1226,27 @@ def run_pump_check():
                     sell_blocks = sellable_result is False
 
                     if rug_blocks or holder_blocks or volume_blocks or sell_blocks or already_recommended_elsewhere or historical_volume_blocks:
+                        block_reasons = []
+                        if rug_blocks:
+                            block_reasons.append(f"rugcheck({rug_score})")
+                        if holder_blocks:
+                            block_reasons.append(f"holder_pct({top1_pct:.1f})")
+                        if volume_blocks:
+                            block_reasons.append(f"vol_ratio({vol_h1_to_liq_ratio:.1f}x)")
+                        if historical_volume_blocks:
+                            block_reasons.append(f"historical_peak_ratio({historical_peak_ratio:.1f}x)")
+                        if sell_blocks:
+                            block_reasons.append("not_sellable")
+                        if already_recommended_elsewhere:
+                            block_reasons.append("already_recommended")
+                        block_reason_str = ", ".join(block_reasons)
+
+                        c.execute(
+                            "UPDATE wallet_token_history SET block_reason_at_last_attempt = %s WHERE wallet=%s AND token_mint=%s",
+                            (block_reason_str, wallet, mint)
+                        )
+                        conn.commit()
+
                         print(f"⛔ Recommendation blocked for {mint}: "
                               f"rug_score={rug_score} (blocks={rug_blocks}), "
                               f"top1_pct={top1_pct} (blocks={holder_blocks}), "
@@ -4549,11 +4571,8 @@ def check_full_profile_vs_outcome():
 def check_buy_trajectory_vs_outcome():
     """
     Tests whether the wallet buy PRICE TRAJECTORY (rising vs falling vs
-    flat) predicts outcome better than raw buy_count alone — addresses
-    the DCA-down confound where more buys could mean conviction OR
-    loss-cutting. Optionally filters to market cap <= threshold via
-    ?max_mc=, since the hypothesis is this matters most at low market cap.
-    Still inconclusive as of last check — treated as informational only.
+    flat) predicts outcome better than raw buy_count alone. Still
+    inconclusive as of last check — treated as informational only.
     """
     since_param, until_param = get_date_filter_params()
     max_mc = request.args.get("max_mc")
@@ -4669,8 +4688,7 @@ def check_buy_trajectory_vs_outcome():
 
         lines.append(
             "<br><br>If RISING outperforms FALLING/FLAT, that confirms buy "
-            "trajectory (not just raw count) is the real signal — conviction "
-            "on the way up, not damage control on the way down. Try "
+            "trajectory (not just raw count) is the real signal. Try "
             "?max_mc=50000 to test specifically at low market cap."
         )
         return "<br>".join(lines), 200
@@ -4687,8 +4705,7 @@ def check_too_perfect_vs_outcome():
     """
     Checks hit-rate for recommendations flagged with the too_perfect_penalty
     (3+ of 4 score components near their individual max simultaneously) vs
-    those not flagged. Validates whether the penalty is actually filtering
-    out worse-performing tokens as intended.
+    those not flagged.
     """
     since_param, until_param = get_date_filter_params()
     conn = get_conn()
@@ -4740,8 +4757,7 @@ def check_too_perfect_vs_outcome():
         lines.append(
             "<br><br>If flagged tokens still manage to get recommended (they "
             "can, the penalty is soft, -15 points, not a hard block) and "
-            "underperform, that validates the theory. If rates are similar, "
-            "the penalty may need to be stronger or the theory reconsidered."
+            "underperform, that validates the theory."
         )
         return "<br>".join(lines), 200
 
@@ -4756,14 +4772,9 @@ def check_too_perfect_vs_outcome():
 def check_historical_peak_ratio_vs_outcome():
     """
     For each recommendation, calculates the PEAK vol_h1_to_liq_ratio seen
-    in that token's scan history BEFORE the recommendation fired (not just
-    the ratio at the moment of recommendation). Tests whether tokens that
-    were ever dangerously hot on volume early on (even if calm by the time
-    they got recommended) perform worse than tokens that were always calm.
-    Prompted by a real case: a token peaked at 18.25x ratio early, cooled
-    to 2.11x by recommendation time, passed every gate, then dropped to
-    0.39x (61% loss) afterward. Validated: peaked-over-10x tokens held
-    50%+ only 5.0% of the time (n=20) vs 40.0% for never-over-10x (n=10).
+    in that token's scan history BEFORE the recommendation fired. Tests
+    whether tokens that were ever dangerously hot on volume early on
+    (even if calm by recommendation time) perform worse.
     """
     since_param, until_param = get_date_filter_params()
     hours = request.args.get("hours", "1")
@@ -4896,9 +4907,7 @@ def check_historical_peak_ratio_vs_outcome():
         lines.append(
             "<br><br>If 'peaked over 10x' shows meaningfully LOWER rates "
             "(especially HELD) than 'never over 10x', that validates "
-            "gating on historical peak ratio, not just the current-scan "
-            "ratio. This confirms whether a token that was ever "
-            "dangerously hot on volume stays risky even after cooling down."
+            "gating on historical peak ratio."
         )
         return "<br>".join(lines), 200
 
@@ -4914,11 +4923,7 @@ def check_historical_peak_ratio_buckets():
     """
     Finer-grained version of /check-historical-peak-ratio-vs-outcome —
     splits historical peak vol_h1_to_liq_ratio into narrower bands instead
-    of a single 10x cutoff, to find where the real "cliff" in performance
-    sits. Built after a 3-day check showed the 10x cutoff still valid but
-    with a more modest gap (24.7% vs 6.9% held) than an earlier small
-    sample suggested (40% vs 5%) — worth checking if a different cutoff
-    performs better.
+    of a single 10x cutoff, to find where the real cliff sits.
     """
     since_param, until_param = get_date_filter_params()
     hours = request.args.get("hours", "1")
@@ -5067,10 +5072,7 @@ def check_historical_peak_ratio_buckets():
             )
 
         lines.append(
-            "<br><br>Look for where held-rate actually drops sharply — if "
-            "it's still healthy through 10-12x or 12-15x and only craters "
-            "above 15-20x, the current 10x cutoff may be too conservative. "
-            "If it drops right around 10x and stays low, 10x is well-placed. "
+            "<br><br>Look for where held-rate actually drops sharply. "
             "Treat any bucket under ~15-20 samples cautiously."
         )
         return "<br>".join(lines), 200
@@ -5087,9 +5089,6 @@ def check_buysell_ratio_at_recommendation():
     """
     Lists every recommendation in a date range with its buys_5m/sells_5m
     AT THE MOMENT OF RECOMMENDATION, plus the calculated ratio and outcome.
-    Built after finding an extreme buy/sell skew (~38:1) on a token that
-    rugged within 10 minutes of recommendation — checking if this pattern
-    shows up across other recent recommendations too.
     """
     since_param, until_param = get_date_filter_params()
     conn = get_conn()
@@ -5163,18 +5162,104 @@ def check_buysell_ratio_at_recommendation():
         conn.close()
 
 
+@app.route("/check-buysell-ratio-vs-outcome")
+def check_buysell_ratio_vs_outcome():
+    """
+    Buckets recommendations by buys_5m/sells_5m ratio AT RECOMMENDATION
+    TIME and compares hit rates against pump success (touched 3x).
+    """
+    since_param, until_param = get_date_filter_params()
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+
+        query = """
+            SELECT s.buys_5m, s.sells_5m,
+                   h.max_multiplier_since_recommendation,
+                   h.pumped_since_recommendation_alerted
+            FROM wallet_token_history h
+            JOIN token_scan_log s
+                ON s.wallet = h.wallet AND s.token_mint = h.token_mint
+                AND s.momentum_alert_fired = TRUE
+            WHERE h.momentum_alerted = TRUE
+            AND s.buys_5m IS NOT NULL AND s.sells_5m IS NOT NULL
+        """
+        params = []
+        if since_param:
+            query += " AND h.recommended_at >= %s"
+            params.append(since_param)
+        if until_param:
+            query += " AND h.recommended_at < %s"
+            params.append(until_param)
+
+        c.execute(query, params)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return "No recommendation data with buy/sell counts yet.", 200
+
+        buckets = {
+            "under 2x": {"total": 0, "hit_3x": 0},
+            "2-5x": {"total": 0, "hit_3x": 0},
+            "5-10x": {"total": 0, "hit_3x": 0},
+            "over 10x": {"total": 0, "hit_3x": 0},
+        }
+
+        for buys, sells, max_mult, hit_3x in rows:
+            if sells == 0:
+                ratio = float(buys) if buys else 0
+            else:
+                ratio = buys / sells
+
+            if ratio < 2:
+                key = "under 2x"
+            elif ratio < 5:
+                key = "2-5x"
+            elif ratio < 10:
+                key = "5-10x"
+            else:
+                key = "over 10x"
+
+            buckets[key]["total"] += 1
+            hit = bool(hit_3x) or (max_mult and max_mult >= 3)
+            if hit:
+                buckets[key]["hit_3x"] += 1
+
+        range_label = ""
+        if since_param or until_param:
+            range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
+
+        lines = [f"<b>Buy/sell ratio at recommendation vs outcome:</b>{range_label}<br>"]
+        for bucket, d in buckets.items():
+            total = d["total"]
+            hits = d["hit_3x"]
+            rate = f"{hits/total*100:.1f}%" if total else "n/a"
+            lines.append(f"<br>Ratio {bucket}: {hits}/{total} hit 3x+ ({rate})")
+
+        lines.append(
+            "<br><br>If 'over 10x' shows meaningfully LOWER hit rate than "
+            "the other buckets, that validates a buy/sell ratio gate."
+        )
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_buysell_ratio_vs_outcome error: {e}", 500
+
+    finally:
+        conn.close()
+
+
 @app.route("/check-buysell-ratio-vs-rug-rate")
 def check_buysell_ratio_vs_rug_rate():
     """
     Buckets recommendations by buys_5m/sells_5m ratio AT RECOMMENDATION
     TIME and compares RUG rate (max_drawdown_seen >= 0.8), not pump
     success. Tests the theory that extreme buy/sell skew is a risk/
-    manipulation signal (predicts collapse) rather than a pump signal
-    (predicts 3x) — these are different questions. A token can have a
-    perfectly normal ratio and still fail to pump due to unrelated
-    factors (attention, sentiment, external buying) without that being
-    a red flag; but an extreme skew specifically suggests wash trading,
-    which is a collapse/rug risk regardless of whether it ever pumps.
+    manipulation signal (predicts collapse) rather than a pump signal.
+    Validated: 54.8% rug rate at over-10x (n=42) vs 42.1% baseline
+    (n=949) — real but moderate effect, hence a soft penalty not a
+    hard gate.
     """
     since_param, until_param = get_date_filter_params()
     conn = get_conn()
@@ -5247,14 +5332,109 @@ def check_buysell_ratio_vs_rug_rate():
         lines.append(
             "<br><br>If 'over 10x' shows meaningfully HIGHER rug rate than "
             "the other buckets, that confirms extreme buy/sell skew is a "
-            "genuine manipulation/collapse signal — separate from whether "
-            "the token ever pumps. Treat any bucket under 20-30 samples "
-            "cautiously."
+            "genuine manipulation/collapse signal."
         )
         return "<br>".join(lines), 200
 
     except Exception as e:
         return f"check_buysell_ratio_vs_rug_rate error: {e}", 500
+
+    finally:
+        conn.close()
+
+
+@app.route("/check-never-recommended-winners")
+def check_never_recommended_winners():
+    """
+    Lists tokens that hit 3x+ from first buy but were NEVER recommended,
+    showing whether their score ever crossed 70 (meaning they were
+    blocked by a hard gate at some point) or never crossed 70 (meaning
+    the scoring formula itself never rated them highly enough). If a
+    hard gate blocked it AFTER this feature was deployed, the specific
+    reason (RugCheck/holder/volume/historical/sellable/already-
+    recommended) is shown via block_reason_at_last_attempt. Blocks that
+    happened before this deploy will show as reason not recorded, since
+    that detail was only ever printed to logs previously, never stored.
+    """
+    since_param, until_param = get_date_filter_params()
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+
+        query = """
+            SELECT wallet, token_mint, max_multiplier_seen
+            FROM wallet_token_history
+            WHERE momentum_alerted = FALSE
+            AND COALESCE(max_multiplier_seen, 0) >= 3
+        """
+        params = []
+        if since_param:
+            query += " AND first_seen_at >= %s"
+            params.append(since_param)
+        if until_param:
+            query += " AND first_seen_at < %s"
+            params.append(until_param)
+        query += " ORDER BY max_multiplier_seen DESC"
+
+        c.execute(query, params)
+        winners = c.fetchall()
+        c.close()
+
+        if not winners:
+            return "No never-recommended winners in this range.", 200
+
+        conn2 = get_conn()
+        c2 = conn2.cursor()
+
+        lines = []
+        range_label = ""
+        if since_param or until_param:
+            range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
+        lines.append(f"<b>Never-recommended tokens that hit 3x+:</b>{range_label}<br>")
+
+        for wallet, mint, max_mult in winners:
+            c2.execute("""
+                SELECT MAX(momentum_score)
+                FROM token_scan_log
+                WHERE wallet = %s AND token_mint = %s
+            """, (wallet, mint))
+            peak_score_row = c2.fetchone()
+            peak_score = peak_score_row[0] if peak_score_row else None
+
+            c2.execute(
+                "SELECT block_reason_at_last_attempt FROM wallet_token_history WHERE wallet=%s AND token_mint=%s",
+                (wallet, mint)
+            )
+            block_reason_row = c2.fetchone()
+            block_reason = block_reason_row[0] if block_reason_row else None
+
+            if peak_score is not None and peak_score >= 70:
+                if block_reason:
+                    reason = f"⛔ BLOCKED: {block_reason}"
+                else:
+                    reason = "⛔ BLOCKED BY A HARD GATE (crossed 70 before this fix was deployed — reason not recorded)"
+            else:
+                reason = f"📉 Score never crossed 70 (peak: {peak_score})"
+
+            lines.append(
+                f"<br><code>{mint}</code> — hit {max_mult:.2f}x<br>"
+                f"{reason}"
+            )
+
+        c2.close()
+        conn2.close()
+
+        lines.append(
+            "<br><br>Look for patterns: were these consistently just below "
+            "70 (a threshold-tuning issue), or fundamentally different "
+            "profiles (low liquidity, quiet volume) that legitimately "
+            "shouldn't have qualified? For BLOCKED entries, the reason "
+            "shows exactly which gate stopped them."
+        )
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_never_recommended_winners error: {e}", 500
 
     finally:
         conn.close()
