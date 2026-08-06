@@ -440,6 +440,12 @@ def score_momentum(pair, liquidity_delta_pct=None, prior_liquidity_delta_pct=Non
 
     liquidity = pair.get("liquidity", {}).get("usd", 0) or 0
     details["liquidity"] = liquidity
+
+    txns = pair.get("txns", {}) or {}
+    m5 = txns.get("m5", {}) or {}
+    details["buys_5m"] = m5.get("buys", 0) or 0
+    details["sells_5m"] = m5.get("sells", 0) or 0
+
     if liquidity < MIN_LIQUIDITY_USD:
         return 0, details
 
@@ -518,10 +524,21 @@ def score_momentum(pair, liquidity_delta_pct=None, prior_liquidity_delta_pct=Non
     # these tokens touch 3x normally (8.6%) but almost never HOLD it (2.1%
     # vs 24.2% for under-3x) — classic spike-and-dump signature.
 
-    txns = pair.get("txns", {}) or {}
-    m5 = txns.get("m5", {}) or {}
-    details["buys_5m"] = m5.get("buys", 0) or 0
-    details["sells_5m"] = m5.get("sells", 0) or 0
+    # Buy/sell skew penalty — validated via /check-buysell-ratio-vs-rug-rate:
+    # extreme buy/sell imbalance (possible wash-trading signature) showed a
+    # real, if moderate, rug-rate increase (54.8% vs 42.1% baseline, n=42
+    # vs n=949). Soft penalty, not a hard gate, given the effect size is
+    # meaningful but not dramatic — one contributing risk factor among
+    # several, not a disqualifying one on its own.
+    buys_5m_val = details["buys_5m"]
+    sells_5m_val = details["sells_5m"]
+    if sells_5m_val > 0:
+        buy_sell_ratio = buys_5m_val / sells_5m_val
+    else:
+        buy_sell_ratio = float(buys_5m_val) if buys_5m_val else 0
+    details["buy_sell_ratio"] = buy_sell_ratio
+    if buy_sell_ratio >= 10:
+        score -= 15
 
     return round(max(0, score)), details
 
