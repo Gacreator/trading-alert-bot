@@ -5065,6 +5065,87 @@ def check_historical_peak_ratio_buckets():
         conn.close()
 
 
+@app.route("/check-buysell-ratio-at-recommendation")
+def check_buysell_ratio_at_recommendation():
+    """
+    Lists every recommendation in a date range with its buys_5m/sells_5m
+    AT THE MOMENT OF RECOMMENDATION, plus the calculated ratio and outcome.
+    Built after finding an extreme buy/sell skew (~38:1) on a token that
+    rugged within 10 minutes of recommendation — checking if this pattern
+    shows up across other recent recommendations too.
+    """
+    since_param, until_param = get_date_filter_params()
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+
+        query = """
+            SELECT h.wallet, h.token_mint, h.recommended_at,
+                   s.buys_5m, s.sells_5m,
+                   h.max_multiplier_since_recommendation,
+                   h.pumped_since_recommendation_alerted
+            FROM wallet_token_history h
+            JOIN token_scan_log s
+                ON s.wallet = h.wallet AND s.token_mint = h.token_mint
+                AND s.momentum_alert_fired = TRUE
+            WHERE h.momentum_alerted = TRUE
+        """
+        params = []
+        if since_param:
+            query += " AND h.recommended_at >= %s"
+            params.append(since_param)
+        if until_param:
+            query += " AND h.recommended_at < %s"
+            params.append(until_param)
+        query += " ORDER BY h.recommended_at ASC"
+
+        c.execute(query, params)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return "No recommendation data in this range.", 200
+
+        range_label = ""
+        if since_param or until_param:
+            range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
+
+        lines = [f"<b>Buy/sell ratio at recommendation:</b>{range_label}<br>"]
+        for wallet, mint, recommended_at, buys, sells, max_mult, hit_3x in rows:
+            hit = bool(hit_3x) or (max_mult and max_mult >= 3)
+            outcome_label = "✅ hit 3x+" if hit else "❌ no hit"
+
+            if buys is not None and sells is not None and sells > 0:
+                ratio = buys / sells
+                ratio_str = f"{ratio:.1f}:1"
+                flag = " ⚠️ EXTREME SKEW" if ratio >= 10 else ""
+            elif buys is not None and sells == 0:
+                ratio_str = f"{buys}:0 (infinite)"
+                flag = " ⚠️ EXTREME SKEW"
+            else:
+                ratio_str = "n/a"
+                flag = ""
+
+            lines.append(
+                f"<br><code>{mint}</code><br>"
+                f"Recommended: {recommended_at} | Buys/Sells: {buys}/{sells} "
+                f"(ratio {ratio_str}){flag} | Outcome: {outcome_label}"
+            )
+
+        lines.append(
+            "<br><br>Look for '⚠️ EXTREME SKEW' flags (ratio ≥10:1) — if "
+            "these disproportionately show '❌ no hit' or correlate with "
+            "known rugs, that validates a buy/sell ratio gate."
+        )
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_buysell_ratio_at_recommendation error: {e}", 500
+
+    finally:
+        conn.close()
+
+
 @app.route("/recommendation/<mint>")
 def recommendation_lookup(mint):
     conn = get_conn()
