@@ -5408,6 +5408,12 @@ def check_never_recommended_winners():
     except (TypeError, ValueError):
         hours = 1.0
 
+    limit_param = request.args.get("limit", "30")
+    try:
+        result_limit = int(limit_param)
+    except (TypeError, ValueError):
+        result_limit = 30
+
     conn = get_conn()
     try:
         c = conn.cursor()
@@ -5474,7 +5480,7 @@ def check_never_recommended_winners():
             range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
         lines.append(f"<b>Never-recommended tokens that peaked 3x+ AND held 50%+ after {hours}h:</b>{range_label}<br>")
 
-        for wallet, mint, peak_mult, first_seen in winners:
+        for wallet, mint, peak_mult, first_seen in winners[:result_limit]:
             c2.execute("""
                 SELECT MAX(momentum_score)
                 FROM token_scan_log
@@ -5505,6 +5511,9 @@ def check_never_recommended_winners():
 
         c2.close()
         conn2.close()
+
+        if len(winners) > result_limit:
+            lines.append(f"<br><br>Showing top {result_limit} of {len(winners)} total. Use ?limit= to see more.")
 
         lines.append(
             "<br><br>These are genuine sustained winners (not just brief spikes), "
