@@ -5601,6 +5601,12 @@ def recommendation_lookup(mint):
 
 @app.route("/token/<mint>")
 def token_history(mint):
+    limit_param = request.args.get("limit", "30")
+    try:
+        limit = int(limit_param)
+    except (TypeError, ValueError):
+        limit = 30
+
     conn = get_conn()
     try:
         c = conn.cursor()
@@ -5612,9 +5618,10 @@ def token_history(mint):
                    multiplier_since_recommendation, market_cap, suspect_data
             FROM token_scan_log
             WHERE token_mint = %s
-            ORDER BY scanned_at ASC
-        """, (mint,))
-        rows = c.fetchall()
+            ORDER BY scanned_at DESC
+            LIMIT %s
+        """, (mint, limit))
+        rows = list(reversed(c.fetchall()))
         c.close()
 
         if not rows:
