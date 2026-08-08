@@ -934,17 +934,23 @@ def check_and_record_buy(wallet, mint):
         price = get_current_price(mint)
 
         if not exists:
-            c.execute(
-                """
-                INSERT INTO wallet_token_history (wallet, token_mint, buy_count, price_at_first_buy)
-                VALUES (%s, %s, 1, %s)
-                ON CONFLICT (wallet, token_mint) DO NOTHING
-                """,
-                (wallet, mint, price)
-            )
-            conn.commit()
-            buy_number = 1
-            print(f"🟢 FIRST BUY DETECTED (recorded, no alert): wallet={wallet} token={mint} price={price}")
+            try:
+                c.execute(
+                    """
+                    INSERT INTO wallet_token_history (wallet, token_mint, buy_count, price_at_first_buy)
+                    VALUES (%s, %s, 1, %s)
+                    ON CONFLICT (wallet, token_mint) DO NOTHING
+                    """,
+                    (wallet, mint, price)
+                )
+                conn.commit()
+                buy_number = 1
+                print(f"🟢 FIRST BUY DETECTED (recorded, no alert): wallet={wallet} token={mint} price={price}")
+            except Exception as insert_err:
+                print(f"❌ FIRST BUY INSERT FAILED for wallet={wallet} token={mint}: {insert_err}")
+                conn.rollback()
+                c.close()
+                return
         else:
             c.execute(
                 """
