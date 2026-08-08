@@ -5529,6 +5529,110 @@ def check_never_recommended_winners():
         conn.close()
 
 
+@app.route("/check-post-recommendation-decline")
+def check_post_recommendation_decline():
+    """
+    For every recommendation, checks the multiplier_since_recommendation
+    at roughly 1h, 3h, and 6h after the recommendation fired. Shows the
+    distribution of outcomes at each checkpoint, to establish what a
+    "normal" range of post-recommendation movement looks like before
+    picking an alert threshold for a decline-warning feature.
+    """
+    since_param, until_param = get_date_filter_params()
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+
+        query = """
+            SELECT h.wallet, h.token_mint, h.recommended_at
+            FROM wallet_token_history h
+            WHERE h.momentum_alerted = TRUE
+            AND h.recommended_at IS NOT NULL
+        """
+        params = []
+        if since_param:
+            query += " AND h.recommended_at >= %s"
+            params.append(since_param)
+        if until_param:
+            query += " AND h.recommended_at < %s"
+            params.append(until_param)
+
+        c.execute(query, params)
+        recs = c.fetchall()
+        c.close()
+
+        if not recs:
+            return "No recommendation data yet.", 200
+
+        checkpoints = {"1h": [], "3h": [], "6h": []}
+        checkpoint_hours = {"1h": 1, "3h": 3, "6h": 6}
+
+        conn2 = get_conn()
+        c2 = conn2.cursor()
+
+        for wallet, mint, recommended_at in recs:
+            for label, hrs in checkpoint_hours.items():
+                c2.execute("""
+                    SELECT multiplier_since_recommendation
+                    FROM token_scan_log
+                    WHERE wallet = %s AND token_mint = %s
+                    AND scanned_at >= %s
+                    AND multiplier_since_recommendation IS NOT NULL
+                    AND suspect_data IS NOT TRUE
+                    ORDER BY scanned_at ASC
+                    LIMIT 1
+                """, (wallet, mint, recommended_at + datetime.timedelta(hours=hrs)))
+                row = c2.fetchone()
+                if row and row[0] is not None:
+                    checkpoints[label].append(float(row[0]))
+
+        c2.close()
+        conn2.close()
+
+        def median(vals):
+            s = sorted(vals)
+            n = len(s)
+            if n == 0:
+                return None
+            mid = n // 2
+            return (s[mid - 1] + s[mid]) / 2 if n % 2 == 0 else s[mid]
+
+        range_label = ""
+        if since_param or until_param:
+            range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
+
+        lines = [f"<b>Post-recommendation multiplier distribution:</b>{range_label}<br>"]
+        for label, vals in checkpoints.items():
+            if not vals:
+                lines.append(f"<br>{label}: no data")
+                continue
+            n = len(vals)
+            avg = sum(vals) / n
+            med = median(vals)
+            below_50pct = sum(1 for v in vals if v < 0.5) / n * 100
+            below_70pct = sum(1 for v in vals if v < 0.7) / n * 100
+            lines.append(
+                f"<br><b>{label} after recommendation</b> (n={n})<br>"
+                f"avg: {avg:.2f}x, median: {med:.2f}x<br>"
+                f"Below 0.5x (down 50%+): {below_50pct:.1f}%<br>"
+                f"Below 0.7x (down 30%+): {below_70pct:.1f}%"
+            )
+
+        lines.append(
+            "<br><br>Use this to pick a sensible decline-alert threshold — "
+            "if e.g. 40% of tokens are already below 0.7x by 1h normally, "
+            "alerting at that level would be mostly noise. Look for a "
+            "threshold that's genuinely rare/abnormal, not routine."
+        )
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_post_recommendation_decline error: {e}", 500
+
+    finally:
+        conn.close()
+
+
 @app.route("/recommendation/<mint>")
 def recommendation_lookup(mint):
     conn = get_conn()
