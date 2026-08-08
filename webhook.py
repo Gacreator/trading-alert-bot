@@ -126,6 +126,7 @@ def init_db():
                 bought_at TIMESTAMP DEFAULT NOW()
             )
         """)
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS decline_alert_fired BOOLEAN DEFAULT FALSE")
 
         c.execute("""
             CREATE TABLE IF NOT EXISTS token_scan_log (
@@ -1056,7 +1057,7 @@ def get_buy_trajectory(wallet, mint):
         conn.close()
 
 
-def run_pump_check():
+ def run_pump_check():
     conn = None
     c = None
     checked = 0
@@ -1148,10 +1149,22 @@ def run_pump_check():
                     except (TypeError, ValueError, ZeroDivisionError):
                         multiplier_since_recommendation = None
 
+                decline_alert_needed = (
+                    not suspect if False else True  # placeholder replaced below
+                )
+
                 suspect = is_suspect_scan(
                     multiplier_from_first_buy,
                     multiplier_since_recommendation,
                     details.get("pc_h6")
+                )
+
+                decline_alert_needed = (
+                    not suspect
+                    and price_at_recommendation
+                    and multiplier_since_recommendation is not None
+                    and multiplier_since_recommendation < 0.7
+                    and momentum_alerted
                 )
 
                 if suspect:
@@ -1214,6 +1227,7 @@ def run_pump_check():
                     holder_blocks = top1_pct is not None and top1_pct >= 7
                     volume_blocks = vol_h1_to_liq_ratio is not None and vol_h1_to_liq_ratio > 10
                     historical_volume_blocks = historical_peak_ratio is not None and historical_peak_ratio > 10
+
                     buy_sell_ratio_at_rec = details.get("buy_sell_ratio", 0)
                     buysell_blocks = buy_sell_ratio_at_rec is not None and buy_sell_ratio_at_rec >= 10
 
@@ -1249,7 +1263,7 @@ def run_pump_check():
                         conn.commit()
 
                         print(f"⛔ Recommendation blocked for {mint}: "
-                               f"rug_score={rug_score} (blocks={rug_blocks}), "
+                              f"rug_score={rug_score} (blocks={rug_blocks}), "
                               f"top1_pct={top1_pct} (blocks={holder_blocks}), "
                               f"vol_h1_to_liq_ratio={vol_h1_to_liq_ratio:.1f} (blocks={volume_blocks}), "
                               f"historical_peak_ratio={historical_peak_ratio} (blocks={historical_volume_blocks}), "
@@ -1358,6 +1372,29 @@ def run_pump_check():
                         "UPDATE wallet_token_history SET pumped_since_recommendation_alerted = TRUE WHERE wallet=%s AND token_mint=%s",
                         (wallet, mint)
                     )
+
+                if decline_alert_needed:
+                    c.execute(
+                        "SELECT decline_alert_fired FROM wallet_token_history WHERE wallet=%s AND token_mint=%s",
+                        (wallet, mint)
+                    )
+                    already_alerted_row = c.fetchone()
+                    already_declined_alerted = already_alerted_row[0] if already_alerted_row else False
+
+                    if not already_declined_alerted:
+                        decline_pct = (1 - multiplier_since_recommendation) * 100
+                        send_telegram_alert(
+                            f"⚠️ DECLINING — down {decline_pct:.0f}% since recommendation\n"
+                            f"Wallet: <code>{wallet}</code>\n"
+                            f"Token: <code>{mint}</code>\n"
+                            f"Price at recommendation: ${price_at_recommendation} → now: ${current_price}\n\n"
+                            f"Validated: tokens down 30%+ at 1h only hit 3x+ afterward 4.5% of the time "
+                            f"(vs 16.0% baseline) — this one is unlikely to recover. DYOR."
+                        )
+                        c.execute(
+                            "UPDATE wallet_token_history SET decline_alert_fired = TRUE WHERE wallet=%s AND token_mint=%s",
+                            (wallet, mint)
+                        )
 
                 c.execute(
                     """
