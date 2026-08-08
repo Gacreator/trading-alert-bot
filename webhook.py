@@ -5633,6 +5633,106 @@ def check_post_recommendation_decline():
         conn.close()
 
 
+@app.route("/check-decline-then-outcome")
+def check_decline_then_outcome():
+    """
+    For recommendations that were down 30%+ (multiplier < 0.7x) at 1h,
+    checks what fraction still went on to eventually hit 3x+ later,
+    versus never recovering. Tests the theory that early decline is a
+    genuine predictor of a dead token, not just normal volatility —
+    distinguishing this from the raw "how common is decline" question,
+    which showed decline itself is the median outcome regardless.
+    """
+    since_param, until_param = get_date_filter_params()
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+
+        query = """
+            SELECT h.wallet, h.token_mint, h.recommended_at,
+                   h.max_multiplier_since_recommendation,
+                   h.pumped_since_recommendation_alerted
+            FROM wallet_token_history h
+            WHERE h.momentum_alerted = TRUE
+            AND h.recommended_at IS NOT NULL
+        """
+        params = []
+        if since_param:
+            query += " AND h.recommended_at >= %s"
+            params.append(since_param)
+        if until_param:
+            query += " AND h.recommended_at < %s"
+            params.append(until_param)
+
+        c.execute(query, params)
+        recs = c.fetchall()
+        c.close()
+
+        if not recs:
+            return "No recommendation data yet.", 200
+
+        conn2 = get_conn()
+        c2 = conn2.cursor()
+
+        declined_early = {"total": 0, "eventually_hit_3x": 0}
+        did_not_decline = {"total": 0, "eventually_hit_3x": 0}
+
+        for wallet, mint, recommended_at, max_mult, hit_3x in recs:
+            c2.execute("""
+                SELECT multiplier_since_recommendation
+                FROM token_scan_log
+                WHERE wallet = %s AND token_mint = %s
+                AND scanned_at >= %s
+                AND multiplier_since_recommendation IS NOT NULL
+                AND suspect_data IS NOT TRUE
+                ORDER BY scanned_at ASC
+                LIMIT 1
+            """, (wallet, mint, recommended_at + datetime.timedelta(hours=1)))
+            row = c2.fetchone()
+            if not row or row[0] is None:
+                continue
+
+            mult_at_1h = float(row[0])
+            eventually_hit = bool(hit_3x) or (max_mult and max_mult >= 3)
+
+            if mult_at_1h < 0.7:
+                declined_early["total"] += 1
+                if eventually_hit:
+                    declined_early["eventually_hit_3x"] += 1
+            else:
+                did_not_decline["total"] += 1
+                if eventually_hit:
+                    did_not_decline["eventually_hit_3x"] += 1
+
+        c2.close()
+        conn2.close()
+
+        range_label = ""
+        if since_param or until_param:
+            range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
+
+        lines = [f"<b>Down 30%+ at 1h vs eventual 3x+ outcome:</b>{range_label}<br>"]
+        for label, d in [("DOWN 30%+ AT 1H", declined_early), ("NOT DOWN 30%+ AT 1H", did_not_decline)]:
+            total, hits = d["total"], d["eventually_hit_3x"]
+            rate = f"{hits/total*100:.1f}%" if total else "n/a"
+            lines.append(f"<br><b>{label}</b>: {hits}/{total} eventually hit 3x+ ({rate})")
+
+        lines.append(
+            "<br><br>If 'DOWN 30%+ AT 1H' shows a MUCH lower eventual hit "
+            "rate than the other group, that validates your eye-test — "
+            "early decline genuinely predicts a dead token, and a decline "
+            "alert (flagging these specifically, not all dips) would be "
+            "a real, non-noisy signal worth building."
+        )
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_decline_then_outcome error: {e}", 500
+
+    finally:
+        conn.close()
+
+
 @app.route("/recommendation/<mint>")
 def recommendation_lookup(mint):
     conn = get_conn()
