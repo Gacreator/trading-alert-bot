@@ -5655,6 +5655,46 @@ def recommendation_lookup(mint):
         conn.close()
 
 
+@app.route("/debug-token/<mint>")
+def debug_token(mint):
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT wallet, token_mint, first_seen_at, buy_count,
+                   price_at_first_buy, pumped_3x_alerted, momentum_alerted,
+                   pumped_since_recommendation_alerted, last_checked_at
+            FROM wallet_token_history
+            WHERE token_mint = %s
+        """, (mint,))
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return f"No row found in wallet_token_history for {mint} — the INSERT never actually created a row, despite any 'FIRST BUY DETECTED' log line.", 200
+
+        lines = [f"<b>Raw wallet_token_history row(s) for {mint}:</b><br>"]
+        for wallet, token_mint, first_seen_at, buy_count, price_at_first_buy, pumped_3x, momentum_alerted, pumped_since_rec, last_checked in rows:
+            lines.append(
+                f"<br>Wallet: <code>{wallet}</code><br>"
+                f"first_seen_at: {first_seen_at}<br>"
+                f"buy_count: {buy_count}<br>"
+                f"price_at_first_buy: {price_at_first_buy}<br>"
+                f"pumped_3x_alerted: {pumped_3x}<br>"
+                f"momentum_alerted: {momentum_alerted}<br>"
+                f"pumped_since_recommendation_alerted: {pumped_since_rec}<br>"
+                f"last_checked_at: {last_checked}<br>"
+            )
+
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"debug_token error: {e}", 500
+
+    finally:
+        conn.close()
+
+
 @app.route("/token/<mint>")
 def token_history(mint):
     limit_param = request.args.get("limit", "30")
