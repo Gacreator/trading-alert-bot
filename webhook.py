@@ -116,6 +116,7 @@ def init_db():
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS sellable_check_result TEXT")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS historical_peak_ratio_at_recommendation NUMERIC")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS block_reason_at_last_attempt TEXT")
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS decline_alert_fired BOOLEAN DEFAULT FALSE")
         c.execute("""
             CREATE TABLE IF NOT EXISTS wallet_buy_events (
                 id SERIAL PRIMARY KEY,
@@ -126,7 +127,6 @@ def init_db():
                 bought_at TIMESTAMP DEFAULT NOW()
             )
         """)
-        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS decline_alert_fired BOOLEAN DEFAULT FALSE")
 
         c.execute("""
             CREATE TABLE IF NOT EXISTS token_scan_log (
@@ -496,15 +496,6 @@ def score_momentum(pair, liquidity_delta_pct=None, prior_liquidity_delta_pct=Non
     score += volume_sanity_points
     details["volume_sanity_points"] = volume_sanity_points
 
-    # "Too perfect simultaneously" penalty — validated across two checks via
-    # /check-score-components-by-bucket: the 90-100 score tier consistently
-    # maxes out liquidity trend, liquidity level, AND price window points
-    # near-simultaneously, far more often than 70-79. Organic growth rarely
-    # maxes every independent dimension at once; this pattern is more
-    # consistent with manufactured/coordinated activity designed to look
-    # attractive on every visible metric. If 3+ of the 4 components sit at
-    # or above 90% of their individual max, apply a penalty rather than
-    # letting them compound freely toward the top of the score range.
     component_ratios = [
         trend_score / 45,
         liquidity_score / 25,
@@ -521,16 +512,7 @@ def score_momentum(pair, liquidity_delta_pct=None, prior_liquidity_delta_pct=Non
     details["vol_h1_to_liq_ratio"] = vol_h1_to_liq_ratio
     if vol_h1_to_liq_ratio > 5:
         score -= 20
-    # Over-10x is a hard gate (blocked entirely at recommendation time, see
-    # run_pump_check) since /check-volume-ratio-vs-outcome-sustained showed
-    # these tokens touch 3x normally (8.6%) but almost never HOLD it (2.1%
-    # vs 24.2% for under-3x) — classic spike-and-dump signature.
 
-    # Buy/sell ratio calculated here, gated (not penalized) at recommendation
-    # time in run_pump_check — validated via /check-buysell-ratio-vs-outcome:
-    # 0/42 tokens with ratio ≥10x ever hit 3x (vs ~6% baseline), plus
-    # elevated rug rate (54.8% vs 42.1%) — clean enough evidence for a
-    # hard gate rather than a soft penalty.
     buys_5m_val = details["buys_5m"]
     sells_5m_val = details["sells_5m"]
     if sells_5m_val > 0:
@@ -744,15 +726,6 @@ def cluster_label(wallets, current_wallet):
 
 
 def clean_signal_tier(rug_score, top1_pct, vol_h1_to_liq_ratio):
-    """
-    Classifies a recommendation by how comfortably it cleared all three
-    gates (RugCheck, holder %, volume ratio), not just barely passing.
-    Informational tier only — does not affect whether the alert fires,
-    since it can only be computed after the token already crossed 70 and
-    passed the hard gates. Validated via /check-combined-signal-vs-outcome
-    across two checks with growing samples: all-clean tokens held 13.8%
-    then 21.2%, vs mostly-clean's 5.9% then 7.9%.
-    """
     if rug_score is None or top1_pct is None:
         return "unknown"
 
@@ -770,14 +743,6 @@ def clean_signal_tier(rug_score, top1_pct, vol_h1_to_liq_ratio):
 
 
 def conviction_tier(buy_count):
-    """
-    Classifies conviction level based on how many times the wallet bought
-    this token before it crossed 70. Informational only — buy_count is
-    only available after the token already qualifies for recommendation,
-    so this cannot change whether an alert fires. Validated across three
-    consecutive checks with growing samples: winners' median buy count
-    climbed from 12.5 -> 16.0 -> 24.5 while losers stayed flat at 6-7.
-    """
     if buy_count is None:
         return "unknown"
     if buy_count >= 15:
@@ -791,15 +756,14 @@ def conviction_tier(buy_count):
 def check_sellable_via_jupiter(mint, test_amount_lamports=10000000):
     """
     Simulates a sell of this token via Jupiter's quote API to directly
-    test honeypot risk — RugCheck's summary score can miss honeypots
-    entirely (confirmed: a real honeypot scored 18/100, single low-
-    liquidity flag, nothing else). This tests the actual failure mode:
-    can this token be sold right now, at a sane price.
-
-    Returns True if sellable with reasonable output, False if the quote
-    fails or looks broken (near-zero output), None if the check itself
-    failed (network error, etc — treated as inconclusive, not blocking).
+    test honeypot risk. Returns True if sellable with reasonable output,
+    False if the quote fails or looks broken (near-zero output), None if
+    the check itself failed (network error, etc — treated as
+    inconclusive, not blocking). Includes timing logs to diagnose whether
+    inconclusive results are due to genuine timeouts, HTTP errors, or
+    something else.
     """
+    start_time = time.time()
     try:
         url = "https://quote-api.jup.ag/v6/quote"
         params = {
@@ -810,41 +774,40 @@ def check_sellable_via_jupiter(mint, test_amount_lamports=10000000):
         }
         resp = requests.get(url, params=params, timeout=(3, 4))
         if resp.status_code != 200:
-            print(f"Jupiter quote failed for {mint}: HTTP {resp.status_code}")
+            elapsed = time.time() - start_time
+            print(f"⏱️ Jupiter quote failed for {mint}: HTTP {resp.status_code} (took {elapsed:.2f}s)")
             return None
 
         data = resp.json()
         out_amount = data.get("outAmount")
         if out_amount is None:
-            print(f"⛔ Jupiter returned no sell route for {mint} — likely honeypot")
+            elapsed = time.time() - start_time
+            print(f"⏱️ ⛔ Jupiter returned no sell route for {mint} — likely honeypot (took {elapsed:.2f}s)")
             return False
 
         try:
             out_val = float(out_amount)
         except (TypeError, ValueError):
+            elapsed = time.time() - start_time
+            print(f"⏱️ Jupiter output parse error for {mint} (took {elapsed:.2f}s)")
             return None
 
         if out_val <= 0:
-            print(f"⛔ Jupiter sell quote for {mint} returned zero/near-zero output — likely honeypot")
+            elapsed = time.time() - start_time
+            print(f"⏱️ ⛔ Jupiter sell quote for {mint} returned zero/near-zero output — likely honeypot (took {elapsed:.2f}s)")
             return False
 
+        elapsed = time.time() - start_time
+        print(f"⏱️ ✅ Jupiter sellable check passed for {mint} (took {elapsed:.2f}s)")
         return True
 
     except Exception as e:
-        print(f"Jupiter sellability check error for {mint}: {e}")
+        elapsed = time.time() - start_time
+        print(f"⏱️ Jupiter sellability check error for {mint}: {e} (took {elapsed:.2f}s)")
         return None
 
 
 def has_token_been_recommended_before(mint):
-    """
-    Checks if ANY tracked wallet has already recommended this exact
-    token_mint, ever — not just this specific wallet+token pair. Prevents
-    a second wallet (or the same wallet on a later scan) from overwriting
-    price_at_recommendation and resetting max_multiplier_since_recommendation,
-    which was silently destroying real historical performance data (a
-    confirmed ~49x recommendation got overwritten and displayed as 3x
-    after a second, unrelated recommendation reset the baseline).
-    """
     conn = get_conn()
     try:
         c = conn.cursor()
@@ -860,16 +823,6 @@ def has_token_been_recommended_before(mint):
 
 
 def get_historical_peak_ratio(wallet, mint, up_to_time=None):
-    """
-    Finds the peak vol_h1_to_liq_ratio ever seen for this wallet+token
-    pair, across all prior scans. Validated via
-    /check-historical-peak-ratio-vs-outcome: tokens that ever peaked over
-    10x held 50%+ only 5.0-6.9% of the time vs 24.7-40.0% for tokens that
-    never crossed 10x, on real samples — confirming early volume spikes
-    carry lasting risk even after a token cools down. Finer bucketing
-    later showed the real cliff sits closer to 8x, but 10x remains a
-    reasonable, defensible cutoff.
-    """
     conn = get_conn()
     try:
         c = conn.cursor()
@@ -1023,12 +976,6 @@ def check_and_record_buy(wallet, mint):
 
 
 def get_buy_trajectory(wallet, mint):
-    """
-    Returns 'rising', 'falling', 'flat', or None (insufficient data) based
-    on whether the wallet buy prices for this token have been trending
-    up (real conviction) or down (DCA/loss-cutting behavior). Still
-    inconclusive as of last check — treated as informational only.
-    """
     conn = get_conn()
     try:
         c = conn.cursor()
@@ -1057,7 +1004,7 @@ def get_buy_trajectory(wallet, mint):
         conn.close()
 
 
- def run_pump_check():
+def run_pump_check():
     conn = None
     c = None
     checked = 0
@@ -1148,10 +1095,6 @@ def get_buy_trajectory(wallet, mint):
                         multiplier_since_recommendation = current_price / float(price_at_recommendation)
                     except (TypeError, ValueError, ZeroDivisionError):
                         multiplier_since_recommendation = None
-
-                decline_alert_needed = (
-                    not suspect if False else True  # placeholder replaced below
-                )
 
                 suspect = is_suspect_scan(
                     multiplier_from_first_buy,
@@ -2693,11 +2636,8 @@ def backfill_suspect_data():
 def cleanup_old_scans():
     """
     Deletes token_scan_log rows older than a retention window (default 5
-    days) to prevent database storage from growing unbounded. Built after
-    hitting Neon's 512MB free-tier limit — token_scan_log had grown to
-    466MB, causing "could not extend file" write failures and dropped
-    DB connections mid-scan. Meant to be triggered on a regular schedule
-    (e.g. daily via cron-job.org) so this never silently recurs.
+    days) to prevent database storage from growing unbounded. Meant to be
+    triggered on a regular schedule (e.g. daily via cron-job.org).
     """
     days = request.args.get("days", "5")
     try:
@@ -3183,13 +3123,6 @@ def check_cluster_performance():
 
 @app.route("/check-volume-ratio-vs-outcome")
 def check_volume_ratio_vs_outcome():
-    """
-    Buckets recommendations by their vol_h1_to_liq_ratio AT THE MOMENT OF
-    RECOMMENDATION and checks hit-rate per bucket. Tests whether high
-    volume relative to liquidity actually predicts worse outcomes strongly
-    enough to justify a hard gate, rather than just the current soft
-    penalty in score_momentum().
-    """
     since_param, until_param = get_date_filter_params()
     conn = get_conn()
     try:
@@ -3274,16 +3207,6 @@ def check_volume_ratio_vs_outcome():
 
 @app.route("/check-volume-ratio-vs-outcome-sustained")
 def check_volume_ratio_vs_outcome_sustained():
-    """
-    Same bucketing as /check-volume-ratio-vs-outcome, but uses a STRICTER
-    definition of 'hit': the token must have peaked at 3x+ from first buy
-    AND still held at least 50% of that peak some hours later — not just
-    touched 3x briefly. This distinguishes genuine sustained winners from
-    spike-and-dump tokens that briefly cross 3x due to manufactured volume.
-
-    Purely a background analytical metric — does NOT change what triggers
-    the live 'PAID OFF' alert, which still fires on any 3x touch.
-    """
     since_param, until_param = get_date_filter_params()
     hours = request.args.get("hours", "1")
     try:
@@ -3411,13 +3334,6 @@ def check_volume_ratio_vs_outcome_sustained():
 
 @app.route("/check-combined-signal-vs-outcome")
 def check_combined_signal_vs_outcome():
-    """
-    Classifies each recommendation by how cleanly it cleared ALL THREE
-    gates (RugCheck, holder %, volume ratio) simultaneously, then compares
-    both touched-3x and held-3x-after-1h hit rates across those combined
-    buckets. Tests whether stacking clean signals compounds into better
-    picks, or whether the signals are largely redundant.
-    """
     since_param, until_param = get_date_filter_params()
     hours = request.args.get("hours", "1")
     try:
@@ -3567,12 +3483,6 @@ def check_combined_signal_vs_outcome():
 
 @app.route("/check-conviction-vs-outcome")
 def check_conviction_vs_outcome():
-    """
-    Buckets recommendations by the tracked wallet's buy_count SNAPSHOTTED
-    AT RECOMMENDATION TIME, and compares both touched-3x and
-    held-3x-after-1h hit rates. Tests whether repeat buys before a
-    recommendation fires (conviction) predict better outcomes.
-    """
     since_param, until_param = get_date_filter_params()
     hours = request.args.get("hours", "1")
     try:
@@ -3700,11 +3610,6 @@ def check_conviction_vs_outcome():
 
 @app.route("/check-conviction-tier-vs-outcome")
 def check_conviction_tier_vs_outcome():
-    """
-    Checks hit-rate by conviction_tier (low/moderate/high, based on
-    buy_count_at_recommendation thresholds of 3 and 15) to validate
-    whether those specific tier boundaries are well-calibrated.
-    """
     since_param, until_param = get_date_filter_params()
     conn = get_conn()
     try:
@@ -3929,13 +3834,6 @@ def check_holder_vs_outcome():
 
 @app.route("/check-marketcap-growth-vs-score")
 def check_marketcap_growth_vs_score():
-    """
-    Checks market cap AT RECOMMENDATION, and how much it grew from the
-    market cap at each wallet first buy, broken down by score bucket.
-    Tests the eye-test observation: do 90-100 score recommendations
-    tend to fire only after market cap has already ballooned significantly
-    (e.g. 200k -> 769k), rather than closer to the original entry point?
-    """
     since_param, until_param = get_date_filter_params()
     conn = get_conn()
     try:
@@ -4042,12 +3940,6 @@ def check_marketcap_growth_vs_score():
 
 @app.route("/check-marketcap-vs-outcome-detailed")
 def check_marketcap_vs_outcome_detailed():
-    """
-    Same as /check-marketcap-vs-outcome, but with finer-grained buckets
-    above 500k instead of one broad over-500k catch-all — since a $600k
-    token and a $5M token are likely very different situations that
-    should not be averaged together.
-    """
     since_param, until_param = get_date_filter_params()
     hours = request.args.get("hours", "1")
     try:
@@ -4191,14 +4083,6 @@ def check_marketcap_vs_outcome_detailed():
 
 @app.route("/check-price-velocity-by-score")
 def check_price_velocity_by_score():
-    """
-    Checks pc_h1 and pc_h6 (recent price change AT RECOMMENDATION) by
-    score bucket. Tests whether 90-100 tokens specifically tend to have
-    already pumped hard in the recent past compared to 70-79, which
-    would support the theory that maxing multiple scoring components
-    simultaneously correlates with catching tokens right after their
-    biggest move rather than at the start of it.
-    """
     since_param, until_param = get_date_filter_params()
     conn = get_conn()
     try:
@@ -4293,12 +4177,6 @@ def check_price_velocity_by_score():
 
 @app.route("/check-recommendation-timing")
 def check_recommendation_timing():
-    """
-    Checks how long it typically takes (from first_seen_at to
-    recommended_at) for tokens that eventually got recommended. Use this
-    BEFORE shrinking SCAN_WINDOW_HOURS, to confirm a shorter window won't
-    silently cut off legitimate slower-moving tokens before they mature.
-    """
     conn = get_conn()
     try:
         c = conn.cursor()
@@ -4346,15 +4224,6 @@ def check_recommendation_timing():
 
 @app.route("/check-timing-by-score")
 def check_timing_by_score():
-    """
-    Checks time-to-recommendation (first_seen_at to recommended_at) broken
-    down by score bucket. Tests whether 90-100 tokens systematically take
-    LONGER to mature into a recommendation than 70-79 — which would mean
-    they've had more scan cycles for momentum/volume to build up and
-    align across every scoring dimension simultaneously, a different
-    angle from market cap, price velocity, or extension multiplier
-    (all previously ruled out).
-    """
     since_param, until_param = get_date_filter_params()
     conn = get_conn()
     try:
@@ -4530,13 +4399,6 @@ def check_score_components_by_bucket():
 
 @app.route("/check-full-profile-vs-outcome")
 def check_full_profile_vs_outcome():
-    """
-    Pulls every stored attribute at recommendation time (RugCheck score,
-    holder %, volume ratio, market cap, buy count, cluster count) for
-    every recommendation, split by whether the token eventually hit 3x+
-    or not. Gives a single comprehensive comparison instead of checking
-    each factor separately.
-    """
     since_param, until_param = get_date_filter_params()
     conn = get_conn()
     try:
@@ -4651,11 +4513,6 @@ def check_full_profile_vs_outcome():
 
 @app.route("/check-buy-trajectory-vs-outcome")
 def check_buy_trajectory_vs_outcome():
-    """
-    Tests whether the wallet buy PRICE TRAJECTORY (rising vs falling vs
-    flat) predicts outcome better than raw buy_count alone. Still
-    inconclusive as of last check — treated as informational only.
-    """
     since_param, until_param = get_date_filter_params()
     max_mc = request.args.get("max_mc")
     hours = request.args.get("hours", "1")
@@ -4784,11 +4641,6 @@ def check_buy_trajectory_vs_outcome():
 
 @app.route("/check-too-perfect-vs-outcome")
 def check_too_perfect_vs_outcome():
-    """
-    Checks hit-rate for recommendations flagged with the too_perfect_penalty
-    (3+ of 4 score components near their individual max simultaneously) vs
-    those not flagged.
-    """
     since_param, until_param = get_date_filter_params()
     conn = get_conn()
     try:
@@ -4852,12 +4704,6 @@ def check_too_perfect_vs_outcome():
 
 @app.route("/check-historical-peak-ratio-vs-outcome")
 def check_historical_peak_ratio_vs_outcome():
-    """
-    For each recommendation, calculates the PEAK vol_h1_to_liq_ratio seen
-    in that token's scan history BEFORE the recommendation fired. Tests
-    whether tokens that were ever dangerously hot on volume early on
-    (even if calm by recommendation time) perform worse.
-    """
     since_param, until_param = get_date_filter_params()
     hours = request.args.get("hours", "1")
     try:
@@ -5002,11 +4848,6 @@ def check_historical_peak_ratio_vs_outcome():
 
 @app.route("/check-historical-peak-ratio-buckets")
 def check_historical_peak_ratio_buckets():
-    """
-    Finer-grained version of /check-historical-peak-ratio-vs-outcome —
-    splits historical peak vol_h1_to_liq_ratio into narrower bands instead
-    of a single 10x cutoff, to find where the real cliff sits.
-    """
     since_param, until_param = get_date_filter_params()
     hours = request.args.get("hours", "1")
     try:
@@ -5168,10 +5009,6 @@ def check_historical_peak_ratio_buckets():
 
 @app.route("/check-buysell-ratio-at-recommendation")
 def check_buysell_ratio_at_recommendation():
-    """
-    Lists every recommendation in a date range with its buys_5m/sells_5m
-    AT THE MOMENT OF RECOMMENDATION, plus the calculated ratio and outcome.
-    """
     since_param, until_param = get_date_filter_params()
     conn = get_conn()
     try:
@@ -5246,10 +5083,6 @@ def check_buysell_ratio_at_recommendation():
 
 @app.route("/check-buysell-ratio-vs-outcome")
 def check_buysell_ratio_vs_outcome():
-    """
-    Buckets recommendations by buys_5m/sells_5m ratio AT RECOMMENDATION
-    TIME and compares hit rates against pump success (touched 3x).
-    """
     since_param, until_param = get_date_filter_params()
     conn = get_conn()
     try:
@@ -5334,15 +5167,6 @@ def check_buysell_ratio_vs_outcome():
 
 @app.route("/check-buysell-ratio-vs-rug-rate")
 def check_buysell_ratio_vs_rug_rate():
-    """
-    Buckets recommendations by buys_5m/sells_5m ratio AT RECOMMENDATION
-    TIME and compares RUG rate (max_drawdown_seen >= 0.8), not pump
-    success. Tests the theory that extreme buy/sell skew is a risk/
-    manipulation signal (predicts collapse) rather than a pump signal.
-    Validated: 54.8% rug rate at over-10x (n=42) vs 42.1% baseline
-    (n=949) — real but moderate effect, hence a soft penalty not a
-    hard gate.
-    """
     since_param, until_param = get_date_filter_params()
     conn = get_conn()
     try:
@@ -5427,17 +5251,6 @@ def check_buysell_ratio_vs_rug_rate():
 
 @app.route("/check-never-recommended-winners")
 def check_never_recommended_winners():
-    """
-    Lists tokens that peaked at 3x+ from first buy AND held at least 50%
-    of that peak after N hours (default 1h), but were NEVER recommended.
-    Uses the same held-metric as other validated checks, rather than raw
-    max_multiplier_seen >= 3 — that earlier version was pulling in tokens
-    that briefly touched 3x then immediately rugged to near-zero (a
-    confirmed real case: a token hit 6.52x, then collapsed 99%+ within
-    one scan cycle and stayed dead for 5+ hours), which isn't a genuine
-    missed winner, just a spike that happened to cross the touch
-    threshold before dying.
-    """
     since_param, until_param = get_date_filter_params()
     hours = request.args.get("hours", "1")
     try:
@@ -5568,13 +5381,6 @@ def check_never_recommended_winners():
 
 @app.route("/check-post-recommendation-decline")
 def check_post_recommendation_decline():
-    """
-    For every recommendation, checks the multiplier_since_recommendation
-    at roughly 1h, 3h, and 6h after the recommendation fired. Shows the
-    distribution of outcomes at each checkpoint, to establish what a
-    "normal" range of post-recommendation movement looks like before
-    picking an alert threshold for a decline-warning feature.
-    """
     since_param, until_param = get_date_filter_params()
     conn = get_conn()
     try:
@@ -5675,10 +5481,10 @@ def check_decline_then_outcome():
     """
     For recommendations that were down 30%+ (multiplier < 0.7x) at 1h,
     checks what fraction still went on to eventually hit 3x+ later,
-    versus never recovering. Tests the theory that early decline is a
-    genuine predictor of a dead token, not just normal volatility —
-    distinguishing this from the raw "how common is decline" question,
-    which showed decline itself is the median outcome regardless.
+    versus never recovering. Validated: 4.5% (down 30%+ at 1h) vs 16.0%
+    (baseline) eventually hit 3x — confirms early decline is a genuine
+    predictor of a dead token, distinct from the fact that SOME decline
+    is normal/routine for most recommendations.
     """
     since_param, until_param = get_date_filter_params()
     conn = get_conn()
@@ -5756,10 +5562,10 @@ def check_decline_then_outcome():
 
         lines.append(
             "<br><br>If 'DOWN 30%+ AT 1H' shows a MUCH lower eventual hit "
-            "rate than the other group, that validates your eye-test — "
+            "rate than the other group, that validates the eye-test — "
             "early decline genuinely predicts a dead token, and a decline "
-            "alert (flagging these specifically, not all dips) would be "
-            "a real, non-noisy signal worth building."
+            "alert (flagging these specifically, not all dips) is "
+            "a real, non-noisy signal."
         )
         return "<br>".join(lines), 200
 
@@ -5877,7 +5683,7 @@ def token_history(mint):
         if not rows:
             return f"No scan history found for {mint}", 200
 
-        lines = [f"<b>Scan history for {mint}</b> ({len(rows)} scans)<br>"]
+        lines = [f"<b>Scan history for {mint}</b> (showing last {len(rows)} scans)<br>"]
         for i, row in enumerate(rows, 1):
             (scanned_at, price, liquidity, vol_5m, vol_h1, pc_5m, pc_h1, pc_h6,
              buys_5m, sells_5m, score, multiplier, liq_delta, mom_fired, pump_fired,
