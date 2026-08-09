@@ -5659,6 +5659,157 @@ def check_decline_then_outcome():
         conn.close()
 
 
+@app.route("/check-score-threshold-finer")
+def check_score_threshold_finer():
+    """
+    Bucket recommendations by narrow 5-point score bands to see whether
+    70 is genuinely a meaningful cutoff, or an arbitrary number with no
+    real cliff in performance. Uses the held metric (peaked 3x+ AND
+    held 50%+ after N hours) as the outcome measure, consistent with
+    every other validated signal tonight.
+    """
+    since_param, until_param = get_date_filter_params()
+    hours = request.args.get("hours", "1")
+    try:
+        hours = float(hours)
+    except (TypeError, ValueError):
+        hours = 1.0
+
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+
+        query = """
+            SELECT h.wallet, h.token_mint, s.momentum_score,
+                   h.max_multiplier_since_recommendation,
+                   h.pumped_since_recommendation_alerted
+            FROM wallet_token_history h
+            JOIN token_scan_log s
+                ON s.wallet = h.wallet AND s.token_mint = h.token_mint
+                AND s.momentum_alert_fired = TRUE
+            WHERE h.momentum_alerted = TRUE
+        """
+        params = []
+        if since_param:
+            query += " AND h.recommended_at >= %s"
+            params.append(since_param)
+        if until_param:
+            query += " AND h.recommended_at < %s"
+            params.append(until_param)
+
+        c.execute(query, params)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return "No recommendation data yet.", 200
+
+        conn2 = get_conn()
+        c2 = conn2.cursor()
+        c2.execute("""
+            WITH scans AS (
+                SELECT wallet, token_mint, scanned_at, multiplier_from_first_buy
+                FROM token_scan_log
+                WHERE multiplier_from_first_buy IS NOT NULL
+                AND suspect_data IS NOT TRUE
+            ),
+            peak AS (
+                SELECT DISTINCT ON (wallet, token_mint)
+                    wallet, token_mint, scanned_at AS peak_at,
+                    multiplier_from_first_buy AS peak_mult
+                FROM scans
+                ORDER BY wallet, token_mint, multiplier_from_first_buy DESC, scanned_at ASC
+            ),
+            qualifying AS (
+                SELECT * FROM peak WHERE peak_mult >= 3
+            ),
+            latest AS (
+                SELECT DISTINCT ON (wallet, token_mint)
+                    wallet, token_mint, scanned_at AS latest_at,
+                    multiplier_from_first_buy AS latest_mult
+                FROM scans
+                ORDER BY wallet, token_mint, scanned_at DESC
+            )
+            SELECT q.wallet, q.token_mint,
+                   CASE WHEN l.latest_mult >= q.peak_mult * 0.5 THEN TRUE ELSE FALSE END AS held
+            FROM qualifying q
+            JOIN latest l ON l.wallet = q.wallet AND l.token_mint = q.token_mint
+            WHERE l.latest_at >= q.peak_at + (INTERVAL '1 hour' * %s)
+        """, (hours,))
+        held_rows = c2.fetchall()
+        c2.close()
+        conn2.close()
+        held_map = {(w, m): held for w, m, held in held_rows}
+
+        buckets = {
+            "70-74": {"touched_total": 0, "touched_hit": 0, "held_total": 0, "held_hit": 0},
+            "75-79": {"touched_total": 0, "touched_hit": 0, "held_total": 0, "held_hit": 0},
+            "80-84": {"touched_total": 0, "touched_hit": 0, "held_total": 0, "held_hit": 0},
+            "85-89": {"touched_total": 0, "touched_hit": 0, "held_total": 0, "held_hit": 0},
+            "90-94": {"touched_total": 0, "touched_hit": 0, "held_total": 0, "held_hit": 0},
+            "95-100": {"touched_total": 0, "touched_hit": 0, "held_total": 0, "held_hit": 0},
+        }
+
+        for wallet, mint, score, max_mult, hit_3x in rows:
+            if score is None:
+                continue
+            if 70 <= score < 75:
+                key = "70-74"
+            elif 75 <= score < 80:
+                key = "75-79"
+            elif 80 <= score < 85:
+                key = "80-84"
+            elif 85 <= score < 90:
+                key = "85-89"
+            elif 90 <= score < 95:
+                key = "90-94"
+            elif score >= 95:
+                key = "95-100"
+            else:
+                continue
+
+            touched = bool(hit_3x) or (max_mult and max_mult >= 3)
+            buckets[key]["touched_total"] += 1
+            if touched:
+                buckets[key]["touched_hit"] += 1
+
+            if (wallet, mint) in held_map:
+                buckets[key]["held_total"] += 1
+                if held_map[(wallet, mint)]:
+                    buckets[key]["held_hit"] += 1
+
+        range_label = ""
+        if since_param or until_param:
+            range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
+
+        lines = [f"<b>Finer score threshold check (5-point bands):</b>{range_label}<br>"]
+        for bucket, d in buckets.items():
+            t_total, t_hit = d["touched_total"], d["touched_hit"]
+            h_total, h_hit = d["held_total"], d["held_hit"]
+            t_rate = f"{t_hit/t_total*100:.1f}%" if t_total else "n/a"
+            h_rate = f"{h_hit/h_total*100:.1f}%" if h_total else "n/a"
+            lines.append(
+                f"<br><b>Score {bucket}</b><br>"
+                f"Touched 3x+: {t_hit}/{t_total} ({t_rate})<br>"
+                f"Held 50%+ after {hours}h: {h_hit}/{h_total} ({h_rate})"
+            )
+
+        lines.append(
+            "<br><br>Look for where held-rate meaningfully improves. If "
+            "70-74 performs similarly to 90-95, 70 isn't a special cutoff "
+            "— just where you happened to draw the line. If there's a "
+            "real jump somewhere (e.g. 80+), that threshold might be worth "
+            "adopting instead. Treat bands under ~15-20 samples cautiously."
+        )
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_score_threshold_finer error: {e}", 500
+
+    finally:
+        conn.close()
+
+
 @app.route("/recommendation/<mint>")
 def recommendation_lookup(mint):
     conn = get_conn()
