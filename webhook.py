@@ -271,11 +271,16 @@ def get_dexscreener_full(mint):
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
         resp = requests.get(url, timeout=5)
-        if resp.status_code != 200 or not resp.text.strip():
+        if resp.status_code != 200:
+            print(f"⚠️ DexScreener non-200 for {mint}: HTTP {resp.status_code}")
+            return None
+        if not resp.text.strip():
+            print(f"⚠️ DexScreener empty response for {mint}")
             return None
         data = resp.json()
         pairs = data.get("pairs") or []
         if not pairs:
+            print(f"⚠️ DexScreener no pairs for {mint}")
             return None
         pair = max(pairs, key=lambda p: p.get("liquidity", {}).get("usd", 0) or 0)
         return pair
