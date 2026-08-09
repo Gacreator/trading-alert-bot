@@ -267,54 +267,81 @@ def get_pumpfun_data(mint):
         return None
 
 
-def get_dexscreener_full(mint, max_retries=2):
-    for attempt in range(max_retries + 1):
-        try:
-            url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
-            resp = requests.get(url, timeout=5)
+def get_dexscreener_batch(mints):
+    """
+    Fetches multiple tokens' DexScreener data in a single request instead
+    of one request per token. DexScreener's /tokens/ endpoint accepts
+    comma-separated mint addresses. Built after discovering the bot was
+    hitting DexScreener's rate limit (300 req/min) hard when scanning
+    1000+ tokens individually — batching cuts total request count by
+    up to 30x, addressing the root cause rather than just pacing/retrying
+    around it.
 
-            if resp.status_code == 429:
-                if attempt < max_retries:
-                    wait_time = 1.0 * (attempt + 1)
-                    print(f"⚠️ DexScreener 429 for {mint}, retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    print(f"⚠️ DexScreener 429 for {mint} — gave up after {max_retries} retries")
-                    return None
-
-            if resp.status_code != 200:
-                print(f"⚠️ DexScreener non-200 for {mint}: HTTP {resp.status_code}")
-                return None
-            if not resp.text.strip():
-                print(f"⚠️ DexScreener empty response for {mint}")
-                return None
-
-            data = resp.json()
-            pairs = data.get("pairs") or []
-            if not pairs:
-                print(f"⚠️ DexScreener no pairs for {mint}")
-                return None
-
-            pair = max(pairs, key=lambda p: p.get("liquidity", {}).get("usd", 0) or 0)
-            return pair
-
-        except Exception as e:
-            print(f"DexScreener error for {mint}: {e}")
-            return None
-
-    return None
-
-
-def get_dexscreener_full_ratelimited(mint):
-    with _dex_rate_lock:
-        result = get_dexscreener_full(mint)
-        time.sleep(0.2)
+    Returns a dict mapping mint -> pair (or None if not found).
+    """
+    result = {}
+    if not mints:
         return result
+
+    joined = ",".join(mints)
+    try:
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{joined}"
+        resp = requests.get(url, timeout=8)
+
+        if resp.status_code == 429:
+            print(f"⚠️ DexScreener batch 429 for {len(mints)} mints")
+            return {m: None for m in mints}
+
+        if resp.status_code != 200:
+            print(f"⚠️ DexScreener batch non-200: HTTP {resp.status_code} for {len(mints)} mints")
+            return {m: None for m in mints}
+
+        if not resp.text.strip():
+            print(f"⚠️ DexScreener batch empty response for {len(mints)} mints")
+            return {m: None for m in mints}
+
+        data = resp.json()
+        pairs = data.get("pairs") or []
+
+        best_pair_by_mint = {}
+        for pair in pairs:
+            base_mint = pair.get("baseToken", {}).get("address")
+            if not base_mint:
+                continue
+            liq = pair.get("liquidity", {}).get("usd", 0) or 0
+            if base_mint not in best_pair_by_mint or liq > (best_pair_by_mint[base_mint].get("liquidity", {}).get("usd", 0) or 0):
+                best_pair_by_mint[base_mint] = pair
+
+        for m in mints:
+            result[m] = best_pair_by_mint.get(m)
+
+        return result
+
+    except Exception as e:
+        print(f"DexScreener batch error for {len(mints)} mints: {e}")
+        return {m: None for m in mints}
+
+
+def get_dexscreener_batches_ratelimited(mints, batch_size=30):
+    """
+    Splits a list of mints into batches (DexScreener supports up to ~30
+    addresses per request) and fetches each batch, with a small delay
+    between batches to stay comfortably under the 300 req/min limit.
+    """
+    all_results = {}
+    batches = [mints[i:i + batch_size] for i in range(0, len(mints), batch_size)]
+
+    for batch in batches:
+        with _dex_rate_lock:
+            batch_result = get_dexscreener_batch(batch)
+            all_results.update(batch_result)
+            time.sleep(0.3)
+
+    return all_results
 
 
 def get_dexscreener_data(mint):
-    pair = get_dexscreener_full(mint)
+    pair = get_dexscreener_single(mint)
     if not pair:
         return None
     base = pair.get("baseToken", {})
@@ -341,7 +368,7 @@ def get_dexscreener_data(mint):
 
 
 def get_current_price(mint):
-    pair = get_dexscreener_full(mint)
+    pair = get_dexscreener_single(mint)
     if pair and pair.get("priceUsd"):
         try:
             return float(pair["priceUsd"])
@@ -1057,9 +1084,7 @@ def run_pump_check():
         print(f"Checking {len(rows)} tokens for pumps/momentum...")
 
         mints = [row[1] for row in rows]
-        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_DEXSCREENER) as executor:
-            pair_results = list(executor.map(get_dexscreener_full_ratelimited, mints))
-        pairs_by_mint = dict(zip(mints, pair_results))
+        pairs_by_mint = get_dexscreener_batches_ratelimited(mints, batch_size=30)
 
         for i, (wallet, mint, price_at_first_buy, pumped_alerted, momentum_alerted,
                 prev_liquidity, price_at_recommendation, pumped_since_rec_alerted,
