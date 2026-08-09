@@ -491,7 +491,7 @@ def explain_pump(mint, price_at_recommendation, current_price, multiplier, recom
     return ask_queen(prompt)
 
 
-def score_momentum(pair, liquidity_delta_pct=None, prior_liquidity_delta_pct=None):
+def score_momentum(pair, liquidity_delta_pct=None, prior_liquidity_delta_pct=None, buy_trajectory=None):
     score = 0
     details = {}
 
@@ -551,6 +551,15 @@ def score_momentum(pair, liquidity_delta_pct=None, prior_liquidity_delta_pct=Non
     score += volume_sanity_points
     details["volume_sanity_points"] = volume_sanity_points
 
+    # "Too perfect simultaneously" penalty — validated across two checks via
+    # /check-score-components-by-bucket: the 90-100 score tier consistently
+    # maxes out liquidity trend, liquidity level, AND price window points
+    # near-simultaneously, far more often than 70-79. Organic growth rarely
+    # maxes every independent dimension at once; this pattern is more
+    # consistent with manufactured/coordinated activity designed to look
+    # attractive on every visible metric. If 3+ of the 4 components sit at
+    # or above 90% of their individual max, apply a penalty rather than
+    # letting them compound freely toward the top of the score range.
     component_ratios = [
         trend_score / 45,
         liquidity_score / 25,
@@ -567,7 +576,16 @@ def score_momentum(pair, liquidity_delta_pct=None, prior_liquidity_delta_pct=Non
     details["vol_h1_to_liq_ratio"] = vol_h1_to_liq_ratio
     if vol_h1_to_liq_ratio > 5:
         score -= 20
+    # Over-10x is a hard gate (blocked entirely at recommendation time, see
+    # run_pump_check) since /check-volume-ratio-vs-outcome-sustained showed
+    # these tokens touch 3x normally (8.6%) but almost never HOLD it (2.1%
+    # vs 24.2% for under-3x) — classic spike-and-dump signature.
 
+    # Buy/sell ratio calculated here, gated (not penalized) at recommendation
+    # time in run_pump_check — validated via /check-buysell-ratio-vs-outcome:
+    # 0/42 tokens with ratio ≥10x ever hit 3x (vs ~6% baseline), plus
+    # elevated rug rate (54.8% vs 42.1%) — clean enough evidence for a
+    # hard gate rather than a soft penalty.
     buys_5m_val = details["buys_5m"]
     sells_5m_val = details["sells_5m"]
     if sells_5m_val > 0:
@@ -576,9 +594,25 @@ def score_momentum(pair, liquidity_delta_pct=None, prior_liquidity_delta_pct=Non
         buy_sell_ratio = float(buys_5m_val) if buys_5m_val else 0
     details["buy_sell_ratio"] = buy_sell_ratio
 
+    # Buy trajectory adjustment — validated via /check-buy-trajectory-vs-outcome:
+    # rising trajectory (wallet buying more as price climbs) held 50%+ at
+    # 11.5% (n=26) vs 0.0% for both falling and flat (n=6 each), with a
+    # consistent 2x gap on touched-3x too (17.0% vs 9.4%/7.3%). Confirms
+    # the original DCA-down theory: buying more on a rising price reflects
+    # real conviction, buying more on a falling price looks like loss-
+    # cutting that doesn't work — a genuine signal, though not as extreme
+    # as the hard-gated signals, hence a soft adjustment rather than a
+    # block. Asymmetric weighting (+8 rising, -12 falling) reflects that
+    # falling showed a starker drop to 0% than rising's lift above baseline.
+    details["buy_trajectory_used"] = buy_trajectory
+    if buy_trajectory == "rising":
+        score += 8
+    elif buy_trajectory == "falling":
+        score -= 12
+
     return round(max(0, score)), details
 
-
+        
 def get_prior_scan_snapshot(mint):
     conn = get_conn()
     try:
@@ -1168,8 +1202,9 @@ def run_pump_check():
                         liquidity_delta_pct = None
 
                 prior_liq_delta, prior_pc_5m = get_prior_scan_snapshot(mint)
+                current_trajectory = get_buy_trajectory(wallet, mint)
 
-                score, details = score_momentum(pair, liquidity_delta_pct, prior_liq_delta)
+                score, details = score_momentum(pair, liquidity_delta_pct, prior_liq_delta, current_trajectory)
                 current_liquidity = details.get("liquidity")
 
                 multiplier_since_recommendation = None
