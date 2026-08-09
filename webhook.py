@@ -977,65 +977,88 @@ def webhook():
 
 
 def check_and_record_buy(wallet, mint):
-    conn = get_conn()
-    try:
-        c = conn.cursor()
+    max_attempts = 2
+    for attempt in range(max_attempts):
+        conn = get_conn()
+        try:
+            c = conn.cursor()
 
-        c.execute(
-            "SELECT 1 FROM wallet_token_history WHERE wallet=%s AND token_mint=%s",
-            (wallet, mint)
-        )
-        exists = c.fetchone() is not None
-
-        price = get_current_price(mint)
-
-        if not exists:
-            try:
-                c.execute(
-                    """
-                    INSERT INTO wallet_token_history (wallet, token_mint, buy_count, price_at_first_buy)
-                    VALUES (%s, %s, 1, %s)
-                    ON CONFLICT (wallet, token_mint) DO NOTHING
-                    """,
-                    (wallet, mint, price)
-                )
-                conn.commit()
-                buy_number = 1
-                print(f"🟢 FIRST BUY DETECTED (recorded, no alert): wallet={wallet} token={mint} price={price}")
-            except Exception as insert_err:
-                print(f"❌ FIRST BUY INSERT FAILED for wallet={wallet} token={mint}: {insert_err}")
-                conn.rollback()
-                c.close()
-                return
-        else:
             c.execute(
-                """
-                UPDATE wallet_token_history
-                SET buy_count = buy_count + 1
-                WHERE wallet=%s AND token_mint=%s
-                RETURNING buy_count
-                """,
+                "SELECT 1 FROM wallet_token_history WHERE wallet=%s AND token_mint=%s",
                 (wallet, mint)
             )
-            new_count_row = c.fetchone()
-            conn.commit()
-            buy_number = new_count_row[0] if new_count_row else None
-            print(f"🔁 Repeat buy #{buy_number} (recorded, no alert): wallet={wallet} token={mint}")
+            exists = c.fetchone() is not None
 
-        if price is not None:
-            c.execute(
-                """
-                INSERT INTO wallet_buy_events (wallet, token_mint, buy_number, price)
-                VALUES (%s, %s, %s, %s)
-                """,
-                (wallet, mint, buy_number, price)
-            )
-            conn.commit()
+            price = get_current_price(mint)
 
-        c.close()
-    finally:
-        conn.close()
+            if not exists:
+                try:
+                    c.execute(
+                        """
+                        INSERT INTO wallet_token_history (wallet, token_mint, buy_count, price_at_first_buy)
+                        VALUES (%s, %s, 1, %s)
+                        ON CONFLICT (wallet, token_mint) DO NOTHING
+                        """,
+                        (wallet, mint, price)
+                    )
+                    conn.commit()
+                    buy_number = 1
+                    print(f"🟢 FIRST BUY DETECTED (recorded, no alert): wallet={wallet} token={mint} price={price}")
+                except Exception as insert_err:
+                    print(f"❌ FIRST BUY INSERT FAILED for wallet={wallet} token={mint}: {insert_err}")
+                    conn.rollback()
+                    c.close()
+                    conn.close()
+                    return
+            else:
+                c.execute(
+                    """
+                    UPDATE wallet_token_history
+                    SET buy_count = buy_count + 1
+                    WHERE wallet=%s AND token_mint=%s
+                    RETURNING buy_count
+                    """,
+                    (wallet, mint)
+                )
+                new_count_row = c.fetchone()
+                conn.commit()
+                buy_number = new_count_row[0] if new_count_row else None
+                print(f"🔁 Repeat buy #{buy_number} (recorded, no alert): wallet={wallet} token={mint}")
 
+            if price is not None:
+                c.execute(
+                    """
+                    INSERT INTO wallet_buy_events (wallet, token_mint, buy_number, price)
+                    VALUES (%s, %s, %s, %s)
+                    """,
+                    (wallet, mint, buy_number, price)
+                )
+                conn.commit()
+
+            c.close()
+            conn.close()
+            return
+
+        except psycopg2.OperationalError as db_err:
+            print(f"⚠️ DB connection dropped in check_and_record_buy for wallet={wallet} token={mint}: {db_err}")
+            try:
+                conn.close()
+            except Exception:
+                pass
+            if attempt < max_attempts - 1:
+                print(f"🔁 Retrying check_and_record_buy for wallet={wallet} token={mint} (attempt {attempt + 2}/{max_attempts})")
+                continue
+            else:
+                print(f"❌ check_and_record_buy gave up for wallet={wallet} token={mint} after {max_attempts} attempts")
+                return
+
+        except Exception as e:
+            print(f"❌ Unexpected error in check_and_record_buy for wallet={wallet} token={mint}: {e}")
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return
 
 def get_buy_trajectory(wallet, mint):
     conn = get_conn()
