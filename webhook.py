@@ -309,7 +309,7 @@ def get_dexscreener_full(mint, max_retries=2):
 def get_dexscreener_full_ratelimited(mint):
     with _dex_rate_lock:
         result = get_dexscreener_full(mint)
-        time.sleep(0.4)
+        time.sleep(0.2)
         return result
 
 
