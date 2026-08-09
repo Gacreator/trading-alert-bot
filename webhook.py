@@ -339,6 +339,11 @@ def get_dexscreener_batches_ratelimited(mints, batch_size=30):
 
     return all_results
 
+        
+def get_dexscreener_single(mint):
+    result = get_dexscreener_batch([mint])
+    return result.get(mint)
+
 
 def get_dexscreener_data(mint):
     pair = get_dexscreener_single(mint)
