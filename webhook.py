@@ -17,6 +17,7 @@ TELEGRAM_CHAT_IDS = [
 ]
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 HELIUS_API_KEY = os.environ.get("HELIUS_API_KEY")
+JUPITER_API_KEY = os.environ.get("JUPITER_API_KEY")
 
 TRACKED_WALLETS = set(
     w.strip() for w in os.environ.get("TRACKED_WALLETS", "").split(",") if w.strip()
@@ -765,14 +766,15 @@ def check_sellable_via_jupiter(mint, test_amount_lamports=10000000):
     """
     start_time = time.time()
     try:
-        url = "https://quote-api.jup.ag/v6/quote"
+        url = "https://api.jup.ag/swap/v1/quote"
         params = {
             "inputMint": mint,
             "outputMint": WSOL_MINT,
             "amount": test_amount_lamports,
             "slippageBps": 500,
         }
-        resp = requests.get(url, params=params, timeout=(3, 4))
+        headers = {"x-api-key": JUPITER_API_KEY} if JUPITER_API_KEY else {}
+        resp = requests.get(url, params=params, headers=headers, timeout=(3, 4))
         if resp.status_code != 200:
             elapsed = time.time() - start_time
             print(f"⏱️ Jupiter quote failed for {mint}: HTTP {resp.status_code} (took {elapsed:.2f}s)")
