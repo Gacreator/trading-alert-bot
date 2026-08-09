@@ -267,32 +267,49 @@ def get_pumpfun_data(mint):
         return None
 
 
-def get_dexscreener_full(mint):
-    try:
-        url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
-        resp = requests.get(url, timeout=5)
-        if resp.status_code != 200:
-            print(f"⚠️ DexScreener non-200 for {mint}: HTTP {resp.status_code}")
+def get_dexscreener_full(mint, max_retries=2):
+    for attempt in range(max_retries + 1):
+        try:
+            url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
+            resp = requests.get(url, timeout=5)
+
+            if resp.status_code == 429:
+                if attempt < max_retries:
+                    wait_time = 1.0 * (attempt + 1)
+                    print(f"⚠️ DexScreener 429 for {mint}, retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    print(f"⚠️ DexScreener 429 for {mint} — gave up after {max_retries} retries")
+                    return None
+
+            if resp.status_code != 200:
+                print(f"⚠️ DexScreener non-200 for {mint}: HTTP {resp.status_code}")
+                return None
+            if not resp.text.strip():
+                print(f"⚠️ DexScreener empty response for {mint}")
+                return None
+
+            data = resp.json()
+            pairs = data.get("pairs") or []
+            if not pairs:
+                print(f"⚠️ DexScreener no pairs for {mint}")
+                return None
+
+            pair = max(pairs, key=lambda p: p.get("liquidity", {}).get("usd", 0) or 0)
+            return pair
+
+        except Exception as e:
+            print(f"DexScreener error for {mint}: {e}")
             return None
-        if not resp.text.strip():
-            print(f"⚠️ DexScreener empty response for {mint}")
-            return None
-        data = resp.json()
-        pairs = data.get("pairs") or []
-        if not pairs:
-            print(f"⚠️ DexScreener no pairs for {mint}")
-            return None
-        pair = max(pairs, key=lambda p: p.get("liquidity", {}).get("usd", 0) or 0)
-        return pair
-    except Exception as e:
-        print(f"DexScreener error for {mint}: {e}")
-        return None
+
+    return None
 
 
 def get_dexscreener_full_ratelimited(mint):
     with _dex_rate_lock:
         result = get_dexscreener_full(mint)
-        time.sleep(0.1)
+        time.sleep(0.4)
         return result
 
 
