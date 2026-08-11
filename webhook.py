@@ -5858,6 +5858,110 @@ def check_score_threshold_finer():
         conn.close()
 
 
+@app.route("/check-loser-decline-timing")
+def check_loser_decline_timing():
+    """
+    For recommendations that turned out to be losers (never touched 3x+),
+    checks how long after recommendation their price first dropped below
+    various thresholds (10%, 20%, 30%) — to see if a delayed-confirmation
+    approach (waiting N scan cycles before actually recommending) would
+    catch losers early enough to be worth the tradeoff of a delayed,
+    worse-priced entry for winners.
+    """
+    since_param, until_param = get_date_filter_params()
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+
+        query = """
+            SELECT h.wallet, h.token_mint, h.recommended_at,
+                   h.max_multiplier_since_recommendation,
+                   h.pumped_since_recommendation_alerted
+            FROM wallet_token_history h
+            WHERE h.momentum_alerted = TRUE
+            AND h.recommended_at IS NOT NULL
+        """
+        params = []
+        if since_param:
+            query += " AND h.recommended_at >= %s"
+            params.append(since_param)
+        if until_param:
+            query += " AND h.recommended_at < %s"
+            params.append(until_param)
+
+        c.execute(query, params)
+        recs = c.fetchall()
+        c.close()
+
+        if not recs:
+            return "No recommendation data yet.", 200
+
+        conn2 = get_conn()
+        c2 = conn2.cursor()
+
+        loser_decline_times = []
+
+        for wallet, mint, recommended_at, max_mult, hit_3x in recs:
+            eventually_hit = bool(hit_3x) or (max_mult and max_mult >= 3)
+            if eventually_hit:
+                continue
+
+            c2.execute("""
+                SELECT scanned_at, multiplier_since_recommendation
+                FROM token_scan_log
+                WHERE wallet = %s AND token_mint = %s
+                AND scanned_at > %s
+                AND multiplier_since_recommendation IS NOT NULL
+                AND suspect_data IS NOT TRUE
+                ORDER BY scanned_at ASC
+            """, (wallet, mint, recommended_at))
+            scans = c2.fetchall()
+
+            for scanned_at, mult in scans:
+                if float(mult) < 0.9:
+                    minutes_elapsed = (scanned_at - recommended_at).total_seconds() / 60
+                    loser_decline_times.append(minutes_elapsed)
+                    break
+
+        c2.close()
+        conn2.close()
+
+        if not loser_decline_times:
+            return "No losers with a confirmed 10%+ decline found yet.", 200
+
+        loser_decline_times.sort()
+        n = len(loser_decline_times)
+
+        def percentile(p):
+            idx = int(n * p)
+            idx = min(idx, n - 1)
+            return loser_decline_times[idx]
+
+        range_label = ""
+        if since_param or until_param:
+            range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
+
+        lines = [
+            f"<b>Time until losers first drop 10%+ below recommendation price</b> (n={n}){range_label}<br>",
+            f"<br>Median: {percentile(0.5):.1f} min",
+            f"25th percentile: {percentile(0.25):.1f} min",
+            f"75th percentile: {percentile(0.75):.1f} min",
+            f"90th percentile: {percentile(0.90):.1f} min",
+            "<br><br>If the median/25th percentile is well under your current "
+            "scan cycle time, a one-cycle confirmation wait would catch most "
+            "losers early. If it's longer than your cycle time, waiting one "
+            "cycle wouldn't help much — losers reveal themselves too slowly "
+            "for a single delayed check to catch."
+        ]
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_loser_decline_timing error: {e}", 500
+
+    finally:
+        conn.close()
+
+
 @app.route("/recommendation/<mint>")
 def recommendation_lookup(mint):
     conn = get_conn()
