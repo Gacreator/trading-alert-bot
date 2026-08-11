@@ -46,6 +46,7 @@ QUEEN_SYSTEM_PROMPT = (
 SOLANA_ADDRESS_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 
 _check_pumps_lock = threading.Lock()
+_check_pumps_lock_time = None
 _dex_rate_lock = threading.Semaphore(MAX_CONCURRENT_DEXSCREENER)
 
 
@@ -339,7 +340,7 @@ def get_dexscreener_batches_ratelimited(mints, batch_size=30):
 
     return all_results
 
-        
+
 def get_dexscreener_single(mint):
     result = get_dexscreener_batch([mint])
     return result.get(mint)
@@ -612,7 +613,7 @@ def score_momentum(pair, liquidity_delta_pct=None, prior_liquidity_delta_pct=Non
 
     return round(max(0, score)), details
 
-        
+
 def get_prior_scan_snapshot(mint):
     conn = get_conn()
     try:
@@ -788,7 +789,7 @@ def holder_concentration_label(data):
     return base
 
 
-def get_wallet_cluster_count(mint, current_wallet):
+def get_wallet_cluster_count(mint):
     conn = get_conn()
     try:
         c = conn.cursor()
@@ -1094,6 +1095,7 @@ def check_and_record_buy(wallet, mint):
                 pass
             return
 
+
 def get_buy_trajectory(wallet, mint):
     conn = get_conn()
     try:
@@ -1338,7 +1340,7 @@ def run_pump_check():
                         price_trend_note = price_trend_label(details.get("pc_5m"), prior_pc_5m)
                         rug_note = rugcheck_label(rug_score, rug_liq_flags)
                         holder_note = holder_concentration_label(holder_data)
-                        cluster_wallets = get_wallet_cluster_count(mint, wallet)
+                        cluster_wallets = get_wallet_cluster_count(mint)
                         cluster_note = cluster_label(cluster_wallets, wallet)
 
                         c.execute(
@@ -1519,10 +1521,21 @@ def run_pump_check():
 
 @app.route("/check-pumps", methods=["GET", "POST"])
 def check_pumps():
-    if not _check_pumps_lock.acquire(blocking=False):
-        print("check-pumps already running, skipping this trigger")
-        return "already running", 200
+    global _check_pumps_lock_time
 
+    if _check_pumps_lock.locked():
+        if _check_pumps_lock_time and (time.time() - _check_pumps_lock_time) > 1800:
+            print("⚠️ check_pumps lock held for 30+ minutes — force releasing (likely stuck)")
+            try:
+                _check_pumps_lock.release()
+            except RuntimeError:
+                pass
+        else:
+            print("check-pumps already running, skipping this trigger")
+            return "already running", 200
+
+    _check_pumps_lock.acquire()
+    _check_pumps_lock_time = time.time()
     threading.Thread(target=run_pump_check, daemon=True).start()
     return "started", 200
 
