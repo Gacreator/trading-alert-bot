@@ -570,9 +570,7 @@ def score_momentum(pair, liquidity_delta_pct=None, prior_liquidity_delta_pct=Non
     near_max_count = sum(1 for r in component_ratios if r >= 0.9)
     too_perfect = near_max_count >= 3
     details["too_perfect_simultaneously"] = too_perfect
-    if too_perfect:
-        score -= 15
-
+         
     vol_h1_to_liq_ratio = (vol_h1 / liquidity) if liquidity > 0 else 0
     details["vol_h1_to_liq_ratio"] = vol_h1_to_liq_ratio
     if vol_h1_to_liq_ratio > 5:
