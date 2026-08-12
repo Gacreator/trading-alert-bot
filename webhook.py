@@ -5943,6 +5943,104 @@ def check_loser_decline_timing():
             put_conn(conn)
 
 
+@app.route("/check-gate-false-positive-rate")
+def check_gate_false_positive_rate():
+    """
+    For tokens blocked SOLELY by historical_peak_ratio or holder_pct (no
+    other block reason), checks what fraction went on to become genuine
+    sustained winners (peaked 3x+ AND held 50%+ after N hours). This is
+    the direct test of whether these two gates are costing more real wins
+    than they're preventing real losses — pulled together with the
+    never-recommended-winners logic already built tonight.
+    """
+    since_param, until_param = get_date_filter_params()
+    hours = request.args.get("hours", "1")
+    try:
+        hours = float(hours)
+    except (TypeError, ValueError):
+        hours = 1.0
+
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        query = """
+            SELECT wallet, token_mint, block_reason_at_last_attempt
+            FROM wallet_token_history
+            WHERE block_reason_at_last_attempt IS NOT NULL
+            AND momentum_alerted = FALSE
+        """
+        params = []
+        if since_param:
+            query += " AND first_seen_at >= %s"
+            params.append(since_param)
+        if until_param:
+            query += " AND first_seen_at < %s"
+            params.append(until_param)
+
+        c.execute(query, params)
+        blocked_rows = c.fetchall()
+        c.close()
+        put_conn(conn)
+        conn = None
+
+        # Only tokens blocked SOLELY by one of these two reasons (no other
+        # gate also triggered) — isolates the specific gate's impact
+        historical_only = []
+        holder_only = []
+        for wallet, mint, reason in blocked_rows:
+            reasons = [r.strip().split("(")[0] for r in reason.split(",")]
+            if reasons == ["historical_peak_ratio"]:
+                historical_only.append((wallet, mint))
+            elif reasons == ["holder_pct"]:
+                holder_only.append((wallet, mint))
+
+        held_map = get_held_map(hours)
+
+        def evaluate(pairs):
+            total = len(pairs)
+            held = sum(1 for wm in pairs if held_map.get(wm) is True)
+            touched = sum(1 for wm in pairs if wm in held_map)
+            return total, touched, held
+
+        hist_total, hist_touched, hist_held = evaluate(historical_only)
+        holder_total, holder_touched, holder_held = evaluate(holder_only)
+
+        range_label = ""
+        if since_param or until_param:
+            range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
+
+        lines = [f"<b>Gate false-positive check (tokens blocked SOLELY by one gate):</b>{range_label}<br>"]
+
+        lines.append(f"<br><b>HISTORICAL_PEAK_RATIO-only blocks</b> (n={hist_total})")
+        lines.append(f"Peaked 3x+ AND still trackable for held-check: {hist_touched}")
+        lines.append(f"Of those, genuinely held 50%+ after {hours}h: {hist_held}")
+        hist_rate = f"{hist_held/hist_touched*100:.1f}%" if hist_touched else "n/a"
+        lines.append(f"→ Held rate among blocked tokens that reached peak-check: {hist_rate}")
+
+        lines.append(f"<br><br><b>HOLDER_PCT-only blocks</b> (n={holder_total})")
+        lines.append(f"Peaked 3x+ AND still trackable for held-check: {holder_touched}")
+        lines.append(f"Of those, genuinely held 50%+ after {hours}h: {holder_held}")
+        holder_rate = f"{holder_held/holder_touched*100:.1f}%" if holder_touched else "n/a"
+        lines.append(f"→ Held rate among blocked tokens that reached peak-check: {holder_rate}")
+
+        lines.append(
+            "<br><br>Compare these held-rates against your baseline "
+            "(check /check-combined-signal-vs-outcome or /stats for context). "
+            "If either rate is comparable to or higher than tokens that DID "
+            "get recommended, that's real evidence the gate is net-costly. "
+            "If it's near zero, the gate is correctly filtering — remember "
+            "n needs to be 15-20+ before trusting this either way."
+        )
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_gate_false_positive_rate error: {e}", 500
+
+    finally:
+        if conn:
+            put_conn(conn)
+
+
 @app.route("/recommendation/<mint>")
 def recommendation_lookup(mint):
     conn = get_conn()
