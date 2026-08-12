@@ -4,8 +4,10 @@ import re
 import time
 import datetime
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 import psycopg2
+from psycopg2 import pool as pg_pool
 import requests
 
 app = Flask(__name__)
@@ -47,7 +49,30 @@ SOLANA_ADDRESS_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 
 _check_pumps_lock = threading.Lock()
 _check_pumps_lock_time = None
+_check_pumps_run_id = None
 _dex_rate_lock = threading.Semaphore(MAX_CONCURRENT_DEXSCREENER)
+
+_connection_pool = pg_pool.ThreadedConnectionPool(
+    minconn=2,
+    maxconn=20,
+    dsn=DATABASE_URL,
+    connect_timeout=10,
+    keepalives=1,
+    keepalives_idle=30,
+    keepalives_interval=10,
+    keepalives_count=5,
+)
+
+
+def get_conn():
+    return _connection_pool.getconn()
+
+
+def put_conn(conn, close=False):
+    try:
+        _connection_pool.putconn(conn, close=close)
+    except Exception:
+        pass
 
 
 def looks_like_solana_address(text):
@@ -58,17 +83,6 @@ def get_date_filter_params():
     since_param = request.args.get("since")
     until_param = request.args.get("until")
     return since_param, until_param
-
-
-def get_conn():
-    return psycopg2.connect(
-        DATABASE_URL,
-        connect_timeout=10,
-        keepalives=1,
-        keepalives_idle=30,
-        keepalives_interval=10,
-        keepalives_count=5,
-    )
 
 
 def init_db():
@@ -165,7 +179,7 @@ def init_db():
         conn.commit()
         c.close()
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 init_db()
@@ -269,17 +283,6 @@ def get_pumpfun_data(mint):
 
 
 def get_dexscreener_batch(mints):
-    """
-    Fetches multiple tokens' DexScreener data in a single request instead
-    of one request per token. DexScreener's /tokens/ endpoint accepts
-    comma-separated mint addresses. Built after discovering the bot was
-    hitting DexScreener's rate limit (300 req/min) hard when scanning
-    1000+ tokens individually — batching cuts total request count by
-    up to 30x, addressing the root cause rather than just pacing/retrying
-    around it.
-
-    Returns a dict mapping mint -> pair (or None if not found).
-    """
     result = {}
     if not mints:
         return result
@@ -324,11 +327,6 @@ def get_dexscreener_batch(mints):
 
 
 def get_dexscreener_batches_ratelimited(mints, batch_size=30):
-    """
-    Splits a list of mints into batches (DexScreener supports up to ~30
-    addresses per request) and fetches each batch, with a small delay
-    between batches to stay comfortably under the 300 req/min limit.
-    """
     all_results = {}
     batches = [mints[i:i + batch_size] for i in range(0, len(mints), batch_size)]
 
@@ -462,7 +460,7 @@ def explain_pump(mint, price_at_recommendation, current_price, multiplier, recom
         now_row = c.fetchone()
         c.close()
     finally:
-        conn.close()
+        put_conn(conn)
 
     if not then_row or not now_row:
         return "Not enough scan history to break down what changed."
@@ -552,15 +550,6 @@ def score_momentum(pair, liquidity_delta_pct=None, prior_liquidity_delta_pct=Non
     score += volume_sanity_points
     details["volume_sanity_points"] = volume_sanity_points
 
-    # "Too perfect simultaneously" penalty — validated across two checks via
-    # /check-score-components-by-bucket: the 90-100 score tier consistently
-    # maxes out liquidity trend, liquidity level, AND price window points
-    # near-simultaneously, far more often than 70-79. Organic growth rarely
-    # maxes every independent dimension at once; this pattern is more
-    # consistent with manufactured/coordinated activity designed to look
-    # attractive on every visible metric. If 3+ of the 4 components sit at
-    # or above 90% of their individual max, apply a penalty rather than
-    # letting them compound freely toward the top of the score range.
     component_ratios = [
         trend_score / 45,
         liquidity_score / 25,
@@ -570,21 +559,12 @@ def score_momentum(pair, liquidity_delta_pct=None, prior_liquidity_delta_pct=Non
     near_max_count = sum(1 for r in component_ratios if r >= 0.9)
     too_perfect = near_max_count >= 3
     details["too_perfect_simultaneously"] = too_perfect
-         
+
     vol_h1_to_liq_ratio = (vol_h1 / liquidity) if liquidity > 0 else 0
     details["vol_h1_to_liq_ratio"] = vol_h1_to_liq_ratio
     if vol_h1_to_liq_ratio > 5:
         score -= 20
-    # Over-10x is a hard gate (blocked entirely at recommendation time, see
-    # run_pump_check) since /check-volume-ratio-vs-outcome-sustained showed
-    # these tokens touch 3x normally (8.6%) but almost never HOLD it (2.1%
-    # vs 24.2% for under-3x) — classic spike-and-dump signature.
 
-    # Buy/sell ratio calculated here, gated (not penalized) at recommendation
-    # time in run_pump_check — validated via /check-buysell-ratio-vs-outcome:
-    # 0/42 tokens with ratio ≥10x ever hit 3x (vs ~6% baseline), plus
-    # elevated rug rate (54.8% vs 42.1%) — clean enough evidence for a
-    # hard gate rather than a soft penalty.
     buys_5m_val = details["buys_5m"]
     sells_5m_val = details["sells_5m"]
     if sells_5m_val > 0:
@@ -593,16 +573,6 @@ def score_momentum(pair, liquidity_delta_pct=None, prior_liquidity_delta_pct=Non
         buy_sell_ratio = float(buys_5m_val) if buys_5m_val else 0
     details["buy_sell_ratio"] = buy_sell_ratio
 
-    # Buy trajectory adjustment — validated via /check-buy-trajectory-vs-outcome:
-    # rising trajectory (wallet buying more as price climbs) held 50%+ at
-    # 11.5% (n=26) vs 0.0% for both falling and flat (n=6 each), with a
-    # consistent 2x gap on touched-3x too (17.0% vs 9.4%/7.3%). Confirms
-    # the original DCA-down theory: buying more on a rising price reflects
-    # real conviction, buying more on a falling price looks like loss-
-    # cutting that doesn't work — a genuine signal, though not as extreme
-    # as the hard-gated signals, hence a soft adjustment rather than a
-    # block. Asymmetric weighting (+8 rising, -12 falling) reflects that
-    # falling showed a starker drop to 0% than rising's lift above baseline.
     details["buy_trajectory_used"] = buy_trajectory
     if buy_trajectory == "rising":
         score += 8
@@ -629,7 +599,7 @@ def get_prior_scan_snapshot(mint):
             return None, None
         return row[0], row[1]
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 def liquidity_trend_label(current_delta, prior_delta):
@@ -800,7 +770,7 @@ def get_wallet_cluster_count(mint):
         c.close()
         return wallets
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 def cluster_label(wallets, current_wallet):
@@ -842,15 +812,6 @@ def conviction_tier(buy_count):
 
 
 def check_sellable_via_jupiter(mint, test_amount_lamports=10000000):
-    """
-    Simulates a sell of this token via Jupiter's quote API to directly
-    test honeypot risk. Returns True if sellable with reasonable output,
-    False if the quote fails or looks broken (near-zero output), None if
-    the check itself failed (network error, etc — treated as
-    inconclusive, not blocking). Includes timing logs to diagnose whether
-    inconclusive results are due to genuine timeouts, HTTP errors, or
-    something else.
-    """
     start_time = time.time()
     try:
         url = "https://api.jup.ag/swap/v1/quote"
@@ -908,7 +869,7 @@ def has_token_been_recommended_before(mint):
         c.close()
         return exists
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 def get_historical_peak_ratio(wallet, mint, up_to_time=None):
@@ -947,7 +908,7 @@ def get_historical_peak_ratio(wallet, mint, up_to_time=None):
         ratios = [float(vol_h1) / float(liq) for liq, vol_h1 in rows if liq]
         return max(ratios) if ratios else None
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 def extract_wallet_buys(tx, wallet):
@@ -1041,7 +1002,7 @@ def check_and_record_buy(wallet, mint):
                     print(f"❌ FIRST BUY INSERT FAILED for wallet={wallet} token={mint}: {insert_err}")
                     conn.rollback()
                     c.close()
-                    conn.close()
+                    put_conn(conn)
                     return
             else:
                 c.execute(
@@ -1069,15 +1030,12 @@ def check_and_record_buy(wallet, mint):
                 conn.commit()
 
             c.close()
-            conn.close()
+            put_conn(conn)
             return
 
         except psycopg2.OperationalError as db_err:
             print(f"⚠️ DB connection dropped in check_and_record_buy for wallet={wallet} token={mint}: {db_err}")
-            try:
-                conn.close()
-            except Exception:
-                pass
+            put_conn(conn, close=True)
             if attempt < max_attempts - 1:
                 print(f"🔁 Retrying check_and_record_buy for wallet={wallet} token={mint} (attempt {attempt + 2}/{max_attempts})")
                 continue
@@ -1088,7 +1046,7 @@ def check_and_record_buy(wallet, mint):
         except Exception as e:
             print(f"❌ Unexpected error in check_and_record_buy for wallet={wallet} token={mint}: {e}")
             try:
-                conn.close()
+                put_conn(conn)
             except Exception:
                 pass
             return
@@ -1120,10 +1078,10 @@ def get_buy_trajectory(wallet, mint):
         else:
             return "flat"
     finally:
-        conn.close()
+        put_conn(conn)
 
 
-def run_pump_check():
+def run_pump_check(run_id):
     conn = None
     c = None
     checked = 0
@@ -1154,7 +1112,7 @@ def run_pump_check():
 
             if i > 0 and i % DB_CONN_REFRESH_EVERY == 0:
                 try:
-                    conn.close()
+                    put_conn(conn)
                 except Exception:
                     pass
                 try:
@@ -1352,7 +1310,7 @@ def run_pump_check():
                         price_window_pts = details.get("price_window_points")
                         volume_sanity_pts = details.get("volume_sanity_points")
                         too_perfect_flag = details.get("too_perfect_simultaneously", False)
-                        buy_trajectory = get_buy_trajectory(wallet, mint)
+                        buy_trajectory = current_trajectory
                         clean_tier = clean_signal_tier(rug_score, top1_pct, vol_h1_to_liq_ratio)
                         conv_tier = conviction_tier(current_buy_count)
 
@@ -1482,10 +1440,7 @@ def run_pump_check():
 
             except psycopg2.OperationalError as db_err:
                 print(f"DB connection dropped mid-scan on {mint}: {db_err} — reconnecting")
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+                put_conn(conn, close=True)
                 try:
                     conn = get_conn()
                     c = conn.cursor()
@@ -1511,30 +1466,43 @@ def run_pump_check():
                 pass
         if conn:
             try:
-                conn.close()
+                put_conn(conn)
             except Exception:
                 pass
-        _check_pumps_lock.release()
+
+        global _check_pumps_run_id
+        if _check_pumps_run_id == run_id:
+            _check_pumps_run_id = None
+            try:
+                _check_pumps_lock.release()
+            except RuntimeError:
+                pass
+        else:
+            print(f"⚠️ run_pump_check ({run_id}) finished after being force-released — skipping release to avoid stealing the new owner's lock")
 
 
 @app.route("/check-pumps", methods=["GET", "POST"])
 def check_pumps():
-    global _check_pumps_lock_time
+    global _check_pumps_lock_time, _check_pumps_run_id
 
-    if _check_pumps_lock.locked():
+    acquired = _check_pumps_lock.acquire(blocking=False)
+    if not acquired:
         if _check_pumps_lock_time and (time.time() - _check_pumps_lock_time) > 1800:
             print("⚠️ check_pumps lock held for 30+ minutes — force releasing (likely stuck)")
             try:
                 _check_pumps_lock.release()
             except RuntimeError:
                 pass
-        else:
+            acquired = _check_pumps_lock.acquire(blocking=False)
+        if not acquired:
             print("check-pumps already running, skipping this trigger")
             return "already running", 200
 
-    _check_pumps_lock.acquire()
+    run_id = uuid.uuid4()
     _check_pumps_lock_time = time.time()
-    threading.Thread(target=run_pump_check, daemon=True).start()
+    _check_pumps_run_id = run_id
+
+    threading.Thread(target=run_pump_check, args=(run_id,), daemon=True).start()
     return "started", 200
 
 
@@ -1587,7 +1555,7 @@ def telegram_webhook():
                 row = c.fetchone()
                 c.close()
             finally:
-                conn.close()
+                put_conn(conn)
 
             if not row or not row[0]:
                 send_telegram_alert(
@@ -1629,7 +1597,7 @@ def telegram_webhook():
                 row = c.fetchone()
                 c.close()
             finally:
-                conn.close()
+                put_conn(conn)
 
             if not row or not row[0]:
                 send_telegram_alert(
@@ -1748,7 +1716,7 @@ def stats():
         return f"stats error: {e}", 500
 
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.route("/analyze")
@@ -1897,7 +1865,7 @@ def analyze():
         return f"analyze error: {e}", 500
 
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.route("/analyze-alerts")
@@ -1977,7 +1945,7 @@ def analyze_alerts():
         return f"analyze_alerts error: {e}", 500
 
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.route("/check-gate-risk")
@@ -2054,7 +2022,7 @@ def check_gate_risk():
         return f"check_gate_risk error: {e}", 500
 
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.route("/check-volume-floor-risk")
@@ -2134,7 +2102,7 @@ def check_volume_floor_risk():
         return f"check_volume_floor_risk error: {e}", 500
 
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.route("/check-oscillation-risk")
@@ -2227,7 +2195,7 @@ def check_oscillation_risk():
         return f"check_oscillation_risk error: {e}", 500
 
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.route("/check-recency-bias")
@@ -2314,7 +2282,7 @@ def check_recency_bias():
         return f"check_recency_bias error: {e}", 500
 
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.route("/check-pump-retention")
@@ -2395,7 +2363,7 @@ def check_pump_retention():
         return f"check_pump_retention error: {e}", 500
 
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.route("/check-pump-retention-detail")
@@ -2477,7 +2445,7 @@ def check_pump_retention_detail():
         return f"check_pump_retention_detail error: {e}", 500
 
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.route("/check-extension-risk")
@@ -2568,7 +2536,7 @@ def check_extension_risk():
         return f"check_extension_risk error: {e}", 500
 
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.route("/check-retention-patterns")
@@ -2711,7 +2679,7 @@ def check_retention_patterns():
         return f"check_retention_patterns error: {e}", 500
 
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.route("/backfill-suspect-data", methods=["GET", "POST"])
@@ -2758,16 +2726,11 @@ def backfill_suspect_data():
         return f"backfill_suspect_data error: {e}", 500
 
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.route("/cleanup-old-scans", methods=["GET", "POST"])
 def cleanup_old_scans():
-    """
-    Deletes token_scan_log rows older than a retention window (default 5
-    days) to prevent database storage from growing unbounded. Meant to be
-    triggered on a regular schedule (e.g. daily via cron-job.org).
-    """
     days = request.args.get("days", "5")
     try:
         days = float(days)
@@ -2777,9 +2740,6 @@ def cleanup_old_scans():
     conn = get_conn()
     try:
         c = conn.cursor()
-
-        c.execute("SELECT COUNT(*) FROM token_scan_log WHERE scanned_at < NOW() - (INTERVAL '1 day' * %s)", (days,))
-        to_delete = c.fetchone()[0]
 
         c.execute("DELETE FROM token_scan_log WHERE scanned_at < NOW() - (INTERVAL '1 day' * %s)", (days,))
         deleted = c.rowcount
@@ -2798,7 +2758,7 @@ def cleanup_old_scans():
         return f"cleanup_old_scans error: {e}", 500
 
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.route("/check-pump-timing-risk")
@@ -2880,7 +2840,7 @@ def check_pump_timing_risk():
         return f"check_pump_timing_risk error: {e}", 500
 
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.route("/check-pump-timing-risk-6h")
@@ -2961,7 +2921,7 @@ def check_pump_timing_risk_6h():
         return f"check_pump_timing_risk_6h error: {e}", 500
 
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.route("/check-recommendation-value")
@@ -3040,7 +3000,7 @@ def check_recommendation_value():
         return f"check_recommendation_value error: {e}", 500
 
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.route("/check-wallet-performance")
@@ -3099,7 +3059,7 @@ def check_wallet_performance():
         return f"check_wallet_performance error: {e}", 500
 
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.route("/check-time-of-day")
@@ -3179,7 +3139,7 @@ def check_time_of_day():
         return f"check_time_of_day error: {e}", 500
 
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.route("/check-cluster-performance")
@@ -3247,7 +3207,7 @@ def check_cluster_performance():
         return f"check_cluster_performance error: {e}", 500
 
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.route("/check-volume-ratio-vs-outcome")
@@ -3331,7 +3291,7 @@ def check_volume_ratio_vs_outcome():
         return f"check_volume_ratio_vs_outcome error: {e}", 500
 
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.route("/check-volume-ratio-vs-outcome-sustained")
@@ -3458,7 +3418,7 @@ def check_volume_ratio_vs_outcome_sustained():
         return f"check_volume_ratio_vs_outcome_sustained error: {e}", 500
 
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.route("/check-combined-signal-vs-outcome")
@@ -3503,6 +3463,8 @@ def check_combined_signal_vs_outcome():
         c.execute(query, params)
         rows = c.fetchall()
         c.close()
+        put_conn(conn)
+        conn = None
 
         if not rows:
             return "No recommendations with all three signal values yet.", 200
@@ -3541,7 +3503,7 @@ def check_combined_signal_vs_outcome():
         """, (hours,))
         held_rows = c2.fetchall()
         c2.close()
-        conn2.close()
+        put_conn(conn2)
 
         held_map = {(w, m): held for w, m, held in held_rows}
 
@@ -3607,7 +3569,8 @@ def check_combined_signal_vs_outcome():
         return f"check_combined_signal_vs_outcome error: {e}", 500
 
     finally:
-        conn.close()
+        if conn:
+            put_conn(conn)
 
 
 @app.route("/check-conviction-vs-outcome")
@@ -3642,6 +3605,8 @@ def check_conviction_vs_outcome():
         c.execute(query, params)
         rows = c.fetchall()
         c.close()
+        put_conn(conn)
+        conn = None
 
         if not rows:
             return "No recommendation data with buy_count_at_recommendation yet.", 200
@@ -3680,7 +3645,7 @@ def check_conviction_vs_outcome():
         """, (hours,))
         held_rows = c2.fetchall()
         c2.close()
-        conn2.close()
+        put_conn(conn2)
 
         held_map = {(w, m): held for w, m, held in held_rows}
 
@@ -3734,7 +3699,8 @@ def check_conviction_vs_outcome():
         return f"check_conviction_vs_outcome error: {e}", 500
 
     finally:
-        conn.close()
+        if conn:
+            put_conn(conn)
 
 
 @app.route("/check-conviction-tier-vs-outcome")
@@ -3802,7 +3768,7 @@ def check_conviction_tier_vs_outcome():
         return f"check_conviction_tier_vs_outcome error: {e}", 500
 
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.route("/check-rugcheck-vs-outcome")
@@ -3878,7 +3844,7 @@ def check_rugcheck_vs_outcome():
         return f"check_rugcheck_vs_outcome error: {e}", 500
 
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.route("/check-holder-vs-outcome")
@@ -3958,7 +3924,7 @@ def check_holder_vs_outcome():
         return f"check_holder_vs_outcome error: {e}", 500
 
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.route("/check-marketcap-growth-vs-score")
@@ -4064,7 +4030,7 @@ def check_marketcap_growth_vs_score():
         return f"check_marketcap_growth_vs_score error: {e}", 500
 
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.route("/check-marketcap-vs-outcome-detailed")
@@ -4099,6 +4065,8 @@ def check_marketcap_vs_outcome_detailed():
         c.execute(query, params)
         rows = c.fetchall()
         c.close()
+        put_conn(conn)
+        conn = None
 
         if not rows:
             return "No recommendation data with market cap yet.", 200
@@ -4137,7 +4105,7 @@ def check_marketcap_vs_outcome_detailed():
         """, (hours,))
         held_rows = c2.fetchall()
         c2.close()
-        conn2.close()
+        put_conn(conn2)
 
         held_map = {(w, m): held for w, m, held in held_rows}
 
@@ -4207,7 +4175,8 @@ def check_marketcap_vs_outcome_detailed():
         return f"check_marketcap_vs_outcome_detailed error: {e}", 500
 
     finally:
-        conn.close()
+        if conn:
+            put_conn(conn)
 
 
 @app.route("/check-price-velocity-by-score")
@@ -4301,7 +4270,7 @@ def check_price_velocity_by_score():
         return f"check_price_velocity_by_score error: {e}", 500
 
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.route("/check-recommendation-timing")
@@ -4348,7 +4317,7 @@ def check_recommendation_timing():
         return f"check_recommendation_timing error: {e}", 500
 
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.route("/check-timing-by-score")
@@ -4436,7 +4405,7 @@ def check_timing_by_score():
         return f"check_timing_by_score error: {e}", 500
 
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.route("/check-score-components-by-bucket")
@@ -4523,7 +4492,7 @@ def check_score_components_by_bucket():
         return f"check_score_components_by_bucket error: {e}", 500
 
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.route("/check-full-profile-vs-outcome")
@@ -4637,7 +4606,7 @@ def check_full_profile_vs_outcome():
         return f"check_full_profile_vs_outcome error: {e}", 500
 
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.route("/check-buy-trajectory-vs-outcome")
@@ -4677,6 +4646,8 @@ def check_buy_trajectory_vs_outcome():
         c.execute(query, params)
         rows = c.fetchall()
         c.close()
+        put_conn(conn)
+        conn = None
 
         if not rows:
             return "No recommendation data with buy trajectory yet.", 200
@@ -4715,7 +4686,7 @@ def check_buy_trajectory_vs_outcome():
         """, (hours,))
         held_rows = c2.fetchall()
         c2.close()
-        conn2.close()
+        put_conn(conn2)
 
         held_map = {(w, m): held for w, m, held in held_rows}
 
@@ -4765,7 +4736,8 @@ def check_buy_trajectory_vs_outcome():
         return f"check_buy_trajectory_vs_outcome error: {e}", 500
 
     finally:
-        conn.close()
+        if conn:
+            put_conn(conn)
 
 
 @app.route("/check-too-perfect-vs-outcome")
@@ -4818,9 +4790,10 @@ def check_too_perfect_vs_outcome():
         lines.append(f"<br>Flagged (3+ components near max): {rate(flagged)}")
         lines.append(f"Not flagged: {rate(not_flagged)}")
         lines.append(
-            "<br><br>If flagged tokens still manage to get recommended (they "
-            "can, the penalty is soft, -15 points, not a hard block) and "
-            "underperform, that validates the theory."
+            "<br><br>Note: this signal is no longer subtracted from the "
+            "score (removed after data showed it flipped the wrong way — "
+            "flagged tokens hit 3x+ at roughly 2x the rate of non-flagged). "
+            "Kept as an informational check only."
         )
         return "<br>".join(lines), 200
 
@@ -4828,7 +4801,7 @@ def check_too_perfect_vs_outcome():
         return f"check_too_perfect_vs_outcome error: {e}", 500
 
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.route("/check-historical-peak-ratio-vs-outcome")
@@ -4863,6 +4836,8 @@ def check_historical_peak_ratio_vs_outcome():
         c.execute(query, params)
         recs = c.fetchall()
         c.close()
+        put_conn(conn)
+        conn = None
 
         if not recs:
             return "No recommendation data yet.", 200
@@ -4901,7 +4876,7 @@ def check_historical_peak_ratio_vs_outcome():
         """, (hours,))
         held_rows = c2.fetchall()
         c2.close()
-        conn2.close()
+        put_conn(conn2)
         held_map = {(w, m): held for w, m, held in held_rows}
 
         buckets = {
@@ -4943,7 +4918,7 @@ def check_historical_peak_ratio_vs_outcome():
                     buckets[key]["held_hit"] += 1
 
         c3.close()
-        conn3.close()
+        put_conn(conn3)
 
         range_label = ""
         if since_param or until_param:
@@ -4972,7 +4947,8 @@ def check_historical_peak_ratio_vs_outcome():
         return f"check_historical_peak_ratio_vs_outcome error: {e}", 500
 
     finally:
-        conn.close()
+        if conn:
+            put_conn(conn)
 
 
 @app.route("/check-historical-peak-ratio-buckets")
@@ -5007,6 +4983,8 @@ def check_historical_peak_ratio_buckets():
         c.execute(query, params)
         recs = c.fetchall()
         c.close()
+        put_conn(conn)
+        conn = None
 
         if not recs:
             return "No recommendation data yet.", 200
@@ -5045,7 +5023,7 @@ def check_historical_peak_ratio_buckets():
         """, (hours,))
         held_rows = c2.fetchall()
         c2.close()
-        conn2.close()
+        put_conn(conn2)
         held_map = {(w, m): held for w, m, held in held_rows}
 
         buckets = {
@@ -5105,7 +5083,7 @@ def check_historical_peak_ratio_buckets():
                     buckets[key]["held_hit"] += 1
 
         c3.close()
-        conn3.close()
+        put_conn(conn3)
 
         range_label = ""
         if since_param or until_param:
@@ -5133,7 +5111,8 @@ def check_historical_peak_ratio_buckets():
         return f"check_historical_peak_ratio_buckets error: {e}", 500
 
     finally:
-        conn.close()
+        if conn:
+            put_conn(conn)
 
 
 @app.route("/check-buysell-ratio-at-recommendation")
@@ -5207,7 +5186,7 @@ def check_buysell_ratio_at_recommendation():
         return f"check_buysell_ratio_at_recommendation error: {e}", 500
 
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.route("/check-buysell-ratio-vs-outcome")
@@ -5291,7 +5270,7 @@ def check_buysell_ratio_vs_outcome():
         return f"check_buysell_ratio_vs_outcome error: {e}", 500
 
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.route("/check-buysell-ratio-vs-rug-rate")
@@ -5375,7 +5354,7 @@ def check_buysell_ratio_vs_rug_rate():
         return f"check_buysell_ratio_vs_rug_rate error: {e}", 500
 
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.route("/check-never-recommended-winners")
@@ -5446,6 +5425,8 @@ def check_never_recommended_winners():
         c.execute(query, params)
         winners = c.fetchall()
         c.close()
+        put_conn(conn)
+        conn = None
 
         if not winners:
             return f"No never-recommended tokens that both peaked 3x+ AND held 50%+ after {hours}h in this range.", 200
@@ -5489,7 +5470,7 @@ def check_never_recommended_winners():
             )
 
         c2.close()
-        conn2.close()
+        put_conn(conn2)
 
         if len(winners) > result_limit:
             lines.append(f"<br><br>Showing top {result_limit} of {len(winners)} total. Use ?limit= to see more.")
@@ -5505,7 +5486,8 @@ def check_never_recommended_winners():
         return f"check_never_recommended_winners error: {e}", 500
 
     finally:
-        conn.close()
+        if conn:
+            put_conn(conn)
 
 
 @app.route("/check-post-recommendation-decline")
@@ -5532,6 +5514,8 @@ def check_post_recommendation_decline():
         c.execute(query, params)
         recs = c.fetchall()
         c.close()
+        put_conn(conn)
+        conn = None
 
         if not recs:
             return "No recommendation data yet.", 200
@@ -5559,7 +5543,7 @@ def check_post_recommendation_decline():
                     checkpoints[label].append(float(row[0]))
 
         c2.close()
-        conn2.close()
+        put_conn(conn2)
 
         def median(vals):
             s = sorted(vals)
@@ -5602,19 +5586,12 @@ def check_post_recommendation_decline():
         return f"check_post_recommendation_decline error: {e}", 500
 
     finally:
-        conn.close()
+        if conn:
+            put_conn(conn)
 
 
 @app.route("/check-decline-then-outcome")
 def check_decline_then_outcome():
-    """
-    For recommendations that were down 30%+ (multiplier < 0.7x) at 1h,
-    checks what fraction still went on to eventually hit 3x+ later,
-    versus never recovering. Validated: 4.5% (down 30%+ at 1h) vs 16.0%
-    (baseline) eventually hit 3x — confirms early decline is a genuine
-    predictor of a dead token, distinct from the fact that SOME decline
-    is normal/routine for most recommendations.
-    """
     since_param, until_param = get_date_filter_params()
     conn = get_conn()
     try:
@@ -5639,6 +5616,8 @@ def check_decline_then_outcome():
         c.execute(query, params)
         recs = c.fetchall()
         c.close()
+        put_conn(conn)
+        conn = None
 
         if not recs:
             return "No recommendation data yet.", 200
@@ -5677,7 +5656,7 @@ def check_decline_then_outcome():
                     did_not_decline["eventually_hit_3x"] += 1
 
         c2.close()
-        conn2.close()
+        put_conn(conn2)
 
         range_label = ""
         if since_param or until_param:
@@ -5702,18 +5681,12 @@ def check_decline_then_outcome():
         return f"check_decline_then_outcome error: {e}", 500
 
     finally:
-        conn.close()
+        if conn:
+            put_conn(conn)
 
 
 @app.route("/check-score-threshold-finer")
 def check_score_threshold_finer():
-    """
-    Bucket recommendations by narrow 5-point score bands to see whether
-    70 is genuinely a meaningful cutoff, or an arbitrary number with no
-    real cliff in performance. Uses the held metric (peaked 3x+ AND
-    held 50%+ after N hours) as the outcome measure, consistent with
-    every other validated signal tonight.
-    """
     since_param, until_param = get_date_filter_params()
     hours = request.args.get("hours", "1")
     try:
@@ -5746,6 +5719,8 @@ def check_score_threshold_finer():
         c.execute(query, params)
         rows = c.fetchall()
         c.close()
+        put_conn(conn)
+        conn = None
 
         if not rows:
             return "No recommendation data yet.", 200
@@ -5784,7 +5759,7 @@ def check_score_threshold_finer():
         """, (hours,))
         held_rows = c2.fetchall()
         c2.close()
-        conn2.close()
+        put_conn(conn2)
         held_map = {(w, m): held for w, m, held in held_rows}
 
         buckets = {
@@ -5853,19 +5828,12 @@ def check_score_threshold_finer():
         return f"check_score_threshold_finer error: {e}", 500
 
     finally:
-        conn.close()
+        if conn:
+            put_conn(conn)
 
 
 @app.route("/check-loser-decline-timing")
 def check_loser_decline_timing():
-    """
-    For recommendations that turned out to be losers (never touched 3x+),
-    checks how long after recommendation their price first dropped below
-    various thresholds (10%, 20%, 30%) — to see if a delayed-confirmation
-    approach (waiting N scan cycles before actually recommending) would
-    catch losers early enough to be worth the tradeoff of a delayed,
-    worse-priced entry for winners.
-    """
     since_param, until_param = get_date_filter_params()
     conn = get_conn()
     try:
@@ -5890,6 +5858,8 @@ def check_loser_decline_timing():
         c.execute(query, params)
         recs = c.fetchall()
         c.close()
+        put_conn(conn)
+        conn = None
 
         if not recs:
             return "No recommendation data yet.", 200
@@ -5922,7 +5892,7 @@ def check_loser_decline_timing():
                     break
 
         c2.close()
-        conn2.close()
+        put_conn(conn2)
 
         if not loser_decline_times:
             return "No losers with a confirmed 10%+ decline found yet.", 200
@@ -5957,7 +5927,8 @@ def check_loser_decline_timing():
         return f"check_loser_decline_timing error: {e}", 500
 
     finally:
-        conn.close()
+        if conn:
+            put_conn(conn)
 
 
 @app.route("/recommendation/<mint>")
@@ -6036,7 +6007,7 @@ def recommendation_lookup(mint):
         return f"recommendation_lookup error: {e}", 500
 
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.route("/debug-token/<mint>")
@@ -6076,7 +6047,7 @@ def debug_token(mint):
         return f"debug_token error: {e}", 500
 
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.route("/token/<mint>")
@@ -6143,7 +6114,7 @@ def token_history(mint):
         return f"token_history error: {e}", 500
 
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 if __name__ == "__main__":
