@@ -1046,6 +1046,10 @@ def check_and_record_buy(wallet, mint):
         except Exception as e:
             print(f"❌ Unexpected error in check_and_record_buy for wallet={wallet} token={mint}: {e}")
             try:
+                conn.rollback()
+            except Exception:
+                pass
+            try:
                 put_conn(conn)
             except Exception:
                 pass
@@ -1465,6 +1469,10 @@ def run_pump_check(run_id):
             except Exception:
                 pass
         if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
             try:
                 put_conn(conn)
             except Exception:
