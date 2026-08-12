@@ -6062,6 +6062,109 @@ def debug_token(mint):
         put_conn(conn)
 
 
+@app.route("/debug-token-buyers/<mint>")
+def debug_token_buyers(mint):
+    """
+    Pulls historical transaction data for a specific mint from Helius
+    and returns buyer wallets within a given time window. Built for
+    researching who bought a specific token before it graduated to a
+    DEX (so DexScreener/Solscan-based lookups don't apply), using exact
+    UTC timestamps rather than a UI time filter that could be ambiguous
+    about timezone or edge cases.
+
+    Params:
+      start: ISO 8601 datetime (UTC), e.g. 2026-08-09T22:58:00
+      end: ISO 8601 datetime (UTC), e.g. 2026-08-09T23:08:00
+    """
+    if not HELIUS_API_KEY:
+        return "HELIUS_API_KEY not configured.", 500
+
+    start_str = request.args.get("start")
+    end_str = request.args.get("end")
+    if not start_str or not end_str:
+        return "Provide ?start=...&end=... as ISO 8601 UTC datetimes (e.g. 2026-08-09T22:58:00)", 400
+
+    try:
+        start_dt = datetime.datetime.fromisoformat(start_str).replace(tzinfo=datetime.timezone.utc)
+        end_dt = datetime.datetime.fromisoformat(end_str).replace(tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return "Invalid start/end format — use ISO 8601, e.g. 2026-08-09T22:58:00", 400
+
+    start_ts = int(start_dt.timestamp())
+    end_ts = int(end_dt.timestamp())
+
+    buyers = []
+    before_sig = None
+    pages_fetched = 0
+    max_pages = 20
+
+    try:
+        while pages_fetched < max_pages:
+            url = f"https://api.helius.xyz/v0/addresses/{mint}/transactions"
+            params = {"api-key": HELIUS_API_KEY, "limit": 100}
+            if before_sig:
+                params["before"] = before_sig
+
+            resp = requests.get(url, params=params, timeout=10)
+            if resp.status_code != 200:
+                return f"Helius API error: HTTP {resp.status_code} — {resp.text[:300]}", 500
+
+            txs = resp.json()
+            if not txs:
+                break
+
+            pages_fetched += 1
+            oldest_ts_this_page = None
+
+            for tx in txs:
+                tx_ts = tx.get("timestamp")
+                if tx_ts is None:
+                    continue
+                if oldest_ts_this_page is None or tx_ts < oldest_ts_this_page:
+                    oldest_ts_this_page = tx_ts
+
+                if start_ts <= tx_ts <= end_ts:
+                    for transfer in tx.get("tokenTransfers", []) or []:
+                        if transfer.get("mint") != mint:
+                            continue
+                        to_account = transfer.get("toUserAccount")
+                        amount = transfer.get("tokenAmount")
+                        if to_account:
+                            buyers.append({
+                                "wallet": to_account,
+                                "amount": amount,
+                                "timestamp": tx_ts,
+                                "signature": tx.get("signature"),
+                            })
+
+            before_sig = txs[-1].get("signature")
+
+            if oldest_ts_this_page is not None and oldest_ts_this_page < start_ts:
+                break
+
+        if not buyers:
+            return (
+                f"No token transfers found for {mint} between {start_str} and {end_str} "
+                f"UTC (checked {pages_fetched} pages of Helius history). Either genuinely "
+                f"no activity, or the window/mint needs double-checking.",
+                200
+            )
+
+        lines = [f"<b>Buyers of {mint}</b> between {start_str} and {end_str} UTC:<br>"]
+        for b in buyers:
+            lines.append(
+                f"<br>Wallet: <code>{b['wallet']}</code><br>"
+                f"Amount: {b['amount']}<br>"
+                f"Time: {datetime.datetime.utcfromtimestamp(b['timestamp']).isoformat()} UTC<br>"
+                f"Tx: <code>{b['signature']}</code>"
+            )
+
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"debug_token_buyers error: {e}", 500
+
+
 @app.route("/token/<mint>")
 def token_history(mint):
     limit_param = request.args.get("limit", "30")
