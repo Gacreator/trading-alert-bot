@@ -1455,6 +1455,10 @@ def run_pump_check(run_id):
 
             except Exception as e:
                 print(f"Error processing {mint}: {e}")
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
                 continue
 
         print(f"check_pumps finished — checked {checked} tokens")
