@@ -1295,7 +1295,7 @@ def run_pump_check(run_id):
                     rug_blocks = rug_score is not None and rug_score > 30
                     holder_blocks = top1_pct is not None and top1_pct >= 7
                     volume_blocks = vol_h1_to_liq_ratio is not None and vol_h1_to_liq_ratio > 10
-                    historical_volume_blocks = historical_peak_ratio is not None and historical_peak_ratio > 10
+                    historical_volume_blocks = historical_peak_ratio is not None and historical_peak_ratio > 50
 
                     buy_sell_ratio_at_rec = details.get("buy_sell_ratio", 0)
                     buysell_blocks = buy_sell_ratio_at_rec is not None and buy_sell_ratio_at_rec >= 10
