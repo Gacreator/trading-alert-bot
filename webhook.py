@@ -6087,6 +6087,141 @@ def check_gate_false_positive_rate():
             put_conn(conn)
 
 
+@app.route("/check-gate-blocked-otherwise-clean")
+def check_gate_blocked_otherwise_clean():
+    """
+    For tokens blocked SOLELY by historical_peak_ratio or holder_pct,
+    splits them into "otherwise clean" (RugCheck <=15 AND the other of
+    the two concentration/ratio signals also looks fine) vs "otherwise
+    marginal" — to test whether a token that's clean everywhere else
+    still benefits meaningfully from being gated on the one remaining
+    risky signal, or whether the other signals already capture the risk.
+    """
+    since_param, until_param = get_date_filter_params()
+    hours = request.args.get("hours", "1")
+    try:
+        hours = float(hours)
+    except (TypeError, ValueError):
+        hours = 1.0
+
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        query = """
+            SELECT wallet, token_mint, block_reason_at_last_attempt
+            FROM wallet_token_history
+            WHERE block_reason_at_last_attempt IS NOT NULL
+            AND momentum_alerted = FALSE
+        """
+        params = []
+        if since_param:
+            query += " AND first_seen_at >= %s"
+            params.append(since_param)
+        if until_param:
+            query += " AND first_seen_at < %s"
+            params.append(until_param)
+
+        c.execute(query, params)
+        blocked_rows = c.fetchall()
+        c.close()
+        put_conn(conn)
+        conn = None
+
+        # Isolate solely-blocked tokens for each gate
+        historical_only = [(w, m, r) for w, m, r in blocked_rows
+                            if len([x.strip() for x in r.split(",")]) == 1
+                            and r.strip().startswith("historical_peak_ratio")]
+        holder_only = [(w, m, r) for w, m, r in blocked_rows
+                        if len([x.strip() for x in r.split(",")]) == 1
+                        and r.strip().startswith("holder_pct")]
+
+        held_map = get_held_map(hours)
+
+        conn2 = get_conn()
+        c2 = conn2.cursor()
+
+        def classify_and_evaluate(triples, other_signal_check):
+            """other_signal_check(wallet, mint) -> True if 'otherwise clean'"""
+            clean = []
+            marginal = []
+            for wallet, mint, reason in triples:
+                # Pull the token's last known RugCheck score / holder pct
+                # from the last real scan before it was blocked, via
+                # token_scan_log momentum_score peak as a proxy for "did
+                # it ever look genuinely strong elsewhere"
+                c2.execute("""
+                    SELECT MAX(momentum_score)
+                    FROM token_scan_log
+                    WHERE wallet = %s AND token_mint = %s
+                """, (wallet, mint))
+                peak_row = c2.fetchone()
+                peak_score = peak_row[0] if peak_row and peak_row[0] is not None else 0
+
+                is_clean = other_signal_check(peak_score)
+                if is_clean:
+                    clean.append((wallet, mint))
+                else:
+                    marginal.append((wallet, mint))
+            return clean, marginal
+
+        # "Otherwise clean" proxy: peak momentum score was itself high
+        # (85+) despite the one gate — i.e. everything else about it
+        # looked strong, not just barely crossing 70.
+        hist_clean, hist_marginal = classify_and_evaluate(
+            historical_only, lambda score: score >= 85
+        )
+        holder_clean, holder_marginal = classify_and_evaluate(
+            holder_only, lambda score: score >= 85
+        )
+
+        c2.close()
+        put_conn(conn2)
+
+        def evaluate(pairs):
+            total = len(pairs)
+            touched = sum(1 for wm in pairs if wm in held_map)
+            held = sum(1 for wm in pairs if held_map.get(wm) is True)
+            rate = f"{held/touched*100:.1f}%" if touched else "n/a"
+            return total, touched, held, rate
+
+        range_label = ""
+        if since_param or until_param:
+            range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
+
+        lines = [f"<b>Gate-blocked tokens: otherwise-clean (score 85+) vs otherwise-marginal:</b>{range_label}<br>"]
+
+        lines.append("<br><b>HISTORICAL_PEAK_RATIO-only blocks</b>")
+        t, tr, h, r = evaluate(hist_clean)
+        lines.append(f"Otherwise clean (peak score 85+): n={t}, trackable={tr}, held={h} ({r})")
+        t, tr, h, r = evaluate(hist_marginal)
+        lines.append(f"Otherwise marginal (peak score &lt;85): n={t}, trackable={tr}, held={h} ({r})")
+
+        lines.append("<br><br><b>HOLDER_PCT-only blocks</b>")
+        t, tr, h, r = evaluate(holder_clean)
+        lines.append(f"Otherwise clean (peak score 85+): n={t}, trackable={tr}, held={h} ({r})")
+        t, tr, h, r = evaluate(holder_marginal)
+        lines.append(f"Otherwise marginal (peak score &lt;85): n={t}, trackable={tr}, held={h} ({r})")
+
+        lines.append(
+            "<br><br>If 'otherwise clean' held-rate is meaningfully higher than "
+            "'otherwise marginal' AND comparable to your normal recommended-token "
+            "baseline, that supports the theory that other signals already "
+            "capture the risk for genuinely strong tokens — worth loosening "
+            "the gate for high-scoring cases specifically. If both subsets "
+            "look similarly low, the gate is catching something independent "
+            "of overall score quality, and shouldn't be loosened based on "
+            "score alone. Treat any group under 15-20 samples cautiously."
+        )
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_gate_blocked_otherwise_clean error: {e}", 500
+
+    finally:
+        if conn:
+            put_conn(conn)
+
+
 @app.route("/recommendation/<mint>")
 def recommendation_lookup(mint):
     conn = get_conn()
