@@ -20,6 +20,7 @@ TELEGRAM_CHAT_IDS = [
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 HELIUS_API_KEY = os.environ.get("HELIUS_API_KEY")
 JUPITER_API_KEY = os.environ.get("JUPITER_API_KEY")
+RUGCHECK_API_KEY = os.environ.get("RUGCHECK_API_KEY")
 
 TRACKED_WALLETS = set(
     w.strip() for w in os.environ.get("TRACKED_WALLETS", "").split(",") if w.strip()
@@ -686,7 +687,8 @@ def is_suspect_scan(multiplier_from_first_buy, multiplier_since_recommendation, 
 def get_rugcheck_data(mint):
     try:
         url = f"https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary"
-        resp = requests.get(url, timeout=5)
+        headers = {"X-API-KEY": RUGCHECK_API_KEY} if RUGCHECK_API_KEY else {}
+        resp = requests.get(url, headers=headers, timeout=5)
         if resp.status_code != 200:
             return None, None
         data = resp.json()
