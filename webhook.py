@@ -428,8 +428,11 @@ def get_current_price(mint):
 
 
 def get_token_context(mint):
-    pf = get_pumpfun_data(mint)
-    ds = get_dexscreener_data(mint)
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        pf_future = ex.submit(get_pumpfun_data, mint)
+        ds_future = ex.submit(get_dexscreener_data, mint)
+        pf = pf_future.result()
+        ds = ds_future.result()
 
     if not pf and not ds:
         return None, []
