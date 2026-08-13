@@ -1136,10 +1136,219 @@ def get_buy_trajectory(wallet, mint):
         put_conn(conn)
 
 
+def _gate_check_one_token(item):
+    """
+    Runs the full gate-check for one qualifying token, using its own
+    short-lived DB connections (separate from the main scan loop's
+    connection, since this runs concurrently for multiple tokens).
+    Returns a dict describing the outcome so the caller can write
+    results and send alerts sequentially afterward.
+    """
+    wallet = item["wallet"]
+    mint = item["mint"]
+    pair = item["pair"]
+    score = item["score"]
+    details = item["details"]
+
+    already_recommended_elsewhere = has_token_been_recommended_before(mint)
+
+    with ThreadPoolExecutor(max_workers=3) as gate_executor:
+        rug_future = gate_executor.submit(get_rugcheck_data, mint)
+        holder_future = gate_executor.submit(get_top_holder_concentration, mint, pair.get("pairAddress"))
+        sellable_future = gate_executor.submit(check_sellable_via_jupiter, mint)
+
+        rug_score, rug_liq_flags = rug_future.result()
+        holder_data = holder_future.result()
+        sellable_result = sellable_future.result()
+
+    top1_pct = holder_data.get("top1_pct") if holder_data else None
+    vol_h1_to_liq_ratio = details.get("vol_h1_to_liq_ratio", 0)
+    historical_peak_ratio = get_historical_peak_ratio(wallet, mint)
+
+    rug_blocks = rug_score is not None and rug_score > 30
+    holder_blocks = top1_pct is not None and top1_pct >= 7
+    volume_blocks = vol_h1_to_liq_ratio is not None and vol_h1_to_liq_ratio > 10
+    historical_volume_blocks = historical_peak_ratio is not None and historical_peak_ratio > 50
+
+    buy_sell_ratio_at_rec = details.get("buy_sell_ratio", 0)
+    buysell_blocks = buy_sell_ratio_at_rec is not None and buy_sell_ratio_at_rec >= 10
+
+    sellable_str = (
+        "sellable" if sellable_result is True
+        else "not_sellable" if sellable_result is False
+        else "inconclusive"
+    )
+    sell_blocks = sellable_result is False
+
+    blocked = (rug_blocks or holder_blocks or volume_blocks or sell_blocks
+               or already_recommended_elsewhere or historical_volume_blocks or buysell_blocks)
+
+    result = {
+        "item": item,
+        "blocked": blocked,
+        "rug_score": rug_score,
+        "rug_liq_flags": rug_liq_flags,
+        "holder_data": holder_data,
+        "top1_pct": top1_pct,
+        "vol_h1_to_liq_ratio": vol_h1_to_liq_ratio,
+        "historical_peak_ratio": historical_peak_ratio,
+        "buy_sell_ratio_at_rec": buy_sell_ratio_at_rec,
+        "sellable_str": sellable_str,
+        "already_recommended_elsewhere": already_recommended_elsewhere,
+    }
+
+    if blocked:
+        block_reasons = []
+        if rug_blocks:
+            block_reasons.append(f"rugcheck({rug_score})")
+        if holder_blocks:
+            block_reasons.append(f"holder_pct({top1_pct:.1f})")
+        if volume_blocks:
+            block_reasons.append(f"vol_ratio({vol_h1_to_liq_ratio:.1f}x)")
+        if historical_volume_blocks:
+            block_reasons.append(f"historical_peak_ratio({historical_peak_ratio:.1f}x)")
+        if buysell_blocks:
+            block_reasons.append(f"buysell_ratio({buy_sell_ratio_at_rec:.1f}x)")
+        if sell_blocks:
+            block_reasons.append("not_sellable")
+        if already_recommended_elsewhere:
+            block_reasons.append("already_recommended")
+        result["block_reason_str"] = ", ".join(block_reasons)
+
+    return result
+
+
+def _apply_gate_result(result):
+    """
+    Writes the outcome of one gate-check to the database and sends the
+    Telegram alert if applicable. Uses its own short-lived connection,
+    called sequentially after all concurrent gate-checks complete.
+    """
+    item = result["item"]
+    wallet = item["wallet"]
+    mint = item["mint"]
+    pair = item["pair"]
+    score = item["score"]
+    details = item["details"]
+    current_price = item["current_price"]
+    current_market_cap = item["current_market_cap"]
+    liquidity_delta_pct = item["liquidity_delta_pct"]
+    prior_liq_delta = item["prior_liq_delta"]
+    prior_pc_5m = item["prior_pc_5m"]
+    current_trajectory = item["current_trajectory"]
+
+    dexscreener_url = f"https://dexscreener.com/solana/{mint}"
+
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+
+        if result["blocked"]:
+            c.execute(
+                "UPDATE wallet_token_history SET block_reason_at_last_attempt = %s WHERE wallet=%s AND token_mint=%s",
+                (result["block_reason_str"], wallet, mint)
+            )
+            conn.commit()
+            print(f"⛔ Recommendation blocked for {mint}: {result['block_reason_str']}")
+            return
+
+        liq_trend_note = liquidity_trend_label(liquidity_delta_pct, prior_liq_delta)
+        price_trend_note = price_trend_label(details.get("pc_5m"), prior_pc_5m)
+        rug_note = rugcheck_label(result["rug_score"], result["rug_liq_flags"])
+        holder_note = holder_concentration_label(result["holder_data"])
+        cluster_wallets = get_wallet_cluster_count(mint)
+        cluster_note = cluster_label(cluster_wallets, wallet)
+
+        c.execute(
+            "SELECT buy_count FROM wallet_token_history WHERE wallet=%s AND token_mint=%s",
+            (wallet, mint)
+        )
+        current_buy_count_row = c.fetchone()
+        current_buy_count = current_buy_count_row[0] if current_buy_count_row else None
+        liquidity_trend_pts = details.get("liquidity_trend_points")
+        liquidity_level_pts = details.get("liquidity_level_points")
+        price_window_pts = details.get("price_window_points")
+        volume_sanity_pts = details.get("volume_sanity_points")
+        too_perfect_flag = details.get("too_perfect_simultaneously", False)
+        buy_trajectory = current_trajectory
+        clean_tier = clean_signal_tier(result["rug_score"], result["top1_pct"], result["vol_h1_to_liq_ratio"])
+        conv_tier = conviction_tier(current_buy_count)
+
+        clean_tier_note = "🌟 STRONG SETUP (cleared all gates comfortably)\n" if clean_tier == "strong" else ""
+        conv_tier_note = "💪 HIGH CONVICTION (wallet bought 15+ times)\n" if conv_tier == "high conviction" else ""
+
+        c.execute(
+            "UPDATE token_scan_log SET momentum_alert_fired = TRUE WHERE id = %s",
+            (item["scan_log_id"],)
+        )
+
+        c.execute(
+            """
+            UPDATE wallet_token_history
+            SET momentum_alerted = TRUE,
+                price_at_recommendation = %s,
+                recommended_at = NOW(),
+                market_cap_at_recommendation = %s,
+                rugcheck_score_at_recommendation = %s,
+                top1_holder_pct_at_recommendation = %s,
+                cluster_count_at_recommendation = %s,
+                buy_count_at_recommendation = %s,
+                liquidity_trend_points_at_recommendation = %s,
+                liquidity_level_points_at_recommendation = %s,
+                price_window_points_at_recommendation = %s,
+                volume_sanity_points_at_recommendation = %s,
+                buy_trajectory_at_recommendation = %s,
+                clean_signal_tier_at_recommendation = %s,
+                conviction_tier_at_recommendation = %s,
+                too_perfect_penalty_applied = %s,
+                sellable_check_result = %s,
+                historical_peak_ratio_at_recommendation = %s
+            WHERE wallet=%s AND token_mint=%s
+            """,
+            (current_price, current_market_cap, result["rug_score"],
+             result["top1_pct"], len(cluster_wallets), current_buy_count,
+             liquidity_trend_pts, liquidity_level_pts, price_window_pts, volume_sanity_pts,
+             buy_trajectory, clean_tier, conv_tier, too_perfect_flag, result["sellable_str"],
+             result["historical_peak_ratio"], wallet, mint)
+        )
+        conn.commit()
+
+        send_telegram_alert(
+            f"🚀 Heating up (score {score}/100)\n"
+            f"{clean_tier_note}"
+            f"{conv_tier_note}"
+            f"Wallet: <code>{wallet}</code>\n"
+            f"Token: <code>{mint}</code>\n\n"
+            f"Market cap: ${current_market_cap:,.0f}\n"
+            f"Liquidity: ${details.get('liquidity', 0):.0f}"
+            + (f" (Δ {liquidity_delta_pct*100:.1f}% since last scan)" if liquidity_delta_pct is not None else "")
+            + f"\n5m volume: ${details.get('vol_5m', 0):.0f} (1h: ${details.get('vol_h1', 0):.0f})\n"
+            f"Price change 5m/1h/6h: {details.get('pc_5m')}% / {details.get('pc_h1')}% / {details.get('pc_h6')}%\n\n"
+            f"{liq_trend_note}\n"
+            f"{price_trend_note}\n"
+            f"{rug_note}\n"
+            f"{holder_note}\n"
+            f"{cluster_note}\n\n"
+            f"📊 DexScreener: {dexscreener_url}\n\n"
+            f"Recommending this now — tracking from this price to see if it delivers. DYOR."
+        )
+        send_bare_address_to_rick_chat(mint)
+
+    except Exception as e:
+        print(f"Error applying gate result for {mint}: {e}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        put_conn(conn)
+
+
 def run_pump_check(run_id):
     conn = None
     c = None
     checked = 0
+    qualifying_tokens = []
 
     try:
         conn = get_conn()
@@ -1190,7 +1399,6 @@ def run_pump_check(run_id):
                     pass
 
                 current_market_cap = pair.get("fdv", 0) or 0
-                dexscreener_url = f"https://dexscreener.com/solana/{mint}"
 
                 multiplier_from_first_buy = None
                 if price_at_first_buy and current_price:
@@ -1276,155 +1484,11 @@ def run_pump_check(run_id):
                         (current_liquidity, wallet, mint)
                     )
 
-                momentum_alert_fired = False
                 pump_alert_fired = False
 
-                if not suspect and not momentum_alerted and score >= 70:
-
-                    already_recommended_elsewhere = has_token_been_recommended_before(mint)
-
-                    with ThreadPoolExecutor(max_workers=3) as gate_executor:
-                        rug_future = gate_executor.submit(get_rugcheck_data, mint)
-                        holder_future = gate_executor.submit(get_top_holder_concentration, mint, pair.get("pairAddress"))
-                        sellable_future = gate_executor.submit(check_sellable_via_jupiter, mint)
-
-                        rug_score, rug_liq_flags = rug_future.result()
-                        holder_data = holder_future.result()
-                        sellable_result = sellable_future.result()
-
-                    top1_pct = holder_data.get("top1_pct") if holder_data else None
-
-                    vol_h1_to_liq_ratio = details.get("vol_h1_to_liq_ratio", 0)
-                    historical_peak_ratio = get_historical_peak_ratio(wallet, mint)
-
-                    rug_blocks = rug_score is not None and rug_score > 30
-                    holder_blocks = top1_pct is not None and top1_pct >= 7
-                    volume_blocks = vol_h1_to_liq_ratio is not None and vol_h1_to_liq_ratio > 10
-                    historical_volume_blocks = historical_peak_ratio is not None and historical_peak_ratio > 50
-
-                    buy_sell_ratio_at_rec = details.get("buy_sell_ratio", 0)
-                    buysell_blocks = buy_sell_ratio_at_rec is not None and buy_sell_ratio_at_rec >= 10
-
-                    sellable_str = (
-                        "sellable" if sellable_result is True
-                        else "not_sellable" if sellable_result is False
-                        else "inconclusive"
-                    )
-                    sell_blocks = sellable_result is False
-
-                    if rug_blocks or holder_blocks or volume_blocks or sell_blocks or already_recommended_elsewhere or historical_volume_blocks or buysell_blocks:
-                        block_reasons = []
-                        if rug_blocks:
-                            block_reasons.append(f"rugcheck({rug_score})")
-                        if holder_blocks:
-                            block_reasons.append(f"holder_pct({top1_pct:.1f})")
-                        if volume_blocks:
-                            block_reasons.append(f"vol_ratio({vol_h1_to_liq_ratio:.1f}x)")
-                        if historical_volume_blocks:
-                            block_reasons.append(f"historical_peak_ratio({historical_peak_ratio:.1f}x)")
-                        if buysell_blocks:
-                            block_reasons.append(f"buysell_ratio({buy_sell_ratio_at_rec:.1f}x)")
-                        if sell_blocks:
-                            block_reasons.append("not_sellable")
-                        if already_recommended_elsewhere:
-                            block_reasons.append("already_recommended")
-                        block_reason_str = ", ".join(block_reasons)
-
-                        c.execute(
-                            "UPDATE wallet_token_history SET block_reason_at_last_attempt = %s WHERE wallet=%s AND token_mint=%s",
-                            (block_reason_str, wallet, mint)
-                        )
-                        conn.commit()
-
-                        print(f"⛔ Recommendation blocked for {mint}: "
-                              f"rug_score={rug_score} (blocks={rug_blocks}), "
-                              f"top1_pct={top1_pct} (blocks={holder_blocks}), "
-                              f"vol_h1_to_liq_ratio={vol_h1_to_liq_ratio:.1f} (blocks={volume_blocks}), "
-                              f"historical_peak_ratio={historical_peak_ratio} (blocks={historical_volume_blocks}), "
-                              f"buysell_ratio={buy_sell_ratio_at_rec:.1f} (blocks={buysell_blocks}), "
-                              f"sellable_check={sellable_str} (blocks={sell_blocks}), "
-                              f"already_recommended_elsewhere={already_recommended_elsewhere}")
-                    else:
-                        momentum_alert_fired = True
-
-                        liq_trend_note = liquidity_trend_label(liquidity_delta_pct, prior_liq_delta)
-                        price_trend_note = price_trend_label(details.get("pc_5m"), prior_pc_5m)
-                        rug_note = rugcheck_label(rug_score, rug_liq_flags)
-                        holder_note = holder_concentration_label(holder_data)
-                        cluster_wallets = get_wallet_cluster_count(mint)
-                        cluster_note = cluster_label(cluster_wallets, wallet)
-
-                        c.execute(
-                            "SELECT buy_count FROM wallet_token_history WHERE wallet=%s AND token_mint=%s",
-                            (wallet, mint)
-                        )
-                        current_buy_count_row = c.fetchone()
-                        current_buy_count = current_buy_count_row[0] if current_buy_count_row else None
-                        liquidity_trend_pts = details.get("liquidity_trend_points")
-                        liquidity_level_pts = details.get("liquidity_level_points")
-                        price_window_pts = details.get("price_window_points")
-                        volume_sanity_pts = details.get("volume_sanity_points")
-                        too_perfect_flag = details.get("too_perfect_simultaneously", False)
-                        buy_trajectory = current_trajectory
-                        clean_tier = clean_signal_tier(rug_score, top1_pct, vol_h1_to_liq_ratio)
-                        conv_tier = conviction_tier(current_buy_count)
-
-                        clean_tier_note = "🌟 STRONG SETUP (cleared all gates comfortably)\n" if clean_tier == "strong" else ""
-                        conv_tier_note = "💪 HIGH CONVICTION (wallet bought 15+ times)\n" if conv_tier == "high conviction" else ""
-
-                        c.execute(
-                            """
-                            UPDATE wallet_token_history
-                            SET momentum_alerted = TRUE,
-                                price_at_recommendation = %s,
-                                recommended_at = NOW(),
-                                market_cap_at_recommendation = %s,
-                                rugcheck_score_at_recommendation = %s,
-                                top1_holder_pct_at_recommendation = %s,
-                                cluster_count_at_recommendation = %s,
-                                buy_count_at_recommendation = %s,
-                                liquidity_trend_points_at_recommendation = %s,
-                                liquidity_level_points_at_recommendation = %s,
-                                price_window_points_at_recommendation = %s,
-                                volume_sanity_points_at_recommendation = %s,
-                                buy_trajectory_at_recommendation = %s,
-                                clean_signal_tier_at_recommendation = %s,
-                                conviction_tier_at_recommendation = %s,
-                                too_perfect_penalty_applied = %s,
-                                sellable_check_result = %s,
-                                historical_peak_ratio_at_recommendation = %s
-                            WHERE wallet=%s AND token_mint=%s
-                            """,
-                            (current_price, current_market_cap, rug_score,
-                             top1_pct, len(cluster_wallets), current_buy_count,
-                             liquidity_trend_pts, liquidity_level_pts, price_window_pts, volume_sanity_pts,
-                             buy_trajectory, clean_tier, conv_tier, too_perfect_flag, sellable_str,
-                             historical_peak_ratio, wallet, mint)
-                        )
-                        send_telegram_alert(
-                            f"🚀 Heating up (score {score}/100)\n"
-                            f"{clean_tier_note}"
-                            f"{conv_tier_note}"
-                            f"Wallet: <code>{wallet}</code>\n"
-                            f"Token: <code>{mint}</code>\n\n"
-                            f"Market cap: ${current_market_cap:,.0f}\n"
-                            f"Liquidity: ${details.get('liquidity', 0):.0f}"
-                            + (f" (Δ {liquidity_delta_pct*100:.1f}% since last scan)" if liquidity_delta_pct is not None else "")
-                            + f"\n5m volume: ${details.get('vol_5m', 0):.0f} (1h: ${details.get('vol_h1', 0):.0f})\n"
-                            f"Price change 5m/1h/6h: {details.get('pc_5m')}% / {details.get('pc_h1')}% / {details.get('pc_h6')}%\n\n"
-                            f"{liq_trend_note}\n"
-                            f"{price_trend_note}\n"
-                            f"{rug_note}\n"
-                            f"{holder_note}\n"
-                            f"{cluster_note}\n\n"
-                            f"📊 DexScreener: {dexscreener_url}\n\n"
-                            f"Recommending this now — tracking from this price to see if it delivers. DYOR."
-                        )
-
-                        send_bare_address_to_rick_chat(mint)
-
-                elif (not suspect and not pumped_since_rec_alerted and price_at_recommendation
-                      and multiplier_since_recommendation and multiplier_since_recommendation >= 3):
+                if not suspect and not pumped_since_rec_alerted and price_at_recommendation \
+                   and multiplier_since_recommendation and multiplier_since_recommendation >= 3 \
+                   and not (not momentum_alerted and score >= 70):
                     pump_alert_fired = True
                     mc_line = ""
                     if market_cap_at_recommendation:
@@ -1432,6 +1496,7 @@ def run_pump_check(run_id):
                             f"Market cap then: ${float(market_cap_at_recommendation):,.0f} → "
                             f"now: ${current_market_cap:,.0f}\n"
                         )
+                    dexscreener_url = f"https://dexscreener.com/solana/{mint}"
                     send_telegram_alert(
                         f"🎯 RECOMMENDATION PAID OFF — {multiplier_since_recommendation:.1f}x since recommended!\n"
                         f"Wallet: <code>{wallet}</code>\n"
@@ -1446,6 +1511,63 @@ def run_pump_check(run_id):
                         "UPDATE wallet_token_history SET pumped_since_recommendation_alerted = TRUE WHERE wallet=%s AND token_mint=%s",
                         (wallet, mint)
                     )
+
+                if not suspect and not momentum_alerted and score >= 70:
+                    c.execute(
+                        """
+                        INSERT INTO token_scan_log
+                            (wallet, token_mint, price, liquidity, vol_5m, vol_h1,
+                             pc_5m, pc_h1, pc_h6, buys_5m, sells_5m, momentum_score,
+                             multiplier_from_first_buy, drawdown_from_first_buy,
+                             liquidity_delta_pct, momentum_alert_fired, pump_alert_fired,
+                             multiplier_since_recommendation, market_cap, suspect_data)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        RETURNING id
+                        """,
+                        (
+                            wallet, mint, current_price, details.get("liquidity"),
+                            details.get("vol_5m"), details.get("vol_h1"),
+                            details.get("pc_5m"), details.get("pc_h1"), details.get("pc_h6"),
+                            details.get("buys_5m"), details.get("sells_5m"), score,
+                            multiplier_from_first_buy, drawdown, liquidity_delta_pct,
+                            False, pump_alert_fired, multiplier_since_recommendation,
+                            current_market_cap, suspect
+                        )
+                    )
+                    inserted_scan_id = c.fetchone()[0]
+                    conn.commit()
+
+                    qualifying_tokens.append({
+                        "wallet": wallet, "mint": mint, "pair": pair,
+                        "score": score, "details": details,
+                        "current_price": current_price, "current_market_cap": current_market_cap,
+                        "liquidity_delta_pct": liquidity_delta_pct,
+                        "prior_liq_delta": prior_liq_delta, "prior_pc_5m": prior_pc_5m,
+                        "current_trajectory": current_trajectory,
+                        "scan_log_id": inserted_scan_id,
+                    })
+                else:
+                    c.execute(
+                        """
+                        INSERT INTO token_scan_log
+                            (wallet, token_mint, price, liquidity, vol_5m, vol_h1,
+                             pc_5m, pc_h1, pc_h6, buys_5m, sells_5m, momentum_score,
+                             multiplier_from_first_buy, drawdown_from_first_buy,
+                             liquidity_delta_pct, momentum_alert_fired, pump_alert_fired,
+                             multiplier_since_recommendation, market_cap, suspect_data)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            wallet, mint, current_price, details.get("liquidity"),
+                            details.get("vol_5m"), details.get("vol_h1"),
+                            details.get("pc_5m"), details.get("pc_h1"), details.get("pc_h6"),
+                            details.get("buys_5m"), details.get("sells_5m"), score,
+                            multiplier_from_first_buy, drawdown, liquidity_delta_pct,
+                            False, pump_alert_fired, multiplier_since_recommendation,
+                            current_market_cap, suspect
+                        )
+                    )
+                    conn.commit()
 
                 if decline_alert_needed:
                     c.execute(
@@ -1469,29 +1591,7 @@ def run_pump_check(run_id):
                             "UPDATE wallet_token_history SET decline_alert_fired = TRUE WHERE wallet=%s AND token_mint=%s",
                             (wallet, mint)
                         )
-
-                c.execute(
-                    """
-                    INSERT INTO token_scan_log
-                        (wallet, token_mint, price, liquidity, vol_5m, vol_h1,
-                         pc_5m, pc_h1, pc_h6, buys_5m, sells_5m, momentum_score,
-                         multiplier_from_first_buy, drawdown_from_first_buy,
-                         liquidity_delta_pct, momentum_alert_fired, pump_alert_fired,
-                         multiplier_since_recommendation, market_cap, suspect_data)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    """,
-                    (
-                        wallet, mint, current_price, details.get("liquidity"),
-                        details.get("vol_5m"), details.get("vol_h1"),
-                        details.get("pc_5m"), details.get("pc_h1"), details.get("pc_h6"),
-                        details.get("buys_5m"), details.get("sells_5m"), score,
-                        multiplier_from_first_buy, drawdown, liquidity_delta_pct,
-                        momentum_alert_fired, pump_alert_fired, multiplier_since_recommendation,
-                        current_market_cap, suspect
-                    )
-                )
-
-                conn.commit()
+                        conn.commit()
 
             except psycopg2.OperationalError as db_err:
                 print(f"DB connection dropped mid-scan on {mint}: {db_err} — reconnecting")
@@ -1512,7 +1612,25 @@ def run_pump_check(run_id):
                     pass
                 continue
 
-        print(f"check_pumps finished — checked {checked} tokens")
+        if qualifying_tokens:
+            seen_mints = set()
+            deduped = []
+            for item in qualifying_tokens:
+                if item["mint"] in seen_mints:
+                    print(f"⚠️ Skipping duplicate qualifying token {item['mint']} (wallet {item['wallet']}) — already queued from another wallet this cycle")
+                    continue
+                seen_mints.add(item["mint"])
+                deduped.append(item)
+            qualifying_tokens = deduped
+
+            print(f"Gate-checking {len(qualifying_tokens)} qualifying tokens concurrently...")
+            with ThreadPoolExecutor(max_workers=min(len(qualifying_tokens), 10)) as outer_executor:
+                gate_results = list(outer_executor.map(_gate_check_one_token, qualifying_tokens))
+
+            for result in gate_results:
+                _apply_gate_result(result)
+
+        print(f"check_pumps finished — checked {checked} tokens, {len(qualifying_tokens)} qualified for gate-check")
 
     except Exception as e:
         print(f"check_pumps error: {e}")
