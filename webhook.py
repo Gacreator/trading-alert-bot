@@ -631,7 +631,12 @@ def score_momentum(pair, liquidity_delta_pct=None, prior_liquidity_delta_pct=Non
     elif buy_trajectory == "falling":
         score -= 12
 
-    return round(max(0, score)), details
+    market_cap = pair.get("fdv", 0) or 0
+    details["market_cap_used"] = market_cap
+    if market_cap < 300000:
+        score += 5
+
+    return round(max(0, min(100, score))), details
 
 
 def get_prior_scan_snapshot(mint):
