@@ -21,6 +21,7 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 HELIUS_API_KEY = os.environ.get("HELIUS_API_KEY")
 JUPITER_API_KEY = os.environ.get("JUPITER_API_KEY")
 RUGCHECK_API_KEY = os.environ.get("RUGCHECK_API_KEY")
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
 
 TRACKED_WALLETS = set(
     w.strip() for w in os.environ.get("TRACKED_WALLETS", "").split(",") if w.strip()
@@ -999,8 +1000,12 @@ def extract_wallet_buys(tx, wallet):
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.json
+    incoming_secret = request.headers.get("Authorization")
+    if incoming_secret != WEBHOOK_SECRET:
+        return "unauthorized", 401
 
+    data = request.json
+    
     if not data:
         print("Webhook received empty or non-JSON body")
         return "no data", 400
