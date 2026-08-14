@@ -1556,7 +1556,7 @@ def _check_paper_trades():
             trailing_stop_hit = (
                 new_peak > 0
                 and current_price <= new_peak * 0.7
-                and current_price > entry_price * 0.7
+                and (any_profit_taken or current_price > entry_price * 0.7)
             )
 
             if stop_loss_hit and new_remaining > 0:
