@@ -6764,6 +6764,109 @@ def check_lowcap_quality_interaction():
             put_conn(conn)
 
 
+@app.route("/export-shadow-dataset")
+def export_shadow_dataset():
+    since_param, until_param = get_date_filter_params()
+    hours = request.args.get("hours", "1")
+    try:
+        hours = float(hours)
+    except (TypeError, ValueError):
+        hours = 1.0
+
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        query = """
+            SELECT
+                h.wallet, h.token_mint,
+                s.momentum_score,
+                h.market_cap_at_recommendation,
+                h.rugcheck_score_at_recommendation,
+                h.top1_holder_pct_at_recommendation,
+                h.historical_peak_ratio_at_recommendation,
+                h.buy_trajectory_at_recommendation,
+                h.buy_count_at_recommendation,
+                h.cluster_count_at_recommendation,
+                h.clean_signal_tier_at_recommendation,
+                h.conviction_tier_at_recommendation,
+                h.liquidity_trend_points_at_recommendation,
+                h.liquidity_level_points_at_recommendation,
+                h.price_window_points_at_recommendation,
+                h.volume_sanity_points_at_recommendation,
+                h.sellable_check_result,
+                h.recommended_at,
+                h.max_multiplier_since_recommendation,
+                h.pumped_since_recommendation_alerted
+            FROM wallet_token_history h
+            JOIN token_scan_log s
+                ON s.wallet = h.wallet AND s.token_mint = h.token_mint
+                AND s.momentum_alert_fired = TRUE
+            WHERE h.momentum_alerted = TRUE
+        """
+        params = []
+        if since_param:
+            query += " AND h.recommended_at >= %s"
+            params.append(since_param)
+        if until_param:
+            query += " AND h.recommended_at < %s"
+            params.append(until_param)
+
+        c.execute(query, params)
+        rows = c.fetchall()
+        c.close()
+        put_conn(conn)
+        conn = None
+
+        if not rows:
+            return {"rows": [], "count": 0}
+
+        held_map = get_held_map(hours)
+
+        columns = [
+            "wallet", "token_mint", "score", "market_cap", "rugcheck_score",
+            "top1_holder_pct", "historical_peak_ratio",
+            "buy_trajectory", "buy_count", "cluster_count", "clean_signal_tier",
+            "conviction_tier", "liquidity_trend_points", "liquidity_level_points",
+            "price_window_points", "volume_sanity_points", "sellable_check_result",
+            "recommended_at", "max_multiplier_since_recommendation",
+            "pumped_since_recommendation_alerted"
+        ]
+
+        dataset = []
+        for row in rows:
+            wallet, mint = row[0], row[1]
+            record = dict(zip(columns, row))
+
+            touched_3x = bool(record["pumped_since_recommendation_alerted"]) or (
+                record["max_multiplier_since_recommendation"] is not None
+                and float(record["max_multiplier_since_recommendation"]) >= 3
+            )
+            held = held_map.get((wallet, mint))
+
+            record["touched_3x"] = touched_3x
+            record["held_50pct"] = held if held is not None else None
+
+            for k, v in record.items():
+                if hasattr(v, "isoformat"):
+                    record[k] = v.isoformat()
+                elif hasattr(v, "__float__") and not isinstance(v, (bool, int)):
+                    try:
+                        record[k] = float(v)
+                    except (TypeError, ValueError):
+                        pass
+
+            dataset.append(record)
+
+        return {"rows": dataset, "count": len(dataset)}
+
+    except Exception as e:
+        return {"error": str(e)}, 500
+
+    finally:
+        if conn:
+            put_conn(conn)
+
+
 @app.route("/recommendation/<mint>")
 def recommendation_lookup(mint):
     conn = get_conn()
