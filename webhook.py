@@ -22,6 +22,7 @@ HELIUS_API_KEY = os.environ.get("HELIUS_API_KEY")
 JUPITER_API_KEY = os.environ.get("JUPITER_API_KEY")
 RUGCHECK_API_KEY = os.environ.get("RUGCHECK_API_KEY")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
+TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET")
 
 TRACKED_WALLETS = set(
     w.strip() for w in os.environ.get("TRACKED_WALLETS", "").split(",") if w.strip()
