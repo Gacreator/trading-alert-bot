@@ -388,7 +388,7 @@ def ask_queen(user_message, extra_context=""):
 
 def get_pumpfun_data(mint):
     try:
-        url = f"https://frontend-api.pump.fun/coins/{mint}"
+        url = f"https://frontend-api-v3.pump.fun/coins/{mint}"
         resp = requests.get(url, timeout=5, headers={"User-Agent": "Mozilla/5.0"})
         if resp.status_code != 200:
             return None
