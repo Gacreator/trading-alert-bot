@@ -6359,6 +6359,85 @@ def check_gate_blocked_otherwise_clean():
             put_conn(conn)
 
 
+@app.route("/check-lowcap-quality-interaction")
+def check_lowcap_quality_interaction():
+    """
+    Splits under-300K-market-cap recommendations into "also scored 85+"
+    vs "scored 70-84" to test whether the market cap signal is real on
+    its own, or only meaningful when combined with an already-strong
+    score elsewhere.
+    """
+    since_param, until_param = get_date_filter_params()
+    hours = request.args.get("hours", "1")
+    try:
+        hours = float(hours)
+    except (TypeError, ValueError):
+        hours = 1.0
+
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        query = """
+            SELECT h.wallet, h.token_mint, s.momentum_score,
+                   h.max_multiplier_since_recommendation,
+                   h.pumped_since_recommendation_alerted
+            FROM wallet_token_history h
+            JOIN token_scan_log s
+                ON s.wallet = h.wallet AND s.token_mint = h.token_mint
+                AND s.momentum_alert_fired = TRUE
+            WHERE h.momentum_alerted = TRUE
+            AND h.market_cap_at_recommendation IS NOT NULL
+            AND h.market_cap_at_recommendation < 300000
+        """
+        params = []
+        if since_param:
+            query += " AND h.recommended_at >= %s"
+            params.append(since_param)
+        if until_param:
+            query += " AND h.recommended_at < %s"
+            params.append(until_param)
+
+        c.execute(query, params)
+        rows = c.fetchall()
+        c.close()
+        put_conn(conn)
+        conn = None
+
+        if not rows:
+            return "No under-300K recommendation data yet.", 200
+
+        held_map = get_held_map(hours)
+
+        buckets = bucketize_outcome(
+            rows,
+            bucket_fn=lambda rest: "high score (85+)" if rest[2] is not None and rest[2] >= 85 else "lower score (70-84)",
+            bucket_order=["high score (85+)", "lower score (70-84)"],
+            held_map=held_map,
+            wallet_mint_fn=lambda row: (row[0], row[1])
+        )
+
+        range_label = ""
+        if since_param or until_param:
+            range_label = f"<br>Filtered: since={since_param or 'start'}, until={until_param or 'now'}<br>"
+
+        return format_bucket_report(
+            "Under-300K market cap: high score vs lower score",
+            buckets, ["high score (85+)", "lower score (70-84)"],
+            "If 'high score' shows meaningfully better held-rate than 'lower "
+            "score', the market cap bonus should be conditional on already "
+            "scoring well, not flat. If both are similar, the flat bonus "
+            "already applied is correctly designed.",
+            range_label=range_label
+        ), 200
+
+    except Exception as e:
+        return f"check_lowcap_quality_interaction error: {e}", 500
+
+    finally:
+        if conn:
+            put_conn(conn)
+
+
 @app.route("/recommendation/<mint>")
 def recommendation_lookup(mint):
     conn = get_conn()
