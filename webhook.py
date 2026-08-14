@@ -1422,9 +1422,49 @@ def _apply_gate_result(result):
             f"Recommending this now — tracking from this price to see if it delivers. DYOR."
         )
         send_bare_address_to_rick_chat(mint)
+        _open_paper_trade(wallet, mint, current_price, current_market_cap, result["rug_score"])
 
     except Exception as e:
         print(f"Error applying gate result for {mint}: {e}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        put_conn(conn)
+
+
+def _open_paper_trade(wallet, mint, current_price, current_market_cap, rug_score):
+    if current_market_cap is None or current_market_cap > 100000:
+        return
+    if rug_score is None:
+        return
+
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute(
+            "SELECT 1 FROM paper_trades WHERE wallet=%s AND token_mint=%s",
+            (wallet, mint)
+        )
+        if c.fetchone() is not None:
+            c.close()
+            return
+
+        c.execute(
+            """
+            INSERT INTO paper_trades
+                (wallet, token_mint, entry_price, peak_price, remaining_pct, status)
+            VALUES (%s, %s, %s, %s, 100, 'open')
+            """,
+            (wallet, mint, current_price, current_price)
+        )
+        conn.commit()
+        c.close()
+        print(f"📝 PAPER TRADE OPENED: wallet={wallet} token={mint} entry=${current_price} mc=${current_market_cap:,.0f}")
+
+    except Exception as e:
+        print(f"Error opening paper trade for {mint}: {e}")
         try:
             conn.rollback()
         except Exception:
