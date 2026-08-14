@@ -281,6 +281,26 @@ def init_db():
         c.execute("ALTER TABLE token_scan_log ADD COLUMN IF NOT EXISTS multiplier_since_recommendation NUMERIC")
         c.execute("ALTER TABLE token_scan_log ADD COLUMN IF NOT EXISTS market_cap NUMERIC")
         c.execute("ALTER TABLE token_scan_log ADD COLUMN IF NOT EXISTS suspect_data BOOLEAN DEFAULT FALSE")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS paper_trades (
+                id SERIAL PRIMARY KEY,
+                wallet TEXT,
+                token_mint TEXT,
+                entry_price NUMERIC,
+                entry_time TIMESTAMP DEFAULT NOW(),
+                peak_price NUMERIC,
+                remaining_pct NUMERIC DEFAULT 100,
+                tp_3x_hit BOOLEAN DEFAULT FALSE,
+                tp_10x_hit BOOLEAN DEFAULT FALSE,
+                tp_15x_hit BOOLEAN DEFAULT FALSE,
+                tp_30x_hit BOOLEAN DEFAULT FALSE,
+                status TEXT DEFAULT 'open',
+                close_reason TEXT,
+                closed_at TIMESTAMP,
+                realized_return_pct NUMERIC
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_paper_trades_status ON paper_trades (status)")
 
         conn.commit()
         c.close()
