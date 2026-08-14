@@ -134,6 +134,63 @@ def get_held_map(hours):
         put_conn(conn)
 
 
+def bucketize_outcome(rows, bucket_fn, bucket_order, held_map=None, wallet_mint_fn=None):
+    if held_map is not None and wallet_mint_fn is None:
+        raise ValueError("wallet_mint_fn is required when held_map is provided")
+
+    buckets = {k: {"touched_total": 0, "touched_hit": 0, "held_total": 0, "held_hit": 0} for k in bucket_order}
+
+    for row in rows:
+        max_mult, hit_3x = row[-2], row[-1]
+        rest = row[:-2]
+
+        key = bucket_fn(rest)
+        if key is None or key not in buckets:
+            continue
+
+        touched = bool(hit_3x) or (max_mult and max_mult >= 3)
+        buckets[key]["touched_total"] += 1
+        if touched:
+            buckets[key]["touched_hit"] += 1
+
+        if held_map is not None:
+            wallet, mint = wallet_mint_fn(row)
+            if (wallet, mint) in held_map:
+                buckets[key]["held_total"] += 1
+                if held_map[(wallet, mint)]:
+                    buckets[key]["held_hit"] += 1
+
+    return buckets
+
+
+def format_bucket_report(title, buckets, bucket_order, footer_note, range_label="", show_held=True):
+    if show_held:
+        any_held_data = any(d["held_total"] > 0 for d in buckets.values())
+        if not any_held_data:
+            raise ValueError(
+                "format_bucket_report called with show_held=True but no bucket "
+                "has any held_total — did you forget to pass held_map to bucketize_outcome?"
+            )
+
+    lines = [f"<b>{title}</b>{range_label}<br>"]
+    for key in bucket_order:
+        d = buckets[key]
+        t_total, t_hit = d["touched_total"], d["touched_hit"]
+        rate = f"{t_hit/t_total*100:.1f}%" if t_total else "n/a"
+        if show_held:
+            h_total, h_hit = d["held_total"], d["held_hit"]
+            h_rate = f"{h_hit/h_total*100:.1f}%" if h_total else "n/a"
+            lines.append(
+                f"<br><b>{key.upper()}</b><br>"
+                f"Touched 3x+: {t_hit}/{t_total} ({rate})<br>"
+                f"Held 50%+: {h_hit}/{h_total} ({h_rate})"
+            )
+        else:
+            lines.append(f"<br>{key}: {t_hit}/{t_total} hit 3x+ ({rate})")
+    lines.append(f"<br><br>{footer_note}")
+    return "<br>".join(lines)
+
+
 def init_db():
     conn = get_conn()
     try:
