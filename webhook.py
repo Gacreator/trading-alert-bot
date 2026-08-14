@@ -754,6 +754,7 @@ def get_rugcheck_data(mint):
         headers = {"X-API-KEY": RUGCHECK_API_KEY} if RUGCHECK_API_KEY else {}
         resp = requests.get(url, headers=headers, timeout=5)
         if resp.status_code != 200:
+            print(f"⚠️ RugCheck non-200 for {mint}: HTTP {resp.status_code} — {resp.text[:200]}")
             return None, None
         data = resp.json()
         risk_score = data.get("score_normalised")
