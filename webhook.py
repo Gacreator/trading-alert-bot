@@ -1552,21 +1552,25 @@ def _check_paper_trades():
 
             any_profit_taken = new_tp_3x or new_tp_10x or new_tp_15x or new_tp_30x
 
-            trailing_stop_hit = new_peak > 0 and current_price <= new_peak * 0.7
             stop_loss_hit = (not any_profit_taken) and current_price <= entry_price * 0.7
+            trailing_stop_hit = (
+                new_peak > 0
+                and current_price <= new_peak * 0.7
+                and current_price > entry_price * 0.7
+            )
 
-            if trailing_stop_hit and new_remaining > 0:
-                realized_this_cycle += new_remaining * multiplier
-                print(f"🔻 PAPER TRAILING STOP for {mint}: sold remaining {new_remaining}% at {multiplier:.1f}x (peak was {new_peak/entry_price:.1f}x)")
-                new_remaining = 0
-                closed = True
-                close_reason = "trailing_stop"
-            elif stop_loss_hit and new_remaining > 0:
+            if stop_loss_hit and new_remaining > 0:
                 realized_this_cycle += new_remaining * multiplier
                 print(f"🛑 PAPER STOP LOSS for {mint}: sold remaining {new_remaining}% at {multiplier:.1f}x")
                 new_remaining = 0
                 closed = True
                 close_reason = "stop_loss"
+            elif trailing_stop_hit and new_remaining > 0:
+                realized_this_cycle += new_remaining * multiplier
+                print(f"🔻 PAPER TRAILING STOP for {mint}: sold remaining {new_remaining}% at {multiplier:.1f}x (peak was {new_peak/entry_price:.1f}x)")
+                new_remaining = 0
+                closed = True
+                close_reason = "trailing_stop"
             elif new_remaining <= 0:
                 closed = True
                 close_reason = "full_take_profit"
