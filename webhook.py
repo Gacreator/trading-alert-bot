@@ -1693,6 +1693,10 @@ def check_pumps():
 
 @app.route("/telegram", methods=["POST"])
 def telegram_webhook():
+    incoming_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+    if incoming_secret != TELEGRAM_WEBHOOK_SECRET:
+        return "unauthorized", 401
+
     update = request.json
     print("📩 Telegram update:", update)
 
