@@ -1422,7 +1422,7 @@ def _apply_gate_result(result):
             f"Recommending this now — tracking from this price to see if it delivers. DYOR."
         )
         send_bare_address_to_rick_chat(mint)
-        _open_paper_trade(wallet, mint, current_price, current_market_cap, result["rug_score"])
+        _open_paper_trade(wallet, mint, current_price, current_market_cap, result["rug_score"], score)
 
     except Exception as e:
         print(f"Error applying gate result for {mint}: {e}")
@@ -1434,7 +1434,9 @@ def _apply_gate_result(result):
         put_conn(conn)
 
 
-def _open_paper_trade(wallet, mint, current_price, current_market_cap, rug_score):
+def _open_paper_trade(wallet, mint, current_price, current_market_cap, rug_score, score):
+    if score != 100:
+        return
     if current_market_cap is None or current_market_cap > 100000:
         return
     if rug_score is None:
