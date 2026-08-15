@@ -1700,7 +1700,7 @@ def _apply_gate_result(result):
 
 
 def _open_paper_trade(wallet, mint, current_price, current_market_cap, rug_score, score):
-    if score != 100:
+    if score < 85:
         return
     if current_market_cap is None or current_market_cap > 100000:
         return
