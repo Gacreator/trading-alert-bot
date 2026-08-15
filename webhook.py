@@ -36,7 +36,7 @@ MAX_CONCURRENT_DEXSCREENER = int(os.environ.get("MAX_CONCURRENT_DEXSCREENER", "5
 DB_CONN_REFRESH_EVERY = int(os.environ.get("DB_CONN_REFRESH_EVERY", "150"))
 
 MAX_PLAUSIBLE_MULTIPLIER = float(os.environ.get("MAX_PLAUSIBLE_MULTIPLIER", "50"))
-MAX_PLAUSIBLE_PC_H6 = float(os.environ.get("MAX_PLAUSIBLE_PC_H6", "5000"))
+MAX_PLAUSIBLE_PC_H6 = float(os.environ.get("MAX_PLAUSIBLE_PC_H6", "20000"))
 
 QUEEN_SYSTEM_PROMPT = (
     "You are 'Queen' — the user's witty, confident friend who happens to run a Solana trading "
