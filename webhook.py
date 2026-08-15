@@ -249,6 +249,16 @@ def init_db():
                 bought_at TIMESTAMP DEFAULT NOW()
             )
         """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS queen_conversations (
+                id SERIAL PRIMARY KEY,
+                chat_id TEXT,
+                role TEXT,
+                content TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_queen_conv_chat_time ON queen_conversations (chat_id, created_at)")
 
         c.execute("""
             CREATE TABLE IF NOT EXISTS token_scan_log (
@@ -357,7 +367,7 @@ def send_bare_address_to_rick_chat(mint):
         print(f"Failed to send Rick address ping: {e}")
 
 
-def ask_queen(user_message, extra_context=""):
+def ask_queen(user_message, extra_context="", chat_id=None):
     if not GROQ_API_KEY:
         return "My AI brain isn't wired up yet — ask my creator to add the Groq key."
 
@@ -369,6 +379,12 @@ def ask_queen(user_message, extra_context=""):
     messages = [{"role": "system", "content": QUEEN_SYSTEM_PROMPT}]
     if extra_context:
         messages.append({"role": "system", "content": f"Context: {extra_context}"})
+
+    if chat_id is not None:
+        history = get_queen_history(chat_id)
+        for role, content in history:
+            messages.append({"role": role, "content": content})
+
     messages.append({"role": "user", "content": user_message})
 
     payload = {
@@ -380,10 +396,54 @@ def ask_queen(user_message, extra_context=""):
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=15)
         data = resp.json()
-        return data["choices"][0]["message"]["content"]
+        reply = data["choices"][0]["message"]["content"]
+        if chat_id is not None:
+            save_queen_message(chat_id, "user", user_message)
+            save_queen_message(chat_id, "assistant", reply)
+        return reply
     except Exception as e:
         print(f"Groq error: {e}")
         return "Ugh, brain fog moment — try me again in a sec."
+
+
+def get_queen_history(chat_id, limit=10):
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT role, content FROM queen_conversations
+            WHERE chat_id = %s
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            (str(chat_id), limit)
+        )
+        rows = c.fetchall()
+        c.close()
+        return list(reversed(rows))
+    finally:
+        put_conn(conn)
+
+
+def save_queen_message(chat_id, role, content):
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO queen_conversations (chat_id, role, content) VALUES (%s, %s, %s)",
+            (str(chat_id), role, content)
+        )
+        conn.commit()
+        c.close()
+    except Exception as e:
+        print(f"Error saving queen message: {e}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        put_conn(conn)
 
 
 def get_pumpfun_data(mint):
@@ -2079,7 +2139,7 @@ def telegram_webhook():
         handle_lore_request(stripped, chat_id)
 
     else:
-        reply = ask_queen(text)
+        reply = ask_queen(text, chat_id=chat_id)
         send_telegram_alert(reply, chat_id)
 
     return "ok", 200
