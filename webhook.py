@@ -94,6 +94,17 @@ QUEEN_TOOLS = [
                 "required": ["mint"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_bot_stats",
+            "description": "Get overall bot statistics: total tokens tracked, total recommendations made, and recommendation hit rate.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
     }
 ]
 
@@ -465,6 +476,8 @@ def ask_queen(user_message, extra_context="", chat_id=None):
                     result = tool_check_paper_trading_summary()
                 elif func_name == "check_current_price":
                     result = tool_check_current_price(func_args.get("mint", ""))
+                elif func_name == "check_bot_stats":
+                    result = tool_check_bot_stats()
                 else:
                     result = "Unknown tool."
 
@@ -611,6 +624,31 @@ def tool_check_current_price(mint):
     liquidity = pair.get("liquidity", {}).get("usd", 0) or 0
 
     return f"Current price: ${price}. Market cap: ${market_cap:,.0f}. Liquidity: ${liquidity:,.0f}."
+
+
+def tool_check_bot_stats():
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM wallet_token_history")
+        total_tokens = c.fetchone()[0]
+
+        c.execute("SELECT COUNT(*) FROM wallet_token_history WHERE momentum_alerted = TRUE")
+        total_recommended = c.fetchone()[0]
+
+        c.execute("SELECT COUNT(*) FROM wallet_token_history WHERE momentum_alerted = TRUE AND pumped_since_recommendation_alerted = TRUE")
+        paid_off = c.fetchone()[0]
+
+        c.close()
+    finally:
+        put_conn(conn)
+
+    rate = f"{paid_off/total_recommended*100:.1f}%" if total_recommended else "n/a"
+    return (
+        f"Tracking {total_tokens} tokens total. "
+        f"{total_recommended} recommended. "
+        f"{paid_off} confirmed hit 3x+ ({rate} hit rate)."
+    )
 
 
 def get_pumpfun_data(mint):
