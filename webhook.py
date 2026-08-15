@@ -3,6 +3,7 @@ import os
 import re
 import time
 import datetime
+import json
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -47,6 +48,26 @@ QUEEN_SYSTEM_PROMPT = (
     "since this is a Telegram chat. Never break character, but stay strictly accurate to any facts "
     "given to you — never invent usernames, links, or data that wasn't provided."
 )
+
+QUEEN_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "check_recommendation",
+            "description": "Look up whether a specific token mint address was recommended, and its current status.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "mint": {
+                        "type": "string",
+                        "description": "The Solana token mint address to look up"
+                    }
+                },
+                "required": ["mint"]
+            }
+        }
+    }
+]
 
 SOLANA_ADDRESS_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 
@@ -391,16 +412,54 @@ def ask_queen(user_message, extra_context="", chat_id=None):
         "model": "llama-3.3-70b-versatile",
         "messages": messages,
         "max_tokens": 300,
-        "temperature": 0.9
+        "temperature": 0.9,
+        "tools": QUEEN_TOOLS,
+        "tool_choice": "auto"
     }
+
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=15)
         data = resp.json()
-        reply = data["choices"][0]["message"]["content"]
+        message = data["choices"][0]["message"]
+
+        tool_calls = message.get("tool_calls")
+
+        if tool_calls:
+            messages.append(message)
+
+            for tool_call in tool_calls:
+                func_name = tool_call["function"]["name"]
+                func_args = json.loads(tool_call["function"]["arguments"])
+
+                if func_name == "check_recommendation":
+                    result = tool_check_recommendation(func_args.get("mint", ""))
+                else:
+                    result = "Unknown tool."
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "content": result
+                })
+
+            payload2 = {
+                "model": "llama-3.3-70b-versatile",
+                "messages": messages,
+                "max_tokens": 300,
+                "temperature": 0.9
+            }
+            resp2 = requests.post(url, headers=headers, json=payload2, timeout=15)
+            data2 = resp2.json()
+            reply = data2["choices"][0]["message"]["content"]
+        else:
+            reply = message["content"]
+
         if chat_id is not None:
             save_queen_message(chat_id, "user", user_message)
             save_queen_message(chat_id, "assistant", reply)
+
         return reply
+
     except Exception as e:
         print(f"Groq error: {e}")
         return "Ugh, brain fog moment — try me again in a sec."
@@ -444,6 +503,35 @@ def save_queen_message(chat_id, role, content):
             pass
     finally:
         put_conn(conn)
+
+
+def tool_check_recommendation(mint):
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT price_at_recommendation, recommended_at,
+                   max_multiplier_since_recommendation,
+                   pumped_since_recommendation_alerted
+            FROM wallet_token_history
+            WHERE token_mint = %s AND price_at_recommendation IS NOT NULL
+            ORDER BY recommended_at DESC
+            LIMIT 1
+        """, (mint,))
+        row = c.fetchone()
+        c.close()
+    finally:
+        put_conn(conn)
+
+    if not row or not row[0]:
+        return f"This token was never recommended."
+
+    price_at_rec, recommended_at, max_mult, paid_off = row
+    return (
+        f"Recommended at ${price_at_rec} on {recommended_at}. "
+        f"All-time high multiplier since: {f'{max_mult:.2f}x' if max_mult else 'n/a'}. "
+        f"3x confirmation fired: {'Yes' if paid_off else 'No'}."
+    )
 
 
 def get_pumpfun_data(mint):
