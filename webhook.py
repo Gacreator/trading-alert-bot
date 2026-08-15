@@ -66,6 +66,17 @@ QUEEN_TOOLS = [
                 "required": ["mint"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_paper_trading_summary",
+            "description": "Get a summary of the paper-trading agent's current performance, including open and closed positions, win rate, and average return.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
     }
 ]
 
@@ -433,6 +444,8 @@ def ask_queen(user_message, extra_context="", chat_id=None):
 
                 if func_name == "check_recommendation":
                     result = tool_check_recommendation(func_args.get("mint", ""))
+                elif func_name == "check_paper_trading_summary":
+                    result = tool_check_paper_trading_summary()
                 else:
                     result = "Unknown tool."
 
@@ -531,6 +544,41 @@ def tool_check_recommendation(mint):
         f"Recommended at ${price_at_rec} on {recommended_at}. "
         f"All-time high multiplier since: {f'{max_mult:.2f}x' if max_mult else 'n/a'}. "
         f"3x confirmation fired: {'Yes' if paid_off else 'No'}."
+    )
+
+
+def tool_check_paper_trading_summary():
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT status, close_reason, realized_return_pct
+            FROM paper_trades
+        """)
+        rows = c.fetchall()
+        c.close()
+    finally:
+        put_conn(conn)
+
+    if not rows:
+        return "No paper trades have opened yet."
+
+    open_count = sum(1 for r in rows if r[0] == "open")
+    closed = [r for r in rows if r[0] == "closed"]
+    closed_count = len(closed)
+
+    if not closed:
+        return f"{open_count} open paper position(s), no closed trades yet."
+
+    returns = [float(r[2]) / 100 for r in closed if r[2] is not None]
+    avg_return = sum(returns) / len(returns) if returns else 0
+    wins = sum(1 for r in returns if r > 1.0)
+    win_rate = wins / len(returns) * 100 if returns else 0
+
+    return (
+        f"{open_count} open position(s), {closed_count} closed. "
+        f"Average realized return on closed trades: {avg_return:.2f}x. "
+        f"Win rate: {wins}/{len(returns)} ({win_rate:.1f}%)."
     )
 
 
