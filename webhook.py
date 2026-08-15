@@ -77,6 +77,23 @@ QUEEN_TOOLS = [
                 "properties": {}
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_current_price",
+            "description": "Get the current live price and market cap of a specific token mint address.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "mint": {
+                        "type": "string",
+                        "description": "The Solana token mint address to check"
+                    }
+                },
+                "required": ["mint"]
+            }
+        }
     }
 ]
 
@@ -446,6 +463,8 @@ def ask_queen(user_message, extra_context="", chat_id=None):
                     result = tool_check_recommendation(func_args.get("mint", ""))
                 elif func_name == "check_paper_trading_summary":
                     result = tool_check_paper_trading_summary()
+                elif func_name == "check_current_price":
+                    result = tool_check_current_price(func_args.get("mint", ""))
                 else:
                     result = "Unknown tool."
 
@@ -580,6 +599,18 @@ def tool_check_paper_trading_summary():
         f"Average realized return on closed trades: {avg_return:.2f}x. "
         f"Win rate: {wins}/{len(returns)} ({win_rate:.1f}%)."
     )
+
+
+def tool_check_current_price(mint):
+    pair = get_dexscreener_single(mint)
+    if not pair:
+        return "Couldn't find current price data for this token — it may not have an active trading pair yet."
+
+    price = pair.get("priceUsd")
+    market_cap = pair.get("fdv", 0) or 0
+    liquidity = pair.get("liquidity", {}).get("usd", 0) or 0
+
+    return f"Current price: ${price}. Market cap: ${market_cap:,.0f}. Liquidity: ${liquidity:,.0f}."
 
 
 def get_pumpfun_data(mint):
