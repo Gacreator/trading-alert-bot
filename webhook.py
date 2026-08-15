@@ -7291,6 +7291,7 @@ def debug_token_buyers(mint):
     before_sig = None
     pages_fetched = 0
     max_pages = 20
+    oldest_ts_this_page = None
 
     try:
         while pages_fetched < max_pages:
@@ -7337,10 +7338,17 @@ def debug_token_buyers(mint):
                 break
 
         if not buyers:
+            oldest_reached = (
+                datetime.datetime.utcfromtimestamp(oldest_ts_this_page).isoformat()
+                if oldest_ts_this_page is not None else "unknown"
+            )
             return (
                 f"No token transfers found for {mint} between {start_str} and {end_str} "
-                f"UTC (checked {pages_fetched} pages of Helius history). Either genuinely "
-                f"no activity, or the window/mint needs double-checking.",
+                f"UTC (checked {pages_fetched} pages of Helius history, reaching back to "
+                f"{oldest_reached} UTC). If that date is more recent than your requested "
+                f"start time, the {max_pages}-page cap was hit before reaching your window "
+                f"— try increasing max_pages, or the token had less activity than expected "
+                f"between now and your target window.",
                 200
             )
 
