@@ -7252,7 +7252,8 @@ def debug_token(mint):
             SELECT wallet, token_mint, first_seen_at, buy_count,
                    price_at_first_buy, pumped_3x_alerted, momentum_alerted,
                    pumped_since_recommendation_alerted, last_checked_at,
-                   block_reason_at_last_attempt
+                   block_reason_at_last_attempt, token_name, token_symbol,
+                   has_logo, has_website, has_social
             FROM wallet_token_history
             WHERE token_mint = %s
         """, (mint,))
@@ -7263,7 +7264,7 @@ def debug_token(mint):
             return f"No row found in wallet_token_history for {mint} — the INSERT never actually created a row, despite any 'FIRST BUY DETECTED' log line.", 200
 
         lines = [f"<b>Raw wallet_token_history row(s) for {mint}:</b><br>"]
-        for wallet, token_mint, first_seen_at, buy_count, price_at_first_buy, pumped_3x, momentum_alerted, pumped_since_rec, last_checked, block_reason in rows:
+        for wallet, token_mint, first_seen_at, buy_count, price_at_first_buy, pumped_3x, momentum_alerted, pumped_since_rec, last_checked, block_reason, token_name, token_symbol, has_logo, has_website, has_social in rows:
             lines.append(
                 f"<br>Wallet: <code>{wallet}</code><br>"
                 f"first_seen_at: {first_seen_at}<br>"
@@ -7274,6 +7275,11 @@ def debug_token(mint):
                 f"pumped_since_recommendation_alerted: {pumped_since_rec}<br>"
                 f"last_checked_at: {last_checked}<br>"
                 f"block_reason_at_last_attempt: {block_reason or 'none recorded'}<br>"
+                f"token_name: {token_name or 'not captured'}<br>"
+                f"token_symbol: {token_symbol or 'not captured'}<br>"
+                f"has_logo: {has_logo}<br>"
+                f"has_website: {has_website}<br>"
+                f"has_social: {has_social}<br>"
             )
 
         return "<br>".join(lines), 200
