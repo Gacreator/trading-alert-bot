@@ -983,6 +983,12 @@ def score_momentum(pair, liquidity_delta_pct=None, prior_liquidity_delta_pct=Non
     if market_cap < 300000:
         score += 5
 
+    info = pair.get("info", {}) or {}
+    has_logo = bool(info.get("imageUrl"))
+    details["has_logo"] = has_logo
+    if not has_logo:
+        score -= 10
+
     return round(max(0, min(100, score))), details
 
 
