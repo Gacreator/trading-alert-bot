@@ -301,6 +301,9 @@ def init_db():
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS decline_alert_fired BOOLEAN DEFAULT FALSE")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS token_name TEXT")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS token_symbol TEXT")
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS has_logo BOOLEAN DEFAULT FALSE")
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS has_website BOOLEAN DEFAULT FALSE")
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS has_social BOOLEAN DEFAULT FALSE")
         c.execute("""
             CREATE TABLE IF NOT EXISTS wallet_buy_events (
                 id SERIAL PRIMARY KEY,
@@ -1637,6 +1640,11 @@ def _apply_gate_result(result):
         token_name = base_token.get("name")
         token_symbol = base_token.get("symbol")
 
+        info = pair.get("info", {}) or {}
+        has_logo = bool(info.get("imageUrl"))
+        has_website = bool(info.get("websites"))
+        has_social = bool(info.get("socials"))
+
         c.execute(
             "UPDATE token_scan_log SET momentum_alert_fired = TRUE WHERE id = %s",
             (item["scan_log_id"],)
@@ -1648,6 +1656,9 @@ def _apply_gate_result(result):
             SET momentum_alerted = TRUE,
                 token_name = %s,
                 token_symbol = %s,
+                has_logo = %s,
+                has_website = %s,
+                has_social = %s,
                 price_at_recommendation = %s,
                 recommended_at = NOW(),
                 market_cap_at_recommendation = %s,
@@ -1667,7 +1678,8 @@ def _apply_gate_result(result):
                 historical_peak_ratio_at_recommendation = %s
             WHERE wallet=%s AND token_mint=%s
             """,
-            (token_name, token_symbol, current_price, current_market_cap, result["rug_score"],
+            (token_name, token_symbol, has_logo, has_website, has_social,
+             current_price, current_market_cap, result["rug_score"],
              result["top1_pct"], len(cluster_wallets), current_buy_count,
              liquidity_trend_pts, liquidity_level_pts, price_window_pts, volume_sanity_pts,
              buy_trajectory, clean_tier, conv_tier, too_perfect_flag, result["sellable_str"],
