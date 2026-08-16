@@ -2221,6 +2221,15 @@ def check_pumps():
     return "started", 200
 
 
+@app.route("/check-paper-trades-fast", methods=["GET", "POST"])
+def check_paper_trades_fast():
+    try:
+        _check_paper_trades()
+        return "checked", 200
+    except Exception as e:
+        return f"check_paper_trades_fast error: {e}", 500
+
+
 @app.route("/telegram", methods=["POST"])
 def telegram_webhook():
     incoming_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
