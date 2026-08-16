@@ -299,6 +299,8 @@ def init_db():
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS historical_peak_ratio_at_recommendation NUMERIC")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS block_reason_at_last_attempt TEXT")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS decline_alert_fired BOOLEAN DEFAULT FALSE")
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS token_name TEXT")
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS token_symbol TEXT")
         c.execute("""
             CREATE TABLE IF NOT EXISTS wallet_buy_events (
                 id SERIAL PRIMARY KEY,
@@ -1631,6 +1633,10 @@ def _apply_gate_result(result):
         clean_tier_note = "🌟 STRONG SETUP (cleared all gates comfortably)\n" if clean_tier == "strong" else ""
         conv_tier_note = "💪 HIGH CONVICTION (wallet bought 15+ times)\n" if conv_tier == "high conviction" else ""
 
+        base_token = pair.get("baseToken", {}) or {}
+        token_name = base_token.get("name")
+        token_symbol = base_token.get("symbol")
+
         c.execute(
             "UPDATE token_scan_log SET momentum_alert_fired = TRUE WHERE id = %s",
             (item["scan_log_id"],)
@@ -1640,6 +1646,8 @@ def _apply_gate_result(result):
             """
             UPDATE wallet_token_history
             SET momentum_alerted = TRUE,
+                token_name = %s,
+                token_symbol = %s,
                 price_at_recommendation = %s,
                 recommended_at = NOW(),
                 market_cap_at_recommendation = %s,
@@ -1659,7 +1667,7 @@ def _apply_gate_result(result):
                 historical_peak_ratio_at_recommendation = %s
             WHERE wallet=%s AND token_mint=%s
             """,
-            (current_price, current_market_cap, result["rug_score"],
+            (token_name, token_symbol, current_price, current_market_cap, result["rug_score"],
              result["top1_pct"], len(cluster_wallets), current_buy_count,
              liquidity_trend_pts, liquidity_level_pts, price_window_pts, volume_sanity_pts,
              buy_trajectory, clean_tier, conv_tier, too_perfect_flag, result["sellable_str"],
