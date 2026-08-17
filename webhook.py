@@ -6853,6 +6853,76 @@ def check_paper_trade_characteristics():
         put_conn(conn)
 
 
+@app.route("/check-lowcap-loss-severity")
+def check_lowcap_loss_severity():
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT
+                p.token_mint, p.realized_return_pct, p.close_reason,
+                h.market_cap_at_recommendation
+            FROM paper_trades p
+            JOIN wallet_token_history h
+                ON h.wallet = p.wallet AND h.token_mint = p.token_mint
+            WHERE p.status = 'closed'
+            AND h.market_cap_at_recommendation IS NOT NULL
+        """)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return "No closed paper trades yet.", 200
+
+        under_20k = []
+        over_20k = []
+
+        for mint, realized_pct, close_reason, mcap in rows:
+            realized = float(realized_pct) / 100 if realized_pct is not None else None
+            if realized is None:
+                continue
+            mcap = float(mcap)
+            if mcap < 20000:
+                under_20k.append(realized)
+            else:
+                over_20k.append(realized)
+
+        def stats(bucket, label):
+            if not bucket:
+                return f"<br><b>{label}</b>: no examples"
+            n = len(bucket)
+            avg = sum(bucket) / n
+            losses = [r for r in bucket if r < 1.0]
+            avg_loss = sum(losses) / len(losses) if losses else None
+            worst = min(bucket)
+            return (
+                f"<br><b>{label}</b> (n={n})<br>"
+                f"Average return: {avg:.2f}x<br>"
+                f"Losing trades: {len(losses)}/{n}<br>"
+                f"Average loss size (when losing): {f'{avg_loss:.2f}x' if avg_loss else 'n/a'}<br>"
+                f"Worst single trade: {worst:.2f}x"
+            )
+
+        lines = ["<b>Loss severity: under $20K market cap vs $20K+:</b><br>"]
+        lines.append(stats(under_20k, "UNDER $20K"))
+        lines.append(stats(over_20k, "$20K AND ABOVE"))
+
+        lines.append(
+            "<br><br>If under-$20K shows a meaningfully HIGHER average loss "
+            "size (closer to 1.0x, i.e. smaller losses) than the $20K+ "
+            "group, that supports the theory that low market cap limits "
+            "downside severity. If similar or worse, the theory doesn't "
+            "hold up yet."
+        )
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_lowcap_loss_severity error: {e}", 500
+
+    finally:
+        put_conn(conn)
+
+
 @app.route("/check-gate-false-positive-rate")
 def check_gate_false_positive_rate():
     """
