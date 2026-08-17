@@ -6755,6 +6755,104 @@ def paper_trades_report():
         put_conn(conn)
 
 
+@app.route("/check-paper-trade-characteristics")
+def check_paper_trade_characteristics():
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT
+                p.token_mint, p.realized_return_pct, p.close_reason,
+                s.momentum_score,
+                h.market_cap_at_recommendation,
+                h.rugcheck_score_at_recommendation, h.top1_holder_pct_at_recommendation,
+                h.historical_peak_ratio_at_recommendation, h.buy_trajectory_at_recommendation,
+                h.buy_count_at_recommendation, h.clean_signal_tier_at_recommendation,
+                h.conviction_tier_at_recommendation
+            FROM paper_trades p
+            JOIN wallet_token_history h
+                ON h.wallet = p.wallet AND h.token_mint = p.token_mint
+            JOIN token_scan_log s
+                ON s.wallet = p.wallet AND s.token_mint = p.token_mint
+                AND s.momentum_alert_fired = TRUE
+            WHERE p.status = 'closed'
+        """)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return "No closed paper trades yet.", 200
+
+        big_winners = []
+        near_breakeven = []
+        losers = []
+
+        for row in rows:
+            realized = float(row[1]) / 100 if row[1] is not None else 0
+            if realized >= 3:
+                big_winners.append(row)
+            elif 0.85 <= realized < 3:
+                near_breakeven.append(row)
+            else:
+                losers.append(row)
+
+        def summarize(bucket, label):
+            if not bucket:
+                return f"<br><b>{label}</b>: no examples"
+            n = len(bucket)
+            scores = [float(r[3]) for r in bucket if r[3] is not None]
+            mcaps = [float(r[4]) for r in bucket if r[4] is not None]
+            rugs = [float(r[5]) for r in bucket if r[5] is not None]
+            holders = [float(r[6]) for r in bucket if r[6] is not None]
+            hist_ratios = [float(r[7]) for r in bucket if r[7] is not None]
+            buy_counts = [float(r[9]) for r in bucket if r[9] is not None]
+
+            def avg(vals):
+                return sum(vals) / len(vals) if vals else None
+
+            def fmt(v, kind="num"):
+                if v is None:
+                    return "n/a"
+                if kind == "usd":
+                    return f"${v:,.0f}"
+                return f"{v:.2f}"
+
+            trajectories = [r[8] for r in bucket if r[8]]
+            traj_counts = {}
+            for t in trajectories:
+                traj_counts[t] = traj_counts.get(t, 0) + 1
+
+            return (
+                f"<br><b>{label}</b> (n={n})<br>"
+                f"Avg score: {fmt(avg(scores))}<br>"
+                f"Avg market cap: {fmt(avg(mcaps), 'usd')}<br>"
+                f"Avg RugCheck: {fmt(avg(rugs))}<br>"
+                f"Avg holder %: {fmt(avg(holders))}<br>"
+                f"Avg historical ratio: {fmt(avg(hist_ratios))}<br>"
+                f"Avg buy count: {fmt(avg(buy_counts))}<br>"
+                f"Buy trajectory breakdown: {traj_counts}"
+            )
+
+        lines = ["<b>Paper trade outcome characteristics:</b><br>"]
+        lines.append(summarize(big_winners, "BIG WINNERS (3x+)"))
+        lines.append(summarize(near_breakeven, "NEAR BREAKEVEN (0.85x-3x)"))
+        lines.append(summarize(losers, "LOSERS (below 0.85x)"))
+
+        lines.append(
+            "<br><br>Compare averages across buckets — a metric that's "
+            "meaningfully different for BIG WINNERS vs LOSERS is a real "
+            "candidate signal. With this few trades, treat everything "
+            "as directional, not conclusive."
+        )
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_paper_trade_characteristics error: {e}", 500
+
+    finally:
+        put_conn(conn)
+
+
 @app.route("/check-gate-false-positive-rate")
 def check_gate_false_positive_rate():
     """
