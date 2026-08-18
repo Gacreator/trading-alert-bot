@@ -7819,13 +7819,19 @@ def debug_token_buyers(mint):
 def debug_twitter_signal(mint):
     symbol = request.args.get("symbol", "")
     signal = get_twitter_signal(mint, symbol)
-    time.sleep(5)
+    time.sleep(7)
     trends = get_twitter_trends()
     return {
         "mint": mint,
         "twitter_signal": signal,
         "sample_trends": trends[:10] if trends else None
     }
+
+
+@app.route("/debug-twitter-trends")
+def debug_twitter_trends():
+    trends = get_twitter_trends()
+    return {"trends": trends}
 
 
 @app.route("/token/<mint>")
