@@ -6923,6 +6923,79 @@ def check_lowcap_loss_severity():
         put_conn(conn)
 
 
+@app.route("/check-paper-trades-by-score")
+def check_paper_trades_by_score():
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT
+                p.token_mint, p.realized_return_pct,
+                s.momentum_score
+            FROM paper_trades p
+            JOIN wallet_token_history h
+                ON h.wallet = p.wallet AND h.token_mint = p.token_mint
+            JOIN token_scan_log s
+                ON s.wallet = p.wallet AND s.token_mint = p.token_mint
+                AND s.momentum_alert_fired = TRUE
+            WHERE p.status = 'closed'
+        """)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return "No closed paper trades yet.", 200
+
+        buckets = {
+            "85-89": [],
+            "90-94": [],
+            "95-100": [],
+        }
+
+        for mint, realized_pct, score in rows:
+            if score is None or realized_pct is None:
+                continue
+            realized = float(realized_pct) / 100
+            score = float(score)
+            if 85 <= score < 90:
+                key = "85-89"
+            elif 90 <= score < 95:
+                key = "90-94"
+            elif score >= 95:
+                key = "95-100"
+            else:
+                continue
+            buckets[key].append(realized)
+
+        lines = ["<b>Paper trade performance by score bucket:</b><br>"]
+        for key, vals in buckets.items():
+            if not vals:
+                lines.append(f"<br>{key}: no data")
+                continue
+            n = len(vals)
+            avg = sum(vals) / n
+            wins = sum(1 for v in vals if v > 1.0)
+            win_rate = wins / n * 100
+            lines.append(
+                f"<br><b>Score {key}</b> (n={n})<br>"
+                f"Average return: {avg:.2f}x<br>"
+                f"Win rate: {wins}/{n} ({win_rate:.1f}%)"
+            )
+
+        lines.append(
+            "<br><br>If higher score buckets show meaningfully better "
+            "average return and win rate, score is a real predictor within "
+            "this range."
+        )
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_paper_trades_by_score error: {e}", 500
+
+    finally:
+        put_conn(conn)
+
+
 @app.route("/check-gate-false-positive-rate")
 def check_gate_false_positive_rate():
     """
