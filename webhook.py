@@ -1664,6 +1664,36 @@ def _gate_check_one_token(item):
     return result
 
 
+def _compute_early_stage_score(mint, symbol, pair):
+    rug_score, rug_liq_flags = get_rugcheck_data(mint)
+    holder_data = get_top_holder_concentration(mint, pair.get("pairAddress"))
+    twitter_signal = get_twitter_signal(mint, symbol)
+
+    top1_pct = holder_data.get("top1_pct") if holder_data else None
+
+    rug_pass = rug_score is not None and rug_score <= 30
+    holder_pass = top1_pct is not None and top1_pct < 7
+    twitter_pass = (
+        twitter_signal is not None
+        and twitter_signal.get("has_kol")
+        and twitter_signal.get("mention_count", 0) >= 5
+        and (twitter_signal.get("avg_sentiment") or 0) >= 0.3
+    )
+
+    passed = sum([rug_pass, holder_pass, twitter_pass])
+    early_score = round((85 / 3) * passed)
+
+    return {
+        "early_score": early_score,
+        "rug_pass": rug_pass,
+        "holder_pass": holder_pass,
+        "twitter_pass": twitter_pass,
+        "twitter_signal": twitter_signal,
+        "rug_score": rug_score,
+        "top1_pct": top1_pct,
+    }
+
+
 def _apply_gate_result(result):
     """
     Writes the outcome of one gate-check to the database and sends the
@@ -2067,6 +2097,21 @@ def run_pump_check(run_id):
                 score, details = score_momentum(pair, liquidity_delta_pct, prior_liq_delta, current_trajectory)
                 current_liquidity = details.get("liquidity")
 
+                twitter_eligible = (
+                    not momentum_alerted
+                    and current_market_cap > 0 and current_market_cap < 20000
+                    and buy_count <= 2
+                    and score < 85
+                )
+                if twitter_eligible:
+                    base_token = pair.get("baseToken", {}) or {}
+                    symbol = base_token.get("symbol")
+                    early_result = _compute_early_stage_score(mint, symbol, pair)
+                    if early_result["early_score"] > score:
+                        print(f"🐦 Early-stage boost for {mint}: {early_result}")
+                        score = early_result["early_score"]
+                        details["early_stage_result"] = early_result
+                
                 multiplier_since_recommendation = None
                 if price_at_recommendation and current_price:
                     try:
