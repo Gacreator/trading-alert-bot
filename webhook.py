@@ -22,6 +22,7 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 HELIUS_API_KEY = os.environ.get("HELIUS_API_KEY")
 JUPITER_API_KEY = os.environ.get("JUPITER_API_KEY")
 RUGCHECK_API_KEY = os.environ.get("RUGCHECK_API_KEY")
+TWITTERAPI_KEY = os.environ.get("TWITTERAPI_KEY")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
 TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET")
 
@@ -1266,6 +1267,73 @@ def check_sellable_via_jupiter(mint, test_amount_lamports=10000000):
     except Exception as e:
         elapsed = time.time() - start_time
         print(f"⏱️ Jupiter sellability check error for {mint}: {e} (took {elapsed:.2f}s)")
+        return None
+
+
+def get_twitter_signal(mint, symbol, max_tweets=15):
+    if not TWITTERAPI_KEY:
+        return None
+
+    try:
+        url = "https://api.twitterapi.io/twitter/tweet/advanced_search"
+        headers = {"X-API-Key": TWITTERAPI_KEY}
+        query = f'"{mint}"'
+        if symbol:
+            query += f' OR "${symbol}"'
+        params = {
+            "query": query,
+            "queryType": "Latest",
+        }
+        resp = requests.get(url, headers=headers, params=params, timeout=8)
+        if resp.status_code != 200:
+            print(f"⚠️ Twitter search non-200 for {mint}: HTTP {resp.status_code} — {resp.text[:200]}")
+            return None
+
+        data = resp.json()
+        tweets = (data.get("tweets") or [])[:max_tweets]
+
+        if not tweets:
+            return {"mention_count": 0, "has_kol": False, "kol_handles": []}
+
+        kol_handles = []
+        for tweet in tweets:
+            author = tweet.get("author", {}) or {}
+            followers = author.get("followers", 0) or 0
+            if followers >= 10000:
+                handle = author.get("userName")
+                if handle:
+                    kol_handles.append(handle)
+
+        return {
+            "mention_count": len(tweets),
+            "has_kol": len(kol_handles) > 0,
+            "kol_handles": kol_handles,
+        }
+
+    except Exception as e:
+        print(f"Twitter signal error for {mint}: {e}")
+        return None
+
+
+def get_twitter_trends(woeid=1, count=30):
+    if not TWITTERAPI_KEY:
+        return None
+
+    try:
+        url = "https://api.twitterapi.io/twitter/trends"
+        headers = {"X-API-Key": TWITTERAPI_KEY}
+        params = {"woeid": woeid, "count": count}
+        resp = requests.get(url, headers=headers, params=params, timeout=8)
+        if resp.status_code != 200:
+            print(f"⚠️ Twitter trends non-200: HTTP {resp.status_code} — {resp.text[:200]}")
+            return None
+
+        data = resp.json()
+        trends = data.get("trends", [])
+        return [t.get("name") for t in trends if t.get("name")]
+
+    except Exception as e:
+        print(f"Twitter trends error: {e}")
         return None
 
 
@@ -7732,6 +7800,18 @@ def debug_token_buyers(mint):
 
     except Exception as e:
         return f"debug_token_buyers error: {e}", 500
+
+
+@app.route("/debug-twitter-signal/<mint>")
+def debug_twitter_signal(mint):
+    symbol = request.args.get("symbol", "")
+    signal = get_twitter_signal(mint, symbol)
+    trends = get_twitter_trends()
+    return {
+        "mint": mint,
+        "twitter_signal": signal,
+        "sample_trends": trends[:10] if trends else None
+    }
 
 
 @app.route("/token/<mint>")
