@@ -2046,7 +2046,7 @@ def run_pump_check(run_id):
 
                 if not suspect and not pumped_since_rec_alerted and price_at_recommendation \
                    and multiplier_since_recommendation and multiplier_since_recommendation >= 3 \
-                   and not (not momentum_alerted and score >= 70):
+                   and not (not momentum_alerted and score >= 85):
                     pump_alert_fired = True
                     mc_line = ""
                     if market_cap_at_recommendation:
@@ -2070,7 +2070,7 @@ def run_pump_check(run_id):
                         (wallet, mint)
                     )
 
-                if not suspect and not momentum_alerted and score >= 70:
+                if not suspect and not momentum_alerted and score >= 85:
                     c.execute(
                         """
                         INSERT INTO token_scan_log
