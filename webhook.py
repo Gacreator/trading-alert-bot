@@ -127,6 +127,7 @@ _connection_pool = pg_pool.ThreadedConnectionPool(
     keepalives_interval=10,
     keepalives_count=5,
 )
+_vader = SentimentIntensityAnalyzer()
 
 
 def get_conn():
