@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 import psycopg2
 from psycopg2 import pool as pg_pool
 import requests
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 app = Flask(__name__)
 
@@ -1294,18 +1295,31 @@ def get_twitter_signal(mint, symbol, max_tweets=15):
             return {"mention_count": 0, "has_kol": False, "kol_handles": []}
 
         kol_handles = []
+        sentiment_scores = []
+        kol_sentiments = []
+
         for tweet in tweets:
+            text = tweet.get("text", "") or ""
+            score = _vader.polarity_scores(text)["compound"]
+            sentiment_scores.append(score)
+
             author = tweet.get("author", {}) or {}
             followers = author.get("followers", 0) or 0
             if followers >= 10000:
                 handle = author.get("userName")
                 if handle:
                     kol_handles.append(handle)
+                    kol_sentiments.append(score)
+
+        avg_sentiment = sum(sentiment_scores) / len(sentiment_scores) if sentiment_scores else 0
+        avg_kol_sentiment = sum(kol_sentiments) / len(kol_sentiments) if kol_sentiments else None
 
         return {
             "mention_count": len(tweets),
             "has_kol": len(kol_handles) > 0,
             "kol_handles": kol_handles,
+            "avg_sentiment": round(avg_sentiment, 3),
+            "avg_kol_sentiment": round(avg_kol_sentiment, 3) if avg_kol_sentiment is not None else None,
         }
 
     except Exception as e:
