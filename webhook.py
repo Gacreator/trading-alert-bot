@@ -1999,7 +1999,7 @@ def run_pump_check(run_id):
             SELECT wallet, token_mint, price_at_first_buy, pumped_3x_alerted,
                    momentum_alerted, last_liquidity, price_at_recommendation,
                    pumped_since_recommendation_alerted, recommended_at,
-                   market_cap_at_recommendation
+                   market_cap_at_recommendation, buy_count
             FROM wallet_token_history
             WHERE first_seen_at > NOW() - (INTERVAL '1 hour' * %s)
         """, (SCAN_WINDOW_HOURS,))
@@ -2011,7 +2011,7 @@ def run_pump_check(run_id):
 
         for i, (wallet, mint, price_at_first_buy, pumped_alerted, momentum_alerted,
                 prev_liquidity, price_at_recommendation, pumped_since_rec_alerted,
-                recommended_at, market_cap_at_recommendation) in enumerate(rows):
+                recommended_at, market_cap_at_recommendation, buy_count) in enumerate(rows):
 
             if i > 0 and i % DB_CONN_REFRESH_EVERY == 0:
                 try:
