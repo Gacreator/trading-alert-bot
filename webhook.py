@@ -6996,6 +6996,91 @@ def check_paper_trades_by_score():
         put_conn(conn)
 
 
+@app.route("/check-buy-count-timing")
+def check_buy_count_timing():
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT
+                p.token_mint, p.realized_return_pct,
+                h.buy_count_at_recommendation, h.recommended_at
+            FROM paper_trades p
+            JOIN wallet_token_history h
+                ON h.wallet = p.wallet AND h.token_mint = p.token_mint
+            WHERE p.status = 'closed'
+        """)
+        rows = c.fetchall()
+        c.close()
+        put_conn(conn)
+        conn = None
+
+        if not rows:
+            return "No closed paper trades yet.", 200
+
+        conn2 = get_conn()
+        c2 = conn2.cursor()
+
+        results = []
+        for mint, realized_pct, buy_count_at_rec, recommended_at in rows:
+            c2.execute("""
+                SELECT MAX(buy_number) FROM wallet_buy_events
+                WHERE token_mint = %s
+            """, (mint,))
+            row = c2.fetchone()
+            final_buy_count = row[0] if row and row[0] else buy_count_at_rec
+            results.append((mint, realized_pct, buy_count_at_rec, final_buy_count))
+
+        c2.close()
+        put_conn(conn2)
+
+        near_breakeven = []
+        losers = []
+        for mint, realized_pct, at_rec, final in results:
+            if realized_pct is None or at_rec is None:
+                continue
+            realized = float(realized_pct) / 100
+            growth = (final - at_rec) if final else 0
+            entry = (mint, at_rec, final, growth)
+            if 0.85 <= realized < 3:
+                near_breakeven.append(entry)
+            elif realized < 0.85:
+                losers.append(entry)
+
+        def avg(vals):
+            return sum(vals) / len(vals) if vals else None
+
+        lines = ["<b>Buy count: entry vs continued buying, by outcome:</b><br>"]
+        for label, bucket in [("NEAR BREAKEVEN", near_breakeven), ("LOSERS", losers)]:
+            if not bucket:
+                lines.append(f"<br>{label}: no data")
+                continue
+            at_rec_avg = avg([b[1] for b in bucket])
+            final_avg = avg([b[2] for b in bucket])
+            growth_avg = avg([b[3] for b in bucket])
+            lines.append(
+                f"<br><b>{label}</b> (n={len(bucket)})<br>"
+                f"Avg buy count AT recommendation: {at_rec_avg:.1f}<br>"
+                f"Avg buy count at close: {final_avg:.1f}<br>"
+                f"Avg growth in buy count after recommendation: {growth_avg:.1f}"
+            )
+
+        lines.append(
+            "<br><br>If NEAR BREAKEVEN shows meaningfully more buy-count "
+            "GROWTH after recommendation than LOSERS, the effect is about "
+            "ongoing buying during the decline, not entry conviction — "
+            "meaning it can't be scored, only monitored live."
+        )
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_buy_count_timing error: {e}", 500
+
+    finally:
+        if conn:
+            put_conn(conn)
+
+
 @app.route("/check-gate-false-positive-rate")
 def check_gate_false_positive_rate():
     """
