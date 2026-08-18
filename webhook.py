@@ -1278,8 +1278,6 @@ def get_twitter_signal(mint, symbol, max_tweets=15):
         url = "https://api.twitterapi.io/twitter/tweet/advanced_search"
         headers = {"X-API-Key": TWITTERAPI_KEY}
         query = f'"{mint}"'
-        if symbol:
-            query += f' OR "${symbol}"'
         params = {
             "query": query,
             "queryType": "Latest",
@@ -7806,6 +7804,7 @@ def debug_token_buyers(mint):
 def debug_twitter_signal(mint):
     symbol = request.args.get("symbol", "")
     signal = get_twitter_signal(mint, symbol)
+    time.sleep(5)
     trends = get_twitter_trends()
     return {
         "mint": mint,
