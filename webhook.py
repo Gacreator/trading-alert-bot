@@ -24,6 +24,7 @@ HELIUS_API_KEY = os.environ.get("HELIUS_API_KEY")
 JUPITER_API_KEY = os.environ.get("JUPITER_API_KEY")
 RUGCHECK_API_KEY = os.environ.get("RUGCHECK_API_KEY")
 TWITTERAPI_KEY = os.environ.get("TWITTERAPI_KEY")
+SCRAPECREATORS_KEY = os.environ.get("SCRAPECREATORS_KEY")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
 TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET")
 
@@ -1348,6 +1349,61 @@ def get_twitter_trends(woeid=1, count=30):
 
     except Exception as e:
         print(f"Twitter trends error: {e}")
+        return None
+
+
+def get_tiktok_signal(query, max_videos=15):
+    if not SCRAPECREATORS_KEY:
+        return None
+    try:
+        url = "https://api.scrapecreators.com/v1/tiktok/search/keyword"
+        headers = {"x-api-key": SCRAPECREATORS_KEY}
+        params = {"query": query, "sort_by": "date-posted", "date_posted": "this-week"}
+        resp = requests.get(url, headers=headers, params=params, timeout=8)
+        if resp.status_code != 200:
+            print(f"⚠️ TikTok search non-200 for {query}: HTTP {resp.status_code} — {resp.text[:200]}")
+            return None
+
+        data = resp.json()
+        items = (data.get("search_item_list") or [])[:max_videos]
+
+        if not items:
+            return {"video_count": 0, "total_plays": 0, "total_likes": 0}
+
+        total_plays = 0
+        total_likes = 0
+        for item in items:
+            aweme = item.get("aweme_info", {}) or {}
+            stats = aweme.get("statistics", {}) or {}
+            total_plays += stats.get("play_count", 0) or 0
+            total_likes += stats.get("digg_count", 0) or 0
+
+        return {
+            "video_count": len(items),
+            "total_plays": total_plays,
+            "total_likes": total_likes,
+        }
+
+    except Exception as e:
+        print(f"TikTok signal error for {query}: {e}")
+        return None
+
+
+def get_tiktok_trending(region="US"):
+    if not SCRAPECREATORS_KEY:
+        return None
+    try:
+        url = "https://api.scrapecreators.com/v1/tiktok/get-trending-feed"
+        headers = {"x-api-key": SCRAPECREATORS_KEY}
+        params = {"region": region}
+        resp = requests.get(url, headers=headers, params=params, timeout=8)
+        if resp.status_code != 200:
+            print(f"⚠️ TikTok trending non-200: HTTP {resp.status_code} — {resp.text[:200]}")
+            return None
+        data = resp.json()
+        return data.get("aweme_list", [])
+    except Exception as e:
+        print(f"TikTok trending error: {e}")
         return None
 
 
@@ -7934,6 +7990,12 @@ def debug_twitter_signal(mint):
 def debug_twitter_trends():
     trends = get_twitter_trends()
     return {"trends": trends}
+
+
+@app.route("/debug-tiktok-signal/<query>")
+def debug_tiktok_signal(query):
+    signal = get_tiktok_signal(query)
+    return {"query": query, "tiktok_signal": signal}
 
 
 @app.route("/token/<mint>")
