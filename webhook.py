@@ -308,6 +308,12 @@ def init_db():
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS has_logo BOOLEAN DEFAULT FALSE")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS has_website BOOLEAN DEFAULT FALSE")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS has_social BOOLEAN DEFAULT FALSE")
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS twitter_mention_count INTEGER")
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS twitter_has_kol BOOLEAN")
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS twitter_avg_sentiment NUMERIC")
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS tiktok_video_count INTEGER")
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS tiktok_total_plays BIGINT")
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS tiktok_total_likes BIGINT")
         c.execute("""
             CREATE TABLE IF NOT EXISTS wallet_buy_events (
                 id SERIAL PRIMARY KEY,
@@ -1655,14 +1661,21 @@ def _gate_check_one_token(item):
 
     already_recommended_elsewhere = has_token_been_recommended_before(mint)
 
-    with ThreadPoolExecutor(max_workers=3) as gate_executor:
+    base_token = pair.get("baseToken", {}) or {}
+    symbol = base_token.get("symbol")
+
+    with ThreadPoolExecutor(max_workers=5) as gate_executor:
         rug_future = gate_executor.submit(get_rugcheck_data, mint)
         holder_future = gate_executor.submit(get_top_holder_concentration, mint, pair.get("pairAddress"))
         sellable_future = gate_executor.submit(check_sellable_via_jupiter, mint)
+        twitter_future = gate_executor.submit(get_twitter_signal, mint, symbol)
+        tiktok_future = gate_executor.submit(get_tiktok_signal, symbol) if symbol else None
 
         rug_score, rug_liq_flags = rug_future.result()
         holder_data = holder_future.result()
         sellable_result = sellable_future.result()
+        twitter_signal = twitter_future.result()
+        tiktok_signal = tiktok_future.result() if tiktok_future else None
 
     top1_pct = holder_data.get("top1_pct") if holder_data else None
     vol_h1_to_liq_ratio = details.get("vol_h1_to_liq_ratio", 0)
@@ -1698,6 +1711,8 @@ def _gate_check_one_token(item):
         "buy_sell_ratio_at_rec": buy_sell_ratio_at_rec,
         "sellable_str": sellable_str,
         "already_recommended_elsewhere": already_recommended_elsewhere,
+        "twitter_signal": twitter_signal,
+        "tiktok_signal": tiktok_signal,
     }
 
     if blocked:
@@ -1819,6 +1834,25 @@ def _apply_gate_result(result):
         has_website = bool(info.get("websites"))
         has_social = bool(info.get("socials"))
 
+        twitter_signal = result.get("twitter_signal")
+        tiktok_signal = result.get("tiktok_signal")
+
+        twitter_mention_count = twitter_signal.get("mention_count") if twitter_signal else None
+        twitter_has_kol = twitter_signal.get("has_kol") if twitter_signal else None
+        twitter_avg_sentiment = twitter_signal.get("avg_sentiment") if twitter_signal else None
+        tiktok_video_count = tiktok_signal.get("video_count") if tiktok_signal else None
+        tiktok_total_plays = tiktok_signal.get("total_plays") if tiktok_signal else None
+        tiktok_total_likes = tiktok_signal.get("total_likes") if tiktok_signal else None
+
+        social_note = ""
+        if twitter_mention_count:
+            social_note += f"🐦 Twitter: {twitter_mention_count} mentions"
+            if twitter_has_kol:
+                social_note += " (incl. KOL)"
+            social_note += "\n"
+        if tiktok_video_count:
+            social_note += f"🎵 TikTok: {tiktok_video_count} videos, {tiktok_total_plays:,} plays\n"
+
         c.execute(
             "UPDATE token_scan_log SET momentum_alert_fired = TRUE WHERE id = %s",
             (item["scan_log_id"],)
@@ -1833,6 +1867,12 @@ def _apply_gate_result(result):
                 has_logo = %s,
                 has_website = %s,
                 has_social = %s,
+                twitter_mention_count = %s,
+                twitter_has_kol = %s,
+                twitter_avg_sentiment = %s,
+                tiktok_video_count = %s,
+                tiktok_total_plays = %s,
+                tiktok_total_likes = %s,
                 price_at_recommendation = %s,
                 recommended_at = NOW(),
                 market_cap_at_recommendation = %s,
@@ -1853,6 +1893,8 @@ def _apply_gate_result(result):
             WHERE wallet=%s AND token_mint=%s
             """,
             (token_name, token_symbol, has_logo, has_website, has_social,
+             twitter_mention_count, twitter_has_kol, twitter_avg_sentiment,
+             tiktok_video_count, tiktok_total_plays, tiktok_total_likes,
              current_price, current_market_cap, result["rug_score"],
              result["top1_pct"], len(cluster_wallets), current_buy_count,
              liquidity_trend_pts, liquidity_level_pts, price_window_pts, volume_sanity_pts,
@@ -1876,7 +1918,8 @@ def _apply_gate_result(result):
             f"{price_trend_note}\n"
             f"{rug_note}\n"
             f"{holder_note}\n"
-            f"{cluster_note}\n\n"
+            f"{cluster_note}\n"
+            f"{social_note}\n"
             f"📊 DexScreener: {dexscreener_url}\n\n"
             f"Recommending this now — tracking from this price to see if it delivers. DYOR."
         )
