@@ -1980,16 +1980,24 @@ def _check_paper_trades():
 
             if closed:
                 c2.execute(
+                    "SELECT buy_count FROM wallet_token_history WHERE wallet=%s AND token_mint=%s",
+                    (wallet, mint)
+                )
+                buy_row = c2.fetchone()
+                current_buy_count_at_close = buy_row[0] if buy_row else None
+
+                c2.execute(
                     """
                     UPDATE paper_trades
                     SET peak_price = %s, remaining_pct = 0,
                         tp_3x_hit = %s, tp_10x_hit = %s, tp_15x_hit = %s, tp_30x_hit = %s,
                         status = 'closed', close_reason = %s, closed_at = NOW(),
-                        realized_return_pct = COALESCE(realized_return_pct, 0) + %s
+                        realized_return_pct = COALESCE(realized_return_pct, 0) + %s,
+                        buy_count_at_close = %s
                     WHERE id = %s
                     """,
                     (new_peak, new_tp_3x, new_tp_10x, new_tp_15x, new_tp_30x,
-                     close_reason, realized_this_cycle, trade_id)
+                     close_reason, realized_this_cycle, current_buy_count_at_close, trade_id)
                 )
             else:
                 c2.execute(
