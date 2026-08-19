@@ -2024,6 +2024,53 @@ def _check_paper_trades():
             put_conn(conn2)
 
 
+def _check_buy_count_growth():
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT p.wallet, p.token_mint, p.entry_price, h.buy_count_at_recommendation
+            FROM paper_trades p
+            JOIN wallet_token_history h
+                ON h.wallet = p.wallet AND h.token_mint = p.token_mint
+            WHERE p.status = 'open'
+        """)
+        open_trades = c.fetchall()
+        c.close()
+    finally:
+        put_conn(conn)
+
+    if not open_trades:
+        return
+
+    for wallet, mint, entry_price, buy_count_at_rec in open_trades:
+        if buy_count_at_rec is None:
+            continue
+
+        conn2 = get_conn()
+        try:
+            c2 = conn2.cursor()
+            c2.execute(
+                "SELECT buy_count FROM wallet_token_history WHERE wallet=%s AND token_mint=%s",
+                (wallet, mint)
+            )
+            row = c2.fetchone()
+            current_buy_count = row[0] if row else buy_count_at_rec
+            c2.close()
+        finally:
+            put_conn(conn2)
+
+        growth = current_buy_count - buy_count_at_rec
+
+        current_price = get_current_price(mint)
+        below_entry = current_price is not None and entry_price is not None and current_price < float(entry_price)
+
+        if growth >= 5 and below_entry:
+            print(f"📈 Buy-count growth detected on open position {mint}: "
+                  f"entry_count={buy_count_at_rec}, now={current_buy_count} (+{growth}), "
+                  f"price below entry (${current_price} < ${entry_price})")
+
+
 def run_pump_check(run_id):
     conn = None
     c = None
@@ -2324,9 +2371,10 @@ def run_pump_check(run_id):
                 _apply_gate_result(result)
 
         _check_paper_trades()
-        
-        print(f"check_pumps finished — checked {checked} tokens, {len(qualifying_tokens)} qualified for gate-check")
+        _check_buy_count_growth()
 
+        print(f"check_pumps finished — checked {checked} tokens, {len(qualifying_tokens)} qualified for gate-check")
+        
     except Exception as e:
         print(f"check_pumps error: {e}")
 
