@@ -379,6 +379,7 @@ def init_db():
             )
         """)
         c.execute("CREATE INDEX IF NOT EXISTS idx_paper_trades_status ON paper_trades (status)")
+        c.execute("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS buy_count_at_close INTEGER")
 
         conn.commit()
         c.close()
