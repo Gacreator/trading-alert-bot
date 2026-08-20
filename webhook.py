@@ -27,6 +27,7 @@ TWITTERAPI_KEY = os.environ.get("TWITTERAPI_KEY")
 SCRAPECREATORS_KEY = os.environ.get("SCRAPECREATORS_KEY")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
 TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET")
+EARLY_STAGE_WALLET = os.environ.get("EARLY_STAGE_WALLET", "").strip()
 
 TRACKED_WALLETS = set(
     w.strip() for w in os.environ.get("TRACKED_WALLETS", "").split(",") if w.strip()
@@ -2258,12 +2259,27 @@ def run_pump_check(run_id):
                 score, details = score_momentum(pair, liquidity_delta_pct, prior_liq_delta, current_trajectory)
                 current_liquidity = details.get("liquidity")
 
+                                # ── Early-stage Twitter boost (single-wallet, credit-protected) ──
                 twitter_eligible = (
-                    not momentum_alerted
-                    and current_market_cap > 0 and current_market_cap < 20000
+                    EARLY_STAGE_WALLET
+                    and wallet == EARLY_STAGE_WALLET
+                    and not momentum_alerted
+                    and 5000 <= current_market_cap < 20000
                     and buy_count <= 2
                     and score < 85
+                    and score > 0
+                    and details.get("vol_5m", 0) >= 500
+                    and details.get("vol_h1", 0) >= 1500
+                    and details.get("buys_5m", 0) >= 2
+                    and details.get("sells_5m", 0) >= 1
                 )
+
+                if twitter_eligible:
+                    buy_sell_ratio = details.get("buy_sell_ratio", 0) or 0
+                    if buy_sell_ratio < 0.5 or buy_sell_ratio > 10.0:
+                        twitter_eligible = False
+                        print(f"🪦 Early-stage skip {mint}: buy/sell {buy_sell_ratio:.1f}")
+
                 if twitter_eligible:
                     base_token = pair.get("baseToken", {}) or {}
                     symbol = base_token.get("symbol")
@@ -2272,7 +2288,7 @@ def run_pump_check(run_id):
                         print(f"🐦 Early-stage boost for {mint}: {early_result}")
                         score = early_result["early_score"]
                         details["early_stage_result"] = early_result
-                
+        
                 multiplier_since_recommendation = None
                 if price_at_recommendation and current_price:
                     try:
