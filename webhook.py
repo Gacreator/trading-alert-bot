@@ -132,6 +132,7 @@ _connection_pool = pg_pool.ThreadedConnectionPool(
 _vader = SentimentIntensityAnalyzer()
 _twitter_cache = {}
 _twitter_daily_count = {"date": None, "count": 0}
+_wallet_twitter_cooldown = {}
 
 def _twitter_call_allowed(max_per_day=200):
     today = datetime.date.today().isoformat()
@@ -141,6 +142,15 @@ def _twitter_call_allowed(max_per_day=200):
     if _twitter_daily_count["count"] >= max_per_day:
         return False
     _twitter_daily_count["count"] += 1
+    return True
+
+
+def _wallet_twitter_allowed(wallet, cooldown_seconds=120):
+    now = time.time()
+    last_call = _wallet_twitter_cooldown.get(wallet, 0)
+    if now - last_call < cooldown_seconds:
+        return False
+    _wallet_twitter_cooldown[wallet] = now
     return True
 
 
@@ -2295,6 +2305,7 @@ def run_pump_check(run_id):
                     and details.get("vol_h1", 0) >= 1500
                     and details.get("buys_5m", 0) >= 2
                     and details.get("sells_5m", 0) >= 1
+                    and _wallet_twitter_allowed(wallet)
                 )
 
                 if twitter_eligible:
