@@ -387,6 +387,7 @@ def init_db():
         """)
         c.execute("CREATE INDEX IF NOT EXISTS idx_paper_trades_status ON paper_trades (status)")
         c.execute("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS buy_count_at_close INTEGER")
+        c.execute("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS tp_1_5x_hit BOOLEAN DEFAULT FALSE")
 
         conn.commit()
         c.close()
@@ -1983,7 +1984,7 @@ def _check_paper_trades():
         c = conn.cursor()
         c.execute("""
             SELECT id, wallet, token_mint, entry_price, peak_price, remaining_pct,
-                   tp_3x_hit, tp_10x_hit, tp_15x_hit, tp_30x_hit
+                   tp_1_5x_hit, tp_3x_hit, tp_10x_hit, tp_15x_hit, tp_30x_hit
             FROM paper_trades
             WHERE status = 'open'
         """)
@@ -1999,7 +2000,7 @@ def _check_paper_trades():
     pairs_by_mint = get_dexscreener_batches_ratelimited(mints, batch_size=30)
 
     for (trade_id, wallet, mint, entry_price, peak_price,
-         remaining_pct, tp_3x, tp_10x, tp_15x, tp_30x) in open_trades:
+         remaining_pct, tp_1_5x, tp_3x, tp_10x, tp_15x, tp_30x) in open_trades:
 
         pair = pairs_by_mint.get(mint)
         if not pair:
@@ -2026,7 +2027,7 @@ def _check_paper_trades():
             c2 = conn2.cursor()
 
             realized_this_cycle = 0.0
-            new_tp_3x, new_tp_10x, new_tp_15x, new_tp_30x = tp_3x, tp_10x, tp_15x, tp_30x
+            new_tp_1_5x, new_tp_3x, new_tp_10x, new_tp_15x, new_tp_30x = tp_1_5x, tp_3x, tp_10x, tp_15x, tp_30x
             new_remaining = remaining_pct
             closed = False
             close_reason = None
@@ -2051,8 +2052,13 @@ def _check_paper_trades():
                 new_tp_3x = True
                 realized_this_cycle += 25 * 3
                 print(f"📈 PAPER TP 3x hit for {mint}: sold 25% at {multiplier:.1f}x")
+            if multiplier >= 1.5 and not tp_1_5x:
+                new_remaining -= 25
+                new_tp_1_5x = True
+                realized_this_cycle += 25 * 1.5
+                print(f"📈 PAPER TP 1.5x hit for {mint}: sold 25% at {multiplier:.1f}x")
 
-            any_profit_taken = new_tp_3x or new_tp_10x or new_tp_15x or new_tp_30x
+            any_profit_taken = new_tp_1_5x or new_tp_3x or new_tp_10x or new_tp_15x or new_tp_30x
 
             stop_loss_hit = (not any_profit_taken) and current_price <= entry_price * 0.7
             trailing_stop_hit = (
@@ -2089,13 +2095,13 @@ def _check_paper_trades():
                     """
                     UPDATE paper_trades
                     SET peak_price = %s, remaining_pct = 0,
-                        tp_3x_hit = %s, tp_10x_hit = %s, tp_15x_hit = %s, tp_30x_hit = %s,
+                        tp_1_5x_hit = %s, tp_3x_hit = %s, tp_10x_hit = %s, tp_15x_hit = %s, tp_30x_hit = %s,
                         status = 'closed', close_reason = %s, closed_at = NOW(),
                         realized_return_pct = COALESCE(realized_return_pct, 0) + %s,
                         buy_count_at_close = %s
                     WHERE id = %s
                     """,
-                    (new_peak, new_tp_3x, new_tp_10x, new_tp_15x, new_tp_30x,
+                    (new_peak, new_tp_1_5x, new_tp_3x, new_tp_10x, new_tp_15x, new_tp_30x,
                      close_reason, realized_this_cycle, current_buy_count_at_close, trade_id)
                 )
             else:
@@ -2103,11 +2109,11 @@ def _check_paper_trades():
                     """
                     UPDATE paper_trades
                     SET peak_price = %s, remaining_pct = %s,
-                        tp_3x_hit = %s, tp_10x_hit = %s, tp_15x_hit = %s, tp_30x_hit = %s,
+                        tp_1_5x_hit = %s, tp_3x_hit = %s, tp_10x_hit = %s, tp_15x_hit = %s, tp_30x_hit = %s,
                         realized_return_pct = COALESCE(realized_return_pct, 0) + %s
                     WHERE id = %s
                     """,
-                    (new_peak, new_remaining, new_tp_3x, new_tp_10x, new_tp_15x, new_tp_30x,
+                    (new_peak, new_remaining, new_tp_1_5x, new_tp_3x, new_tp_10x, new_tp_15x, new_tp_30x,
                      realized_this_cycle, trade_id)
                 )
             conn2.commit()
