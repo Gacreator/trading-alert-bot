@@ -130,6 +130,7 @@ _connection_pool = pg_pool.ThreadedConnectionPool(
     keepalives_count=5,
 )
 _vader = SentimentIntensityAnalyzer()
+_twitter_cache = {}
 
 
 def get_conn():
@@ -1283,6 +1284,13 @@ def check_sellable_via_jupiter(mint, test_amount_lamports=10000000):
 
 
 def get_twitter_signal(mint, symbol, max_tweets=15):
+    # Return cached result if < 30 min old
+    now = time.time()
+    if mint in _twitter_cache:
+        cached_at, result = _twitter_cache[mint]
+        if now - cached_at < 1800:
+            return result
+
     if not TWITTERAPI_KEY:
         return None
 
@@ -1303,7 +1311,8 @@ def get_twitter_signal(mint, symbol, max_tweets=15):
         tweets = (data.get("tweets") or [])[:max_tweets]
 
         if not tweets:
-            return {"mention_count": 0, "has_kol": False, "kol_handles": []}
+            _twitter_cache[mint] = (now, {"mention_count": 0, "has_kol": False, "kol_handles": []})
+            return _twitter_cache[mint][1]
 
         kol_handles = []
         sentiment_scores = []
@@ -1325,13 +1334,16 @@ def get_twitter_signal(mint, symbol, max_tweets=15):
         avg_sentiment = sum(sentiment_scores) / len(sentiment_scores) if sentiment_scores else 0
         avg_kol_sentiment = sum(kol_sentiments) / len(kol_sentiments) if kol_sentiments else None
 
-        return {
+        result = {
             "mention_count": len(tweets),
             "has_kol": len(kol_handles) > 0,
             "kol_handles": kol_handles,
             "avg_sentiment": round(avg_sentiment, 3),
             "avg_kol_sentiment": round(avg_kol_sentiment, 3) if avg_kol_sentiment is not None else None,
         }
+
+        _twitter_cache[mint] = (now, result)
+        return result
 
     except Exception as e:
         print(f"Twitter signal error for {mint}: {e}")
