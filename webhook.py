@@ -131,6 +131,17 @@ _connection_pool = pg_pool.ThreadedConnectionPool(
 )
 _vader = SentimentIntensityAnalyzer()
 _twitter_cache = {}
+_twitter_daily_count = {"date": None, "count": 0}
+
+def _twitter_call_allowed(max_per_day=200):
+    today = datetime.date.today().isoformat()
+    if _twitter_daily_count["date"] != today:
+        _twitter_daily_count["date"] = today
+        _twitter_daily_count["count"] = 0
+    if _twitter_daily_count["count"] >= max_per_day:
+        return False
+    _twitter_daily_count["count"] += 1
+    return True
 
 
 def get_conn():
@@ -1682,7 +1693,7 @@ def _gate_check_one_token(item):
         rug_future = gate_executor.submit(get_rugcheck_data, mint)
         holder_future = gate_executor.submit(get_top_holder_concentration, mint, pair.get("pairAddress"))
         sellable_future = gate_executor.submit(check_sellable_via_jupiter, mint)
-        twitter_future = gate_executor.submit(get_twitter_signal, mint, symbol)
+        twitter_future = gate_executor.submit(get_twitter_signal, mint, symbol) if _twitter_call_allowed() else None
         tiktok_future = gate_executor.submit(get_tiktok_signal, symbol) if symbol else None
 
         rug_score, rug_liq_flags = rug_future.result()
