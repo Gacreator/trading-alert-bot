@@ -7261,6 +7261,100 @@ def check_lowcap_loss_severity():
         put_conn(conn)
 
 
+@app.route("/check-tiktok-vs-outcome")
+def check_tiktok_vs_outcome():
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT tiktok_video_count, tiktok_total_plays,
+                   max_multiplier_since_recommendation,
+                   pumped_since_recommendation_alerted
+            FROM wallet_token_history
+            WHERE momentum_alerted = TRUE
+            AND tiktok_video_count IS NOT NULL
+        """)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return "No recommendations with TikTok data yet.", 200
+
+        has_activity = {"total": 0, "hit_3x": 0}
+        no_activity = {"total": 0, "hit_3x": 0}
+
+        for video_count, plays, max_mult, hit_3x in rows:
+            hit = bool(hit_3x) or (max_mult and max_mult >= 3)
+            bucket = has_activity if video_count and video_count > 0 else no_activity
+            bucket["total"] += 1
+            if hit:
+                bucket["hit_3x"] += 1
+
+        def rate(d):
+            return f"{d['hit_3x']}/{d['total']} ({d['hit_3x']/d['total']*100:.1f}%)" if d["total"] else "n/a"
+
+        lines = [
+            "<b>TikTok activity vs outcome:</b><br>",
+            f"<br>Has TikTok videos: {rate(has_activity)}",
+            f"No TikTok videos: {rate(no_activity)}",
+        ]
+        return "<br>".join(lines), 200
+    except Exception as e:
+        return f"check_tiktok_vs_outcome error: {e}", 500
+    finally:
+        put_conn(conn)
+
+
+@app.route("/check-twitter-vs-outcome")
+def check_twitter_vs_outcome():
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT twitter_mention_count, twitter_has_kol, twitter_avg_sentiment,
+                   max_multiplier_since_recommendation,
+                   pumped_since_recommendation_alerted
+            FROM wallet_token_history
+            WHERE momentum_alerted = TRUE
+            AND twitter_mention_count IS NOT NULL
+        """)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return "No recommendations with Twitter data yet.", 200
+
+        has_mentions = {"total": 0, "hit_3x": 0}
+        no_mentions = {"total": 0, "hit_3x": 0}
+        has_kol = {"total": 0, "hit_3x": 0}
+
+        for mention_count, kol, sentiment, max_mult, hit_3x in rows:
+            hit = bool(hit_3x) or (max_mult and max_mult >= 3)
+            bucket = has_mentions if mention_count and mention_count > 0 else no_mentions
+            bucket["total"] += 1
+            if hit:
+                bucket["hit_3x"] += 1
+            if kol:
+                has_kol["total"] += 1
+                if hit:
+                    has_kol["hit_3x"] += 1
+
+        def rate(d):
+            return f"{d['hit_3x']}/{d['total']} ({d['hit_3x']/d['total']*100:.1f}%)" if d["total"] else "n/a"
+
+        lines = [
+            "<b>Twitter activity vs outcome:</b><br>",
+            f"<br>Has mentions: {rate(has_mentions)}",
+            f"No mentions: {rate(no_mentions)}",
+            f"<br>Has KOL involvement: {rate(has_kol)}",
+        ]
+        return "<br>".join(lines), 200
+    except Exception as e:
+        return f"check_twitter_vs_outcome error: {e}", 500
+    finally:
+        put_conn(conn)
+
+
 @app.route("/check-paper-trades-by-score")
 def check_paper_trades_by_score():
     conn = get_conn()
