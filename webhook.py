@@ -7267,12 +7267,12 @@ def check_tiktok_vs_outcome():
     try:
         c = conn.cursor()
         c.execute("""
-            SELECT tiktok_video_count, tiktok_total_plays,
+            SELECT tiktok_video_count, tiktok_total_plays, tiktok_total_likes,
                    max_multiplier_since_recommendation,
                    pumped_since_recommendation_alerted
             FROM wallet_token_history
             WHERE momentum_alerted = TRUE
-            AND tiktok_video_count IS NOT NULL
+            AND tiktok_total_plays IS NOT NULL
         """)
         rows = c.fetchall()
         c.close()
@@ -7280,12 +7280,12 @@ def check_tiktok_vs_outcome():
         if not rows:
             return "No recommendations with TikTok data yet.", 200
 
-        has_activity = {"total": 0, "hit_3x": 0}
-        no_activity = {"total": 0, "hit_3x": 0}
+        viral = {"total": 0, "hit_3x": 0}
+        not_viral = {"total": 0, "hit_3x": 0}
 
-        for video_count, plays, max_mult, hit_3x in rows:
+        for video_count, plays, likes, max_mult, hit_3x in rows:
             hit = bool(hit_3x) or (max_mult and max_mult >= 3)
-            bucket = has_activity if video_count and video_count > 0 else no_activity
+            bucket = viral if plays and plays >= 1_000_000 else not_viral
             bucket["total"] += 1
             if hit:
                 bucket["hit_3x"] += 1
@@ -7294,9 +7294,9 @@ def check_tiktok_vs_outcome():
             return f"{d['hit_3x']}/{d['total']} ({d['hit_3x']/d['total']*100:.1f}%)" if d["total"] else "n/a"
 
         lines = [
-            "<b>TikTok activity vs outcome:</b><br>",
-            f"<br>Has TikTok videos: {rate(has_activity)}",
-            f"No TikTok videos: {rate(no_activity)}",
+            "<b>TikTok 1M+ views vs outcome:</b><br>",
+            f"<br>1M+ total plays (viral): {rate(viral)}",
+            f"Under 1M plays: {rate(not_viral)}",
         ]
         return "<br>".join(lines), 200
     except Exception as e:
