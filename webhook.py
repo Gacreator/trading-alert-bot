@@ -337,6 +337,7 @@ def init_db():
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS tiktok_video_count INTEGER")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS tiktok_total_plays BIGINT")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS tiktok_total_likes BIGINT")
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS score_at_recommendation NUMERIC")
         c.execute("""
             CREATE TABLE IF NOT EXISTS wallet_buy_events (
                 id SERIAL PRIMARY KEY,
@@ -1908,6 +1909,7 @@ def _apply_gate_result(result):
                 tiktok_video_count = %s,
                 tiktok_total_plays = %s,
                 tiktok_total_likes = %s,
+                score_at_recommendation = %s,
                 price_at_recommendation = %s,
                 recommended_at = NOW(),
                 market_cap_at_recommendation = %s,
@@ -1930,7 +1932,7 @@ def _apply_gate_result(result):
             (token_name, token_symbol, has_logo, has_website, has_social,
              twitter_mention_count, twitter_has_kol, twitter_avg_sentiment,
              tiktok_video_count, tiktok_total_plays, tiktok_total_likes,
-             current_price, current_market_cap, result["rug_score"],
+             score, current_price, current_market_cap, result["rug_score"],
              result["top1_pct"], len(cluster_wallets), current_buy_count,
              liquidity_trend_pts, liquidity_level_pts, price_window_pts, volume_sanity_pts,
              buy_trajectory, clean_tier, conv_tier, too_perfect_flag, result["sellable_str"],
@@ -7746,7 +7748,7 @@ def export_shadow_dataset():
         query = """
             SELECT
                 h.wallet, h.token_mint,
-                s.momentum_score,
+                h.score_at_recommendation,
                 h.market_cap_at_recommendation,
                 h.rugcheck_score_at_recommendation,
                 h.top1_holder_pct_at_recommendation,
@@ -7765,9 +7767,6 @@ def export_shadow_dataset():
                 h.max_multiplier_since_recommendation,
                 h.pumped_since_recommendation_alerted
             FROM wallet_token_history h
-            JOIN token_scan_log s
-                ON s.wallet = h.wallet AND s.token_mint = h.token_mint
-                AND s.momentum_alert_fired = TRUE
             WHERE h.momentum_alerted = TRUE
         """
         params = []
