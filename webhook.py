@@ -1545,15 +1545,13 @@ def webhook():
         return "unauthorized", 401
 
     data = request.json
-    
+
     if not data:
         print("Webhook received empty or non-JSON body")
         return "no data", 400
 
-    print("🔔 New event received:")
-    print(data)
-
     transactions = data if isinstance(data, list) else [data]
+    print(f"🔔 New event received ({len(transactions)} transaction(s))")
 
     for tx in transactions:
         if not isinstance(tx, dict):
