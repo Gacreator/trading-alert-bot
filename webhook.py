@@ -2256,6 +2256,142 @@ def _check_paper_trades():
             put_conn(conn2)
 
 
+def _check_system_c_trades():
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT id, wallet, token_mint, entry_price, peak_price, remaining_pct,
+                   tp_1_5x_hit, tp_3x_hit, tp_10x_hit, tp_15x_hit, tp_30x_hit
+            FROM paper_trades_c
+            WHERE status = 'open'
+        """)
+        open_trades = c.fetchall()
+        c.close()
+    finally:
+        put_conn(conn)
+
+    if not open_trades:
+        return
+
+    mints = [row[2] for row in open_trades]
+    pairs_by_mint = get_dexscreener_batches_ratelimited(mints, batch_size=30)
+
+    for (trade_id, wallet, mint, entry_price, peak_price,
+         remaining_pct, tp_1_5x, tp_3x, tp_10x, tp_15x, tp_30x) in open_trades:
+
+        pair = pairs_by_mint.get(mint)
+        if not pair:
+            continue
+
+        current_price = None
+        try:
+            current_price = float(pair.get("priceUsd"))
+        except (TypeError, ValueError):
+            continue
+
+        if not current_price or not entry_price:
+            continue
+
+        entry_price = float(entry_price)
+        peak_price = float(peak_price) if peak_price else entry_price
+        remaining_pct = float(remaining_pct)
+        multiplier = current_price / entry_price
+        new_peak = max(peak_price, current_price)
+
+        conn2 = get_conn()
+        try:
+            c2 = conn2.cursor()
+
+            realized_this_cycle = 0.0
+            new_tp_1_5x, new_tp_3x, new_tp_10x, new_tp_15x, new_tp_30x = tp_1_5x, tp_3x, tp_10x, tp_15x, tp_30x
+            new_remaining = remaining_pct
+            closed = False
+            close_reason = None
+
+            if multiplier >= 30 and not tp_30x:
+                new_remaining -= 25
+                new_tp_30x = True
+                realized_this_cycle += 25 * 30
+            if multiplier >= 15 and not tp_15x:
+                new_remaining -= 25
+                new_tp_15x = True
+                realized_this_cycle += 25 * 15
+            if multiplier >= 10 and not tp_10x:
+                new_remaining -= 25
+                new_tp_10x = True
+                realized_this_cycle += 25 * 10
+            if multiplier >= 3 and not tp_3x:
+                new_remaining -= 25
+                new_tp_3x = True
+                realized_this_cycle += 25 * 3
+            if multiplier >= 1.5 and not tp_1_5x:
+                new_remaining -= 25
+                new_tp_1_5x = True
+                realized_this_cycle += 25 * 1.5
+
+            any_profit_taken = new_tp_1_5x or new_tp_3x or new_tp_10x or new_tp_15x or new_tp_30x
+
+            stop_loss_hit = (not any_profit_taken) and current_price <= entry_price * 0.7
+            trailing_stop_hit = (
+                new_peak > 0
+                and current_price <= new_peak * 0.7
+                and (any_profit_taken or current_price > entry_price * 0.7)
+            )
+
+            if stop_loss_hit and new_remaining > 0:
+                realized_this_cycle += new_remaining * multiplier
+                new_remaining = 0
+                closed = True
+                close_reason = "stop_loss"
+            elif trailing_stop_hit and new_remaining > 0:
+                realized_this_cycle += new_remaining * multiplier
+                new_remaining = 0
+                closed = True
+                close_reason = "trailing_stop"
+            elif new_remaining <= 0:
+                closed = True
+                close_reason = "full_take_profit"
+
+            if closed:
+                c2.execute(
+                    """
+                    UPDATE paper_trades_c
+                    SET peak_price = %s, remaining_pct = 0,
+                        tp_1_5x_hit = %s, tp_3x_hit = %s, tp_10x_hit = %s, tp_15x_hit = %s, tp_30x_hit = %s,
+                        status = 'closed', close_reason = %s, closed_at = NOW(),
+                        realized_return_pct = COALESCE(realized_return_pct, 0) + %s
+                    WHERE id = %s
+                    """,
+                    (new_peak, new_tp_1_5x, new_tp_3x, new_tp_10x, new_tp_15x, new_tp_30x,
+                     close_reason, realized_this_cycle, trade_id)
+                )
+                print(f"📝 SYSTEM C CLOSED: {mint} via {close_reason}")
+            else:
+                c2.execute(
+                    """
+                    UPDATE paper_trades_c
+                    SET peak_price = %s, remaining_pct = %s,
+                        tp_1_5x_hit = %s, tp_3x_hit = %s, tp_10x_hit = %s, tp_15x_hit = %s, tp_30x_hit = %s,
+                        realized_return_pct = COALESCE(realized_return_pct, 0) + %s
+                    WHERE id = %s
+                    """,
+                    (new_peak, new_remaining, new_tp_1_5x, new_tp_3x, new_tp_10x, new_tp_15x, new_tp_30x,
+                     realized_this_cycle, trade_id)
+                )
+            conn2.commit()
+            c2.close()
+
+        except Exception as e:
+            print(f"Error checking System C trade {trade_id} for {mint}: {e}")
+            try:
+                conn2.rollback()
+            except Exception:
+                pass
+        finally:
+            put_conn(conn2)
+
+
 def _check_buy_count_growth():
     conn = get_conn()
     try:
@@ -2620,6 +2756,7 @@ def run_pump_check(run_id):
 
         _check_paper_trades()
         _check_buy_count_growth()
+        _check_system_c_trades()
 
         print(f"check_pumps finished — checked {checked} tokens, {len(qualifying_tokens)} qualified for gate-check")
         
