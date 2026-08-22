@@ -7323,6 +7323,86 @@ def paper_trades_report():
         put_conn(conn)
 
 
+@app.route("/paper-trades-c")
+def paper_trades_c_report():
+    since_param = request.args.get("since")
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+
+        query = "SELECT wallet, token_mint, entry_price, entry_time, peak_price, remaining_pct, status, close_reason, closed_at, realized_return_pct, market_cap_tier, had_twitter_signal, had_tiktok_signal FROM paper_trades_c"
+        params = []
+        if since_param:
+            query += " WHERE entry_time >= %s"
+            params.append(since_param)
+        query += " ORDER BY entry_time DESC"
+
+        c.execute(query, params)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return "No System C paper trades yet.", 200
+
+        open_trades = [r for r in rows if r[6] == "open"]
+        closed_trades = [r for r in rows if r[6] == "closed"]
+
+        range_label = f"<br>Filtered: since={since_param}<br>" if since_param else ""
+
+        lines = [f"<b>System C Paper Trading Report</b>{range_label}<br>"]
+        lines.append(f"<br>Open positions: {len(open_trades)}")
+        lines.append(f"Closed positions: {len(closed_trades)}")
+
+        if closed_trades:
+            returns = [float(r[9]) / 100 for r in closed_trades if r[9] is not None]
+            if returns:
+                avg_return = sum(returns) / len(returns)
+                wins = sum(1 for r in returns if r > 1.0)
+                win_rate = wins / len(returns) * 100
+                lines.append(f"<br>Average realized return: {avg_return:.2f}x")
+                lines.append(f"Win rate (return &gt; 1.0x): {wins}/{len(returns)} ({win_rate:.1f}%)")
+
+                by_tier = {}
+                for r in closed_trades:
+                    tier = r[10] or "unknown"
+                    by_tier[tier] = by_tier.get(tier, 0) + 1
+                lines.append("<br><br><b>Closed by market cap tier:</b>")
+                for tier, count in by_tier.items():
+                    lines.append(f"<br>{tier}: {count}")
+
+                had_social = sum(1 for r in closed_trades if r[11] or r[12])
+                lines.append(f"<br><br>Trades with Twitter or TikTok signal at entry: {had_social}/{len(closed_trades)}")
+
+        lines.append("<br><br><b>Open positions:</b>")
+        if not open_trades:
+            lines.append("<br>None")
+        for wallet, mint, entry_price, entry_time, peak_price, remaining_pct, status, close_reason, closed_at, realized, tier, twit, tik in open_trades[:20]:
+            lines.append(
+                f"<br><code>{mint}</code><br>"
+                f"Entry: ${entry_price} at {entry_time} | Peak: ${peak_price} | "
+                f"Remaining: {remaining_pct}% | Tier: {tier}"
+            )
+
+        lines.append("<br><br><b>Recent closed positions:</b>")
+        for wallet, mint, entry_price, entry_time, peak_price, remaining_pct, status, close_reason, closed_at, realized, tier, twit, tik in closed_trades[:20]:
+            realized_mult = float(realized) / 100 if realized is not None else 0
+            lines.append(
+                f"<br><code>{mint}</code><br>"
+                f"Entry: ${entry_price} | Peak: ${peak_price} | "
+                f"Closed: {close_reason} at {closed_at} | "
+                f"Realized: {realized_mult:.2f}x | Tier: {tier} | "
+                f"Twitter: {twit} | TikTok: {tik}"
+            )
+
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"paper_trades_c_report error: {e}", 500
+
+    finally:
+        put_conn(conn)
+
+
 @app.route("/check-paper-trade-characteristics")
 def check_paper_trade_characteristics():
     conn = get_conn()
