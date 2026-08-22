@@ -413,6 +413,31 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_paper_trades_status ON paper_trades (status)")
         c.execute("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS buy_count_at_close INTEGER")
         c.execute("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS tp_1_5x_hit BOOLEAN DEFAULT FALSE")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS paper_trades_c (
+                id SERIAL PRIMARY KEY,
+                wallet TEXT,
+                token_mint TEXT,
+                entry_price NUMERIC,
+                entry_time TIMESTAMP DEFAULT NOW(),
+                peak_price NUMERIC,
+                remaining_pct NUMERIC DEFAULT 100,
+                tp_1_5x_hit BOOLEAN DEFAULT FALSE,
+                tp_3x_hit BOOLEAN DEFAULT FALSE,
+                tp_10x_hit BOOLEAN DEFAULT FALSE,
+                tp_15x_hit BOOLEAN DEFAULT FALSE,
+                tp_30x_hit BOOLEAN DEFAULT FALSE,
+                status TEXT DEFAULT 'open',
+                close_reason TEXT,
+                closed_at TIMESTAMP,
+                realized_return_pct NUMERIC,
+                market_cap_tier TEXT,
+                had_twitter_signal BOOLEAN,
+                had_tiktok_signal BOOLEAN,
+                pc_h6_at_entry NUMERIC
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_paper_trades_c_status ON paper_trades_c (status)")
 
         conn.commit()
         c.close()
@@ -1971,6 +1996,7 @@ def _apply_gate_result(result):
         )
         send_bare_address_to_rick_chat(mint)
         _open_paper_trade(wallet, mint, current_price, current_market_cap, result["rug_score"], score)
+        _evaluate_system_c(wallet, mint, current_price, current_market_cap, details, result)
 
     except Exception as e:
         print(f"Error applying gate result for {mint}: {e}")
@@ -2015,6 +2041,62 @@ def _open_paper_trade(wallet, mint, current_price, current_market_cap, rug_score
 
     except Exception as e:
         print(f"Error opening paper trade for {mint}: {e}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        put_conn(conn)
+
+
+def _evaluate_system_c(wallet, mint, current_price, current_market_cap, details, result):
+    pc_h6 = details.get("pc_h6")
+
+    rug_pass = result["rug_score"] is not None and result["rug_score"] <= 30
+    holder_pass = result["top1_pct"] is not None and result["top1_pct"] < 7
+    sellable_pass = result["sellable_str"] == "sellable"
+
+    if not (rug_pass and holder_pass and sellable_pass):
+        return
+
+    if current_market_cap is None:
+        return
+    if current_market_cap < 20000:
+        mc_tier = "best"
+    elif current_market_cap < 50000:
+        mc_tier = "better"
+    elif current_market_cap < 100000:
+        mc_tier = "good"
+    else:
+        return
+
+    if pc_h6 is not None and pc_h6 > 2000:
+        return
+
+    twitter_signal = result.get("twitter_signal")
+    tiktok_signal = result.get("tiktok_signal")
+
+    had_twitter = bool(twitter_signal and twitter_signal.get("mention_count", 0) > 0)
+    had_tiktok = bool(tiktok_signal and tiktok_signal.get("total_plays", 0) >= 1_000_000)
+
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute(
+            """
+            INSERT INTO paper_trades_c
+                (wallet, token_mint, entry_price, peak_price, market_cap_tier,
+                 had_twitter_signal, had_tiktok_signal, pc_h6_at_entry)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (wallet, mint, current_price, current_price, mc_tier,
+             had_twitter, had_tiktok, pc_h6)
+        )
+        conn.commit()
+        c.close()
+        print(f"📝 SYSTEM C TRADE OPENED: {mint} tier={mc_tier} twitter={had_twitter} tiktok={had_tiktok}")
+    except Exception as e:
+        print(f"Error opening System C trade for {mint}: {e}")
         try:
             conn.rollback()
         except Exception:
