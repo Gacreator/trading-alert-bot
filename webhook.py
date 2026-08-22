@@ -133,6 +133,7 @@ _vader = SentimentIntensityAnalyzer()
 _twitter_cache = {}
 _twitter_daily_count = {"date": None, "count": 0}
 _wallet_twitter_cooldown = {}
+_tiktok_cache = {}
 
 def _twitter_call_allowed(max_per_day=200):
     today = datetime.date.today().isoformat()
@@ -1395,6 +1396,12 @@ def get_twitter_trends(woeid=1, count=30):
 
 
 def get_tiktok_signal(query, max_videos=15):
+    now = time.time()
+    if query in _tiktok_cache:
+        cached_at, result = _tiktok_cache[query]
+        if now - cached_at < 1800:
+            return result
+
     if not SCRAPECREATORS_KEY:
         return None
     try:
@@ -1410,7 +1417,9 @@ def get_tiktok_signal(query, max_videos=15):
         items = (data.get("search_item_list") or [])[:max_videos]
 
         if not items:
-            return {"video_count": 0, "total_plays": 0, "total_likes": 0}
+            empty_result = {"video_count": 0, "total_plays": 0, "total_likes": 0}
+            _tiktok_cache[query] = (now, empty_result)
+            return empty_result
 
         total_plays = 0
         total_likes = 0
@@ -1420,12 +1429,14 @@ def get_tiktok_signal(query, max_videos=15):
             total_plays += stats.get("play_count", 0) or 0
             total_likes += stats.get("digg_count", 0) or 0
 
-        return {
+        result = {
             "video_count": len(items),
             "total_plays": total_plays,
             "total_likes": total_likes,
         }
-
+        _tiktok_cache[query] = (now, result)
+        return result
+        
     except Exception as e:
         print(f"TikTok signal error for {query}: {e}")
         return None
