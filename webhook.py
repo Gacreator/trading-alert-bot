@@ -339,6 +339,7 @@ def init_db():
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS tiktok_total_plays BIGINT")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS tiktok_total_likes BIGINT")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS score_at_recommendation NUMERIC")
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS trend_match TEXT")
         c.execute("""
             CREATE TABLE IF NOT EXISTS wallet_buy_events (
                 id SERIAL PRIMARY KEY,
@@ -1485,6 +1486,26 @@ def get_tiktok_trending(region="US"):
         return None
 
 
+def check_trend_match(token_name, token_symbol):
+    trends = get_tiktok_trending() if False else get_twitter_trends()
+    if not trends:
+        return None
+
+    candidates = [t.lower().replace(" ", "").replace("#", "") for t in trends]
+    name_normalized = (token_name or "").lower().replace(" ", "")
+    symbol_normalized = (token_symbol or "").lower().replace(" ", "")
+
+    for trend, normalized_trend in zip(trends, candidates):
+        if len(normalized_trend) < 3:
+            continue
+        if name_normalized and (name_normalized in normalized_trend or normalized_trend in name_normalized):
+            return trend
+        if symbol_normalized and (symbol_normalized in normalized_trend or normalized_trend in symbol_normalized):
+            return trend
+
+    return None
+
+
 def has_token_been_recommended_before(mint):
     conn = get_conn()
     try:
@@ -1898,6 +1919,7 @@ def _apply_gate_result(result):
         base_token = pair.get("baseToken", {}) or {}
         token_name = base_token.get("name")
         token_symbol = base_token.get("symbol")
+        trend_match = check_trend_match(token_name, token_symbol)
 
         info = pair.get("info", {}) or {}
         has_logo = bool(info.get("imageUrl"))
@@ -1922,6 +1944,8 @@ def _apply_gate_result(result):
             social_note += "\n"
         if tiktok_video_count:
             social_note += f"🎵 TikTok: {tiktok_video_count} videos, {tiktok_total_plays:,} plays\n"
+        if trend_match:
+            social_note += f"📈 Trend match: {trend_match}\n"
 
         c.execute(
             "UPDATE token_scan_log SET momentum_alert_fired = TRUE WHERE id = %s",
@@ -1943,6 +1967,7 @@ def _apply_gate_result(result):
                 tiktok_video_count = %s,
                 tiktok_total_plays = %s,
                 tiktok_total_likes = %s,
+                trend_match = %s,
                 score_at_recommendation = %s,
                 price_at_recommendation = %s,
                 recommended_at = NOW(),
@@ -1965,7 +1990,7 @@ def _apply_gate_result(result):
             """,
             (token_name, token_symbol, has_logo, has_website, has_social,
              twitter_mention_count, twitter_has_kol, twitter_avg_sentiment,
-             tiktok_video_count, tiktok_total_plays, tiktok_total_likes,
+             tiktok_video_count, tiktok_total_plays, tiktok_total_likes, trend_match,
              score, current_price, current_market_cap, result["rug_score"],
              result["top1_pct"], len(cluster_wallets), current_buy_count,
              liquidity_trend_pts, liquidity_level_pts, price_window_pts, volume_sanity_pts,
