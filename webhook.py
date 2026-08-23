@@ -7632,6 +7632,82 @@ def check_lowcap_loss_severity():
         put_conn(conn)
 
 
+@app.route("/check-marketcap-sweet-spot")
+def check_marketcap_sweet_spot():
+    since_param, until_param = get_date_filter_params()
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        query = """
+            SELECT market_cap_at_recommendation, max_multiplier_since_recommendation,
+                   pumped_since_recommendation_alerted
+            FROM wallet_token_history
+            WHERE momentum_alerted = TRUE
+            AND market_cap_at_recommendation IS NOT NULL
+            AND market_cap_at_recommendation < 20000
+        """
+        params = []
+        if since_param:
+            query += " AND recommended_at >= %s"
+            params.append(since_param)
+        if until_param:
+            query += " AND recommended_at < %s"
+            params.append(until_param)
+
+        c.execute(query, params)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return "No recommendations under $20K market cap yet.", 200
+
+        buckets = {
+            "5K-8K": {"total": 0, "hit_3x": 0},
+            "8K-12K": {"total": 0, "hit_3x": 0},
+            "12K-16K": {"total": 0, "hit_3x": 0},
+            "16K-20K": {"total": 0, "hit_3x": 0},
+        }
+
+        for mcap, max_mult, hit_3x in rows:
+            mcap = float(mcap)
+            if mcap < 5000:
+                continue
+            elif mcap < 8000:
+                key = "5K-8K"
+            elif mcap < 12000:
+                key = "8K-12K"
+            elif mcap < 16000:
+                key = "12K-16K"
+            else:
+                key = "16K-20K"
+
+            buckets[key]["total"] += 1
+            hit = bool(hit_3x) or (max_mult and max_mult >= 3)
+            if hit:
+                buckets[key]["hit_3x"] += 1
+
+        lines = ["<b>Market cap sweet spot check (matching wallet-tool buckets):</b><br>"]
+        for bucket, d in buckets.items():
+            total = d["total"]
+            hits = d["hit_3x"]
+            rate = f"{hits/total*100:.1f}%" if total else "n/a"
+            lines.append(f"<br>{bucket}: {hits}/{total} hit 3x+ ({rate})")
+
+        lines.append(
+            "<br><br>Compare against the wallet tool's finding: 8K-12K was the "
+            "sweet spot there. If this shows the same pattern (8K-12K clearly "
+            "best), that's real, independent confirmation from two separate "
+            "data sources."
+        )
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_marketcap_sweet_spot error: {e}", 500
+
+    finally:
+        put_conn(conn)
+
+
 @app.route("/check-tiktok-vs-outcome")
 def check_tiktok_vs_outcome():
     conn = get_conn()
