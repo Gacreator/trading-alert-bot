@@ -1947,6 +1947,11 @@ def _apply_gate_result(result):
         twitter_signal = result.get("twitter_signal")
         tiktok_signal = result.get("tiktok_signal")
 
+        sentiment_bonus = 0
+        if twitter_signal and twitter_signal.get("has_kol") and (twitter_signal.get("avg_kol_sentiment") or 0) > 0.2:
+            sentiment_bonus = 10
+            score = min(100, score + sentiment_bonus)
+
         twitter_mention_count = twitter_signal.get("mention_count") if twitter_signal else None
         twitter_has_kol = twitter_signal.get("has_kol") if twitter_signal else None
         twitter_avg_sentiment = twitter_signal.get("avg_sentiment") if twitter_signal else None
