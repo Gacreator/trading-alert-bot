@@ -2099,7 +2099,10 @@ def _evaluate_system_c(wallet, mint, current_price, current_market_cap, details,
     holder_pass = result["top1_pct"] is not None and result["top1_pct"] < 7
     sellable_pass = result["sellable_str"] == "sellable"
 
-    if not (rug_pass and holder_pass and sellable_pass):
+    info = pair.get("info", {}) or {}
+    has_logo = bool(info.get("imageUrl"))
+
+    if not (rug_pass and holder_pass and sellable_pass and has_logo):
         return
 
     if current_market_cap is None:
