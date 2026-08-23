@@ -7323,15 +7323,22 @@ def check_loser_decline_timing():
 
 @app.route("/paper-trades")
 def paper_trades_report():
+    since_param = request.args.get("since")
     conn = get_conn()
     try:
         c = conn.cursor()
-        c.execute("""
+        query = """
             SELECT wallet, token_mint, entry_price, entry_time, peak_price,
                    remaining_pct, status, close_reason, closed_at, realized_return_pct
             FROM paper_trades
-            ORDER BY entry_time DESC
-        """)
+        """
+        params = []
+        if since_param:
+            query += " WHERE entry_time >= %s"
+            params.append(since_param)
+        query += " ORDER BY entry_time DESC"
+
+        c.execute(query, params)
         rows = c.fetchall()
         c.close()
 
