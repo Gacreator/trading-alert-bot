@@ -1938,7 +1938,7 @@ def _apply_gate_result(result):
         base_token = pair.get("baseToken", {}) or {}
         token_name = base_token.get("name")
         token_symbol = base_token.get("symbol")
-        trend_match = check_trend_match(token_name, token_symbol)
+        trend_match = None
 
         info = pair.get("info", {}) or {}
         has_logo = bool(info.get("imageUrl"))
