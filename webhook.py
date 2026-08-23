@@ -7715,6 +7715,50 @@ def check_marketcap_sweet_spot():
         put_conn(conn)
 
 
+@app.route("/check-early-boost-vs-outcome")
+def check_early_boost_vs_outcome():
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT via_early_stage_boost, market_cap_at_recommendation,
+                   max_multiplier_since_recommendation,
+                   pumped_since_recommendation_alerted
+            FROM wallet_token_history
+            WHERE momentum_alerted = TRUE
+            AND via_early_stage_boost IS NOT NULL
+        """)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return "No recommendations with boost-tracking data yet.", 200
+
+        boosted = {"total": 0, "hit_3x": 0}
+        normal = {"total": 0, "hit_3x": 0}
+
+        for was_boosted, mcap, max_mult, hit_3x in rows:
+            hit = bool(hit_3x) or (max_mult and max_mult >= 3)
+            bucket = boosted if was_boosted else normal
+            bucket["total"] += 1
+            if hit:
+                bucket["hit_3x"] += 1
+
+        def rate(d):
+            return f"{d['hit_3x']}/{d['total']} ({d['hit_3x']/d['total']*100:.1f}%)" if d["total"] else "n/a"
+
+        lines = [
+            "<b>Early-stage Twitter boost vs normal recommendations:</b><br>",
+            f"<br>Via early-stage boost: {rate(boosted)}",
+            f"Via normal scoring: {rate(normal)}",
+        ]
+        return "<br>".join(lines), 200
+    except Exception as e:
+        return f"check_early_boost_vs_outcome error: {e}", 500
+    finally:
+        put_conn(conn)
+
+
 @app.route("/check-tiktok-vs-outcome")
 def check_tiktok_vs_outcome():
     conn = get_conn()
