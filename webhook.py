@@ -340,6 +340,7 @@ def init_db():
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS tiktok_total_likes BIGINT")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS score_at_recommendation NUMERIC")
         c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS trend_match TEXT")
+        c.execute("ALTER TABLE wallet_token_history ADD COLUMN IF NOT EXISTS via_early_stage_boost BOOLEAN DEFAULT FALSE")
         c.execute("""
             CREATE TABLE IF NOT EXISTS wallet_buy_events (
                 id SERIAL PRIMARY KEY,
@@ -1958,6 +1959,7 @@ def _apply_gate_result(result):
         tiktok_video_count = tiktok_signal.get("video_count") if tiktok_signal else None
         tiktok_total_plays = tiktok_signal.get("total_plays") if tiktok_signal else None
         tiktok_total_likes = tiktok_signal.get("total_likes") if tiktok_signal else None
+        via_early_stage_boost = bool(details.get("was_boosted"))
 
         social_note = ""
         if twitter_mention_count:
@@ -1969,6 +1971,8 @@ def _apply_gate_result(result):
             social_note += f"🎵 TikTok: {tiktok_video_count} videos, {tiktok_total_plays:,} plays\n"
         if trend_match:
             social_note += f"📈 Trend match: {trend_match}\n"
+        if via_early_stage_boost:
+            social_note += f"🐦⚡ Recommended via Early-Stage Twitter Boost\n"
 
         c.execute(
             "UPDATE token_scan_log SET momentum_alert_fired = TRUE WHERE id = %s",
@@ -1991,6 +1995,7 @@ def _apply_gate_result(result):
                 tiktok_total_plays = %s,
                 tiktok_total_likes = %s,
                 trend_match = %s,
+                via_early_stage_boost = %s,
                 score_at_recommendation = %s,
                 price_at_recommendation = %s,
                 recommended_at = NOW(),
@@ -2014,6 +2019,7 @@ def _apply_gate_result(result):
             (token_name, token_symbol, has_logo, has_website, has_social,
              twitter_mention_count, twitter_has_kol, twitter_avg_sentiment,
              tiktok_video_count, tiktok_total_plays, tiktok_total_likes, trend_match,
+             via_early_stage_boost,
              score, current_price, current_market_cap, result["rug_score"],
              result["top1_pct"], len(cluster_wallets), current_buy_count,
              liquidity_trend_pts, liquidity_level_pts, price_window_pts, volume_sanity_pts,
@@ -2612,6 +2618,7 @@ def run_pump_check(run_id):
                         print(f"🐦 Early-stage boost for {mint}: {early_result}")
                         score = early_result["early_score"]
                         details["early_stage_result"] = early_result
+                        details["was_boosted"] = True
         
                 multiplier_since_recommendation = None
                 if price_at_recommendation and current_price:
