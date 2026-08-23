@@ -1332,8 +1332,16 @@ def check_sellable_via_jupiter(mint, test_amount_lamports=10000000):
         return None
 
 
-def get_twitter_signal(mint, symbol, max_tweets=15):
-    # Return cached result if < 30 min old
+def _tweet_age_minutes(created_at_str):
+    try:
+        tweet_time = datetime.datetime.strptime(created_at_str, "%a %b %d %H:%M:%S %z %Y")
+        now = datetime.datetime.now(datetime.timezone.utc)
+        return (now - tweet_time).total_seconds() / 60
+    except Exception:
+        return None
+
+
+def get_twitter_signal(mint, symbol, max_tweets=15, max_age_minutes=60):
     now = time.time()
     if mint in _twitter_cache:
         cached_at, result = _twitter_cache[mint]
@@ -1342,7 +1350,6 @@ def get_twitter_signal(mint, symbol, max_tweets=15):
 
     if not TWITTERAPI_KEY:
         return None
-
     try:
         url = "https://api.twitterapi.io/twitter/tweet/advanced_search"
         headers = {"X-API-Key": TWITTERAPI_KEY}
@@ -1357,17 +1364,28 @@ def get_twitter_signal(mint, symbol, max_tweets=15):
             return None
 
         data = resp.json()
-        tweets = (data.get("tweets") or [])[:max_tweets]
+        all_tweets = (data.get("tweets") or [])[:max_tweets]
 
-        if not tweets:
-            _twitter_cache[mint] = (now, {"mention_count": 0, "has_kol": False, "kol_handles": []})
-            return _twitter_cache[mint][1]
+        fresh_tweets = []
+        for tweet in all_tweets:
+            age = _tweet_age_minutes(tweet.get("createdAt", ""))
+            if age is not None and age <= max_age_minutes:
+                fresh_tweets.append(tweet)
+
+        if not fresh_tweets:
+            result = {
+                "mention_count": 0, "has_kol": False, "kol_handles": [],
+                "avg_sentiment": 0, "avg_kol_sentiment": None,
+                "stale_mention_count": len(all_tweets),
+            }
+            _twitter_cache[mint] = (now, result)
+            return result
 
         kol_handles = []
         sentiment_scores = []
         kol_sentiments = []
 
-        for tweet in tweets:
+        for tweet in fresh_tweets:
             text = tweet.get("text", "") or ""
             score = _vader.polarity_scores(text)["compound"]
             sentiment_scores.append(score)
@@ -1384,13 +1402,13 @@ def get_twitter_signal(mint, symbol, max_tweets=15):
         avg_kol_sentiment = sum(kol_sentiments) / len(kol_sentiments) if kol_sentiments else None
 
         result = {
-            "mention_count": len(tweets),
+            "mention_count": len(fresh_tweets),
             "has_kol": len(kol_handles) > 0,
             "kol_handles": kol_handles,
             "avg_sentiment": round(avg_sentiment, 3),
             "avg_kol_sentiment": round(avg_kol_sentiment, 3) if avg_kol_sentiment is not None else None,
+            "stale_mention_count": len(all_tweets) - len(fresh_tweets),
         }
-
         _twitter_cache[mint] = (now, result)
         return result
 
@@ -2101,8 +2119,18 @@ def _evaluate_system_c(wallet, mint, current_price, current_market_cap, details,
     twitter_signal = result.get("twitter_signal")
     tiktok_signal = result.get("tiktok_signal")
 
-    had_twitter = bool(twitter_signal and twitter_signal.get("mention_count", 0) > 0)
-    had_tiktok = bool(tiktok_signal and tiktok_signal.get("total_plays", 0) >= 1_000_000)
+    twitter_strong = bool(
+        twitter_signal
+        and twitter_signal.get("has_kol")
+        and (twitter_signal.get("avg_kol_sentiment") or 0) > 0.2
+    )
+    tiktok_strong = bool(tiktok_signal and tiktok_signal.get("total_plays", 0) >= 1_000_000)
+
+    if not (twitter_strong or tiktok_strong):
+        return
+
+    had_twitter = twitter_strong
+    had_tiktok = tiktok_strong
 
     conn = get_conn()
     try:
