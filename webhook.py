@@ -440,6 +440,26 @@ def init_db():
             )
         """)
         c.execute("CREATE INDEX IF NOT EXISTS idx_paper_trades_c_status ON paper_trades_c (status)")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS paper_trades_b (
+                id SERIAL PRIMARY KEY,
+                wallet TEXT,
+                token_mint TEXT,
+                entry_price NUMERIC,
+                entry_time TIMESTAMP DEFAULT NOW(),
+                peak_price NUMERIC,
+                remaining_pct NUMERIC DEFAULT 100,
+                tp_3x_hit BOOLEAN DEFAULT FALSE,
+                tp_10x_hit BOOLEAN DEFAULT FALSE,
+                tp_15x_hit BOOLEAN DEFAULT FALSE,
+                tp_30x_hit BOOLEAN DEFAULT FALSE,
+                status TEXT DEFAULT 'open',
+                close_reason TEXT,
+                closed_at TIMESTAMP,
+                realized_return_pct NUMERIC
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_paper_trades_b_status ON paper_trades_b (status)")
 
         conn.commit()
         c.close()
@@ -2051,6 +2071,7 @@ def _apply_gate_result(result):
         send_bare_address_to_rick_chat(mint)
         _open_paper_trade(wallet, mint, current_price, current_market_cap, result["rug_score"], score)
         _evaluate_system_c(wallet, mint, current_price, current_market_cap, details, result)
+        _open_paper_trade_b(wallet, mint, current_price, current_market_cap, result["rug_score"], score)
 
     except Exception as e:
         print(f"Error applying gate result for {mint}: {e}")
@@ -2164,6 +2185,47 @@ def _evaluate_system_c(wallet, mint, current_price, current_market_cap, details,
         print(f"📝 SYSTEM C TRADE OPENED: {mint} tier={mc_tier} twitter={had_twitter} tiktok={had_tiktok}")
     except Exception as e:
         print(f"Error opening System C trade for {mint}: {e}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        put_conn(conn)
+
+
+def _open_paper_trade_b(wallet, mint, current_price, current_market_cap, rug_score, score):
+    if score != 85 and score < 85:
+        return
+    if current_market_cap is None or current_market_cap > 100000:
+        return
+    if rug_score is None:
+        return
+
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute(
+            "SELECT 1 FROM paper_trades_b WHERE wallet=%s AND token_mint=%s",
+            (wallet, mint)
+        )
+        if c.fetchone() is not None:
+            c.close()
+            return
+
+        c.execute(
+            """
+            INSERT INTO paper_trades_b
+                (wallet, token_mint, entry_price, peak_price, remaining_pct, status)
+            VALUES (%s, %s, %s, %s, 100, 'open')
+            """,
+            (wallet, mint, current_price, current_price)
+        )
+        conn.commit()
+        c.close()
+        print(f"📝 SYSTEM B TRADE OPENED: wallet={wallet} token={mint} entry=${current_price}")
+
+    except Exception as e:
+        print(f"Error opening System B trade for {mint}: {e}")
         try:
             conn.rollback()
         except Exception:
@@ -2451,6 +2513,126 @@ def _check_system_c_trades():
 
         except Exception as e:
             print(f"Error checking System C trade {trade_id} for {mint}: {e}")
+            try:
+                conn2.rollback()
+            except Exception:
+                pass
+        finally:
+            put_conn(conn2)
+
+
+def _check_paper_trades_b():
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT id, wallet, token_mint, entry_price, peak_price, remaining_pct,
+                   tp_3x_hit, tp_10x_hit, tp_15x_hit, tp_30x_hit
+            FROM paper_trades_b
+            WHERE status = 'open'
+        """)
+        open_trades = c.fetchall()
+        c.close()
+    finally:
+        put_conn(conn)
+
+    if not open_trades:
+        return
+
+    mints = [row[2] for row in open_trades]
+    pairs_by_mint = get_dexscreener_batches_ratelimited(mints, batch_size=30)
+
+    for (trade_id, wallet, mint, entry_price, peak_price,
+         remaining_pct, tp_3x, tp_10x, tp_15x, tp_30x) in open_trades:
+
+        pair = pairs_by_mint.get(mint)
+        if not pair:
+            continue
+
+        current_price = None
+        try:
+            current_price = float(pair.get("priceUsd"))
+        except (TypeError, ValueError):
+            continue
+
+        if not current_price or not entry_price:
+            continue
+
+        entry_price = float(entry_price)
+        peak_price = float(peak_price) if peak_price else entry_price
+        remaining_pct = float(remaining_pct)
+        multiplier = current_price / entry_price
+        new_peak = max(peak_price, current_price)
+
+        conn2 = get_conn()
+        try:
+            c2 = conn2.cursor()
+
+            realized_this_cycle = 0.0
+            new_tp_3x, new_tp_10x, new_tp_15x, new_tp_30x = tp_3x, tp_10x, tp_15x, tp_30x
+            new_remaining = remaining_pct
+            closed = False
+            close_reason = None
+
+            if multiplier >= 30 and not tp_30x:
+                new_remaining -= 25
+                new_tp_30x = True
+                realized_this_cycle += 25 * 30
+            if multiplier >= 15 and not tp_15x:
+                new_remaining -= 25
+                new_tp_15x = True
+                realized_this_cycle += 25 * 15
+            if multiplier >= 10 and not tp_10x:
+                new_remaining -= 25
+                new_tp_10x = True
+                realized_this_cycle += 25 * 10
+            if multiplier >= 3 and not tp_3x:
+                new_remaining -= 25
+                new_tp_3x = True
+                realized_this_cycle += 25 * 3
+
+            stop_loss_hit = current_price <= entry_price * 0.9
+
+            if stop_loss_hit and new_remaining > 0:
+                realized_this_cycle += new_remaining * multiplier
+                new_remaining = 0
+                closed = True
+                close_reason = "stop_loss"
+            elif new_remaining <= 0:
+                closed = True
+                close_reason = "full_take_profit"
+
+            if closed:
+                c2.execute(
+                    """
+                    UPDATE paper_trades_b
+                    SET peak_price = %s, remaining_pct = 0,
+                        tp_3x_hit = %s, tp_10x_hit = %s, tp_15x_hit = %s, tp_30x_hit = %s,
+                        status = 'closed', close_reason = %s, closed_at = NOW(),
+                        realized_return_pct = COALESCE(realized_return_pct, 0) + %s
+                    WHERE id = %s
+                    """,
+                    (new_peak, new_tp_3x, new_tp_10x, new_tp_15x, new_tp_30x,
+                     close_reason, realized_this_cycle, trade_id)
+                )
+                print(f"📝 SYSTEM B CLOSED: {mint} via {close_reason}")
+            else:
+                c2.execute(
+                    """
+                    UPDATE paper_trades_b
+                    SET peak_price = %s, remaining_pct = %s,
+                        tp_3x_hit = %s, tp_10x_hit = %s, tp_15x_hit = %s, tp_30x_hit = %s,
+                        realized_return_pct = COALESCE(realized_return_pct, 0) + %s
+                    WHERE id = %s
+                    """,
+                    (new_peak, new_remaining, new_tp_3x, new_tp_10x, new_tp_15x, new_tp_30x,
+                     realized_this_cycle, trade_id)
+                )
+            conn2.commit()
+            c2.close()
+
+        except Exception as e:
+            print(f"Error checking System B trade {trade_id} for {mint}: {e}")
             try:
                 conn2.rollback()
             except Exception:
@@ -2825,6 +3007,7 @@ def run_pump_check(run_id):
         _check_paper_trades()
         _check_buy_count_growth()
         _check_system_c_trades()
+        _check_paper_trades_b()
 
         print(f"check_pumps finished — checked {checked} tokens, {len(qualifying_tokens)} qualified for gate-check")
         
