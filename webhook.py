@@ -134,6 +134,8 @@ _twitter_cache = {}
 _twitter_daily_count = {"date": None, "count": 0}
 _wallet_twitter_cooldown = {}
 _tiktok_cache = {}
+_price_cache = {}
+_price_cache_ttl = 60  # seconds
 
 def _twitter_call_allowed(max_per_day=200):
     today = datetime.date.today().isoformat()
@@ -807,15 +809,12 @@ def get_dexscreener_batch(mints):
 
 
 def get_dexscreener_batches_ratelimited(mints, batch_size=30):
-    all_results = {}
-    batches = [mints[i:i + batch_size] for i in range(0, len(mints), batch_size)]
-
+    ...
     for batch in batches:
         with _dex_rate_lock:
             batch_result = get_dexscreener_batch(batch)
             all_results.update(batch_result)
-            time.sleep(0.3)
-
+            time.sleep(1.5)   # ← was 0.3
     return all_results
 
 
@@ -852,13 +851,26 @@ def get_dexscreener_data(mint):
 
 
 def get_current_price(mint):
+    now = time.time()
+    
+    # Return cached price if fresh
+    if mint in _price_cache:
+        cached_at, price = _price_cache[mint]
+        if now - cached_at < _price_cache_ttl:
+            return price
+    
+    # Fetch fresh
     pair = get_dexscreener_single(mint)
+    price = None
     if pair and pair.get("priceUsd"):
         try:
-            return float(pair["priceUsd"])
+            price = float(pair["priceUsd"])
         except (TypeError, ValueError):
-            return None
-    return None
+            price = None
+    
+    # Store in cache regardless of result (so None doesn't get hammered)
+    _price_cache[mint] = (now, price)
+    return price
 
 
 def get_token_context(mint):
@@ -1641,26 +1653,46 @@ def webhook():
         return "unauthorized", 401
 
     data = request.json
-
     if not data:
-        print("Webhook received empty or non-JSON body")
         return "no data", 400
 
     transactions = data if isinstance(data, list) else [data]
-    print(f"🔔 New event received ({len(transactions)} transaction(s))")
 
+    # ── COLLECT ALL UNIQUE MINTS FIRST ──
+    all_mints = set()
+    wallet_mint_pairs = []
     for tx in transactions:
         if not isinstance(tx, dict):
             continue
         for wallet in TRACKED_WALLETS:
             mints = extract_wallet_buys(tx, wallet)
             for mint in mints:
-                check_and_record_buy(wallet, mint)
+                all_mints.add(mint)
+                wallet_mint_pairs.append((wallet, mint))
+
+    # ── BATCH FETCH PRICES ONCE ──
+    prices_by_mint = {}
+    mints_list = list(all_mints)
+    for i in range(0, len(mints_list), 30):
+        batch = mints_list[i:i + 30]
+        with _dex_rate_lock:
+            batch_result = get_dexscreener_batch(batch)
+            for m, p in batch_result.items():
+                if p and p.get("priceUsd"):
+                    try:
+                        prices_by_mint[m] = float(p["priceUsd"])
+                    except (TypeError, ValueError):
+                        pass
+            time.sleep(1.5)
+
+    # ── PROCESS RECORDING WITH CACHED PRICES ──
+    for wallet, mint in wallet_mint_pairs:
+        check_and_record_buy(wallet, mint, prices_by_mint.get(mint))
 
     return "ok", 200
 
 
-def check_and_record_buy(wallet, mint):
+def check_and_record_buy(wallet, mint, price=None):
     max_attempts = 2
     for attempt in range(max_attempts):
         conn = get_conn()
@@ -1673,7 +1705,9 @@ def check_and_record_buy(wallet, mint):
             )
             exists = c.fetchone() is not None
 
-            price = get_current_price(mint)
+            # Only fetch price if not provided by caller
+            if price is None:
+                price = get_current_price(mint)
 
             if not exists:
                 try:
@@ -2660,6 +2694,22 @@ def _check_buy_count_growth():
     if not open_trades:
         return
 
+    # ── BATCH FETCH ALL PRICES FIRST ──
+    mints = list({row[1] for row in open_trades})
+    prices_by_mint = {}
+    for i in range(0, len(mints), 30):
+        batch = mints[i:i + 30]
+        with _dex_rate_lock:
+            batch_result = get_dexscreener_batch(batch)
+            for m, p in batch_result.items():
+                if p and p.get("priceUsd"):
+                    try:
+                        prices_by_mint[m] = float(p["priceUsd"])
+                    except (TypeError, ValueError):
+                        pass
+            time.sleep(1.5)
+    # ─────────────────────────────────
+
     for wallet, mint, entry_price, buy_count_at_rec in open_trades:
         if buy_count_at_rec is None:
             continue
@@ -2679,7 +2729,7 @@ def _check_buy_count_growth():
 
         growth = current_buy_count - buy_count_at_rec
 
-        current_price = get_current_price(mint)
+        current_price = prices_by_mint.get(mint)
         below_entry = current_price is not None and entry_price is not None and current_price < float(entry_price)
 
         if growth >= 5 and below_entry:
