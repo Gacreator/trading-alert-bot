@@ -2781,7 +2781,7 @@ def run_pump_check(run_id):
                     and wallet == EARLY_STAGE_WALLET
                     and not momentum_alerted
                     and 5000 <= current_market_cap < 20000
-                    and buy_count <= 2
+                    and (buy_count or 0) <= 2
                     and score < 85
                     and score > 0
                     and details.get("vol_5m", 0) >= 500
