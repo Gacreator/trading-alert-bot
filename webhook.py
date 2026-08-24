@@ -809,12 +809,15 @@ def get_dexscreener_batch(mints):
 
 
 def get_dexscreener_batches_ratelimited(mints, batch_size=30):
-    ...
+    all_results = {}
+    batches = [mints[i:i + batch_size] for i in range(0, len(mints), batch_size)]
+
     for batch in batches:
         with _dex_rate_lock:
             batch_result = get_dexscreener_batch(batch)
             all_results.update(batch_result)
-            time.sleep(1.5)   # ← was 0.3
+            time.sleep(1.5)
+
     return all_results
 
 
