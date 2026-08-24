@@ -2108,7 +2108,7 @@ def _apply_gate_result(result):
         send_bare_address_to_rick_chat(mint)
         _open_paper_trade(wallet, mint, current_price, current_market_cap, result["rug_score"], score)
         _evaluate_system_c(wallet, mint, current_price, current_market_cap, details, result, pair)
-        _open_paper_trade_b(wallet, mint, current_price, current_market_cap, result["rug_score"], score)
+       # _open_paper_trade_b(wallet, mint, current_price, current_market_cap, result["rug_score"], score)
 
     except Exception as e:
         print(f"Error applying gate result for {mint}: {e}")
@@ -3065,7 +3065,7 @@ def run_pump_check(run_id):
         _check_paper_trades()
         _check_buy_count_growth()
         _check_system_c_trades()
-        _check_paper_trades_b()
+        #_check_paper_trades_b()
 
         print(f"check_pumps finished — checked {checked} tokens, {len(qualifying_tokens)} qualified for gate-check")
         
