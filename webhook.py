@@ -114,7 +114,7 @@ QUEEN_TOOLS = [
 
 SOLANA_ADDRESS_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 
-_check_pumps_lock = threading.Semaphore(1)
+_check_pumps_lock = threading.Semaphore(5)
 _check_pumps_lock_time = None
 _check_pumps_run_id = None
 _dex_rate_lock = threading.Semaphore(MAX_CONCURRENT_DEXSCREENER)
@@ -816,7 +816,7 @@ def get_dexscreener_batches_ratelimited(mints, batch_size=30):
         with _dex_rate_lock:
             batch_result = get_dexscreener_batch(batch)
             all_results.update(batch_result)
-            time.sleep(1.5)
+            time.sleep(0.6)
 
     return all_results
 
@@ -1686,7 +1686,7 @@ def webhook():
                         prices_by_mint[m] = float(p["priceUsd"])
                     except (TypeError, ValueError):
                         pass
-            time.sleep(1.5)
+            time.sleep(0.6)
 
     # ── PROCESS RECORDING WITH CACHED PRICES ──
     for wallet, mint in wallet_mint_pairs:
@@ -2710,7 +2710,7 @@ def _check_buy_count_growth():
                         prices_by_mint[m] = float(p["priceUsd"])
                     except (TypeError, ValueError):
                         pass
-            time.sleep(1.5)
+            time.sleep(0.6)
     # ─────────────────────────────────
 
     for wallet, mint, entry_price, buy_count_at_rec in open_trades:
