@@ -2070,7 +2070,7 @@ def _apply_gate_result(result):
         )
         send_bare_address_to_rick_chat(mint)
         _open_paper_trade(wallet, mint, current_price, current_market_cap, result["rug_score"], score)
-        _evaluate_system_c(wallet, mint, current_price, current_market_cap, details, result)
+        _evaluate_system_c(wallet, mint, current_price, current_market_cap, details, result, pair)
         _open_paper_trade_b(wallet, mint, current_price, current_market_cap, result["rug_score"], score)
 
     except Exception as e:
@@ -2124,7 +2124,7 @@ def _open_paper_trade(wallet, mint, current_price, current_market_cap, rug_score
         put_conn(conn)
 
 
-def _evaluate_system_c(wallet, mint, current_price, current_market_cap, details, result):
+def _evaluate_system_c(wallet, mint, current_price, current_market_cap, details, result, pair):
     pc_h6 = details.get("pc_h6")
 
     rug_pass = result["rug_score"] is not None and result["rug_score"] <= 30
