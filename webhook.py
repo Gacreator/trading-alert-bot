@@ -2716,7 +2716,7 @@ def run_pump_check(run_id):
                 prev_liquidity, price_at_recommendation, pumped_since_rec_alerted,
                 recommended_at, market_cap_at_recommendation, buy_count) in enumerate(rows):
 
-                        if i > 0 and i % DB_CONN_REFRESH_EVERY == 0:
+            if i > 0 and i % DB_CONN_REFRESH_EVERY == 0:
                 try:
                     c.close()
                 except Exception:
