@@ -2071,7 +2071,7 @@ def _apply_gate_result(result):
         send_bare_address_to_rick_chat(mint)
         _open_paper_trade(wallet, mint, current_price, current_market_cap, result["rug_score"], score)
         _evaluate_system_c(wallet, mint, current_price, current_market_cap, details, result, pair)
-        _open_paper_trade_b(wallet, mint, current_price, current_market_cap, result["rug_score"], score)
+        _evaluate_system_c(wallet, mint, current_price, current_market_cap, details, result, pair)
 
     except Exception as e:
         print(f"Error applying gate result for {mint}: {e}")
