@@ -114,7 +114,7 @@ QUEEN_TOOLS = [
 
 SOLANA_ADDRESS_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 
-_check_pumps_lock = threading.Lock()
+_check_pumps_lock = threading.Semaphore(1)
 _check_pumps_lock_time = None
 _check_pumps_run_id = None
 _dex_rate_lock = threading.Semaphore(MAX_CONCURRENT_DEXSCREENER)
