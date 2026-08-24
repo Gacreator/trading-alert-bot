@@ -2194,7 +2194,7 @@ def _evaluate_system_c(wallet, mint, current_price, current_market_cap, details,
 
 
 def _open_paper_trade_b(wallet, mint, current_price, current_market_cap, rug_score, score):
-    if score != 85 and score < 85:
+    if score < 85:
         return
     if current_market_cap is None or current_market_cap > 100000:
         return
