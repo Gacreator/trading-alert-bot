@@ -121,7 +121,7 @@ _dex_rate_lock = threading.Semaphore(MAX_CONCURRENT_DEXSCREENER)
 
 _connection_pool = pg_pool.ThreadedConnectionPool(
     minconn=2,
-    maxconn=20,
+    maxconn=50,  # ← was 20
     dsn=DATABASE_URL,
     connect_timeout=10,
     keepalives=1,
@@ -2716,9 +2716,13 @@ def run_pump_check(run_id):
                 prev_liquidity, price_at_recommendation, pumped_since_rec_alerted,
                 recommended_at, market_cap_at_recommendation, buy_count) in enumerate(rows):
 
-            if i > 0 and i % DB_CONN_REFRESH_EVERY == 0:
+                        if i > 0 and i % DB_CONN_REFRESH_EVERY == 0:
                 try:
-                    put_conn(conn)
+                    c.close()
+                except Exception:
+                    pass
+                try:
+                    put_conn(conn, close=True)  # ← close=True, don't recycle a stale conn
                 except Exception:
                     pass
                 try:
@@ -2727,6 +2731,7 @@ def run_pump_check(run_id):
                     print(f"Proactively refreshed DB connection at token {i}")
                 except Exception as refresh_err:
                     print(f"Proactive refresh failed at token {i}: {refresh_err}")
+                    break  # ← stop the loop if we can't get a fresh connection
 
             try:
                 pair = pairs_by_mint.get(mint)
