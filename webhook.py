@@ -8083,6 +8083,72 @@ def check_early_boost_vs_outcome():
         put_conn(conn)
 
 
+@app.route("/check-tiktok-view-threshold")
+def check_tiktok_view_threshold():
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT tiktok_total_plays, max_multiplier_since_recommendation,
+                   pumped_since_recommendation_alerted
+            FROM wallet_token_history
+            WHERE momentum_alerted = TRUE
+            AND tiktok_total_plays IS NOT NULL
+            AND tiktok_total_plays > 0
+        """)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return "No recommendations with TikTok view data yet.", 200
+
+        buckets = {
+            "0-100K": {"total": 0, "hit_3x": 0},
+            "100K-500K": {"total": 0, "hit_3x": 0},
+            "500K-1M": {"total": 0, "hit_3x": 0},
+            "1M-5M": {"total": 0, "hit_3x": 0},
+            "5M+": {"total": 0, "hit_3x": 0},
+        }
+
+        for plays, max_mult, hit_3x in rows:
+            plays = float(plays)
+            if plays < 100000:
+                key = "0-100K"
+            elif plays < 500000:
+                key = "100K-500K"
+            elif plays < 1000000:
+                key = "500K-1M"
+            elif plays < 5000000:
+                key = "1M-5M"
+            else:
+                key = "5M+"
+
+            hit = bool(hit_3x) or (max_mult and max_mult >= 3)
+            buckets[key]["total"] += 1
+            if hit:
+                buckets[key]["hit_3x"] += 1
+
+        lines = ["<b>TikTok view count vs outcome (finer bands):</b><br>"]
+        for bucket, d in buckets.items():
+            total = d["total"]
+            hits = d["hit_3x"]
+            rate = f"{hits/total*100:.1f}%" if total else "n/a"
+            lines.append(f"<br>{bucket}: {hits}/{total} hit 3x+ ({rate})")
+
+        lines.append(
+            "<br><br>Look for where hit-rate meaningfully improves. If a lower "
+            "band (e.g. 100K-500K) performs comparably to 1M+, the 1M threshold "
+            "may be set higher than necessary."
+        )
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_tiktok_view_threshold error: {e}", 500
+
+    finally:
+        put_conn(conn)
+
+
 @app.route("/check-tiktok-vs-outcome")
 def check_tiktok_vs_outcome():
     conn = get_conn()
