@@ -2521,10 +2521,12 @@ def _check_system_c_trades():
             any_profit_taken = new_tp_1_5x or new_tp_3x or new_tp_10x or new_tp_15x or new_tp_30x
 
             stop_loss_hit = (not any_profit_taken) and current_price <= entry_price * 0.7
+
+            profit_floor = entry_price + (new_peak - entry_price) * 0.1
             trailing_stop_hit = (
-                new_peak > 0
-                and current_price <= new_peak * 0.7
-                and (any_profit_taken or current_price > entry_price * 0.7)
+                any_profit_taken
+                and new_peak > entry_price
+                and current_price <= profit_floor
             )
 
             if stop_loss_hit and new_remaining > 0:
@@ -3149,7 +3151,7 @@ def check_pumps():
 @app.route("/check-paper-trades-fast", methods=["GET", "POST"])
 def check_paper_trades_fast():
     try:
-        _check_paper_trades()
+        _check_system_c_trades()
         return "checked", 200
     except Exception as e:
         return f"check_paper_trades_fast error: {e}", 500
