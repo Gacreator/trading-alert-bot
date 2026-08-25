@@ -8149,6 +8149,73 @@ def check_tiktok_view_threshold():
         put_conn(conn)
 
 
+@app.route("/check-highcap-threshold")
+def check_highcap_threshold():
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT market_cap_at_recommendation, max_multiplier_since_recommendation,
+                   pumped_since_recommendation_alerted
+            FROM wallet_token_history
+            WHERE momentum_alerted = TRUE
+            AND market_cap_at_recommendation IS NOT NULL
+            AND market_cap_at_recommendation >= 100000
+        """)
+        rows = c.fetchall()
+        c.close()
+
+        if not rows:
+            return "No recommendations above $100K market cap yet.", 200
+
+        buckets = {
+            "100K-150K": {"total": 0, "hit_3x": 0},
+            "150K-200K": {"total": 0, "hit_3x": 0},
+            "200K-300K": {"total": 0, "hit_3x": 0},
+            "300K-500K": {"total": 0, "hit_3x": 0},
+            "500K-1M": {"total": 0, "hit_3x": 0},
+            "1M-2M": {"total": 0, "hit_3x": 0},
+            "2M+": {"total": 0, "hit_3x": 0},
+        }
+
+        for mcap, max_mult, hit_3x in rows:
+            mcap = float(mcap)
+            if mcap < 150000:
+                key = "100K-150K"
+            elif mcap < 200000:
+                key = "150K-200K"
+            elif mcap < 300000:
+                key = "200K-300K"
+            elif mcap < 500000:
+                key = "300K-500K"
+            elif mcap < 1000000:
+                key = "500K-1M"
+            elif mcap < 2000000:
+                key = "1M-2M"
+            else:
+                key = "2M+"
+
+            hit = bool(hit_3x) or (max_mult and max_mult >= 3)
+            buckets[key]["total"] += 1
+            if hit:
+                buckets[key]["hit_3x"] += 1
+
+        lines = ["<b>Market cap $100K+ vs outcome (full range):</b><br>"]
+        for bucket, d in buckets.items():
+            total = d["total"]
+            hits = d["hit_3x"]
+            rate = f"{hits/total*100:.1f}%" if total else "n/a"
+            lines.append(f"<br>{bucket}: {hits}/{total} hit 3x+ ({rate})")
+
+        return "<br>".join(lines), 200
+
+    except Exception as e:
+        return f"check_highcap_threshold error: {e}", 500
+
+    finally:
+        put_conn(conn)
+
+
 @app.route("/check-tiktok-vs-outcome")
 def check_tiktok_vs_outcome():
     conn = get_conn()
