@@ -2182,6 +2182,8 @@ def _evaluate_system_c(wallet, mint, current_price, current_market_cap, details,
         mc_tier = "better"
     elif current_market_cap < 100000:
         mc_tier = "good"
+    elif current_market_cap < 500000:
+        mc_tier = "acceptable"
     else:
         return
 
@@ -2196,10 +2198,19 @@ def _evaluate_system_c(wallet, mint, current_price, current_market_cap, details,
         and twitter_signal.get("has_kol")
         and (twitter_signal.get("avg_kol_sentiment") or 0) > 0.2
     )
-    tiktok_strong = bool(tiktok_signal and tiktok_signal.get("total_plays", 0) >= 1_000_000)
+    twitter_strong = bool(
+        twitter_signal
+        and twitter_signal.get("has_kol")
+        and (twitter_signal.get("avg_kol_sentiment") or 0) > 0.2
+    )
+    tiktok_strong = bool(tiktok_signal and tiktok_signal.get("total_plays", 0) >= 500_000)
 
-    if not (twitter_strong or tiktok_strong):
-        return
+    if TWITTERAPI_KEY:
+        if not (twitter_strong and tiktok_strong):
+            return
+    else:
+        if not tiktok_strong:
+            return
 
     had_twitter = twitter_strong
     had_tiktok = tiktok_strong
@@ -2220,6 +2231,17 @@ def _evaluate_system_c(wallet, mint, current_price, current_market_cap, details,
         conn.commit()
         c.close()
         print(f"📝 SYSTEM C TRADE OPENED: {mint} tier={mc_tier} twitter={had_twitter} tiktok={had_tiktok}")
+        send_telegram_alert(
+            f"⭐ SYSTEM C SPECIAL PICK ⭐\n\n"
+            f"Token: <code>{mint}</code>\n"
+            f"Entry: ${current_price}\n"
+            f"Market cap tier: {mc_tier}\n"
+            f"Twitter signal: {'✅' if had_twitter else '❌'}\n"
+            f"TikTok signal: {'✅' if had_tiktok else '❌'}\n\n"
+            f"This token passed every combined-signal check — RugCheck, holder %, "
+            f"logo, price-action, and social confirmation. Tracking as a high-conviction pick.\n\n"
+            f"📊 DexScreener: https://dexscreener.com/solana/{mint}"
+        )
     except Exception as e:
         print(f"Error opening System C trade for {mint}: {e}")
         try:
