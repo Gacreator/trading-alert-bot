@@ -2112,7 +2112,7 @@ def _apply_gate_result(result):
         )
         send_bare_address_to_rick_chat(mint)
         _open_paper_trade(wallet, mint, current_price, current_market_cap, result["rug_score"], score)
-        _evaluate_system_c(wallet, mint, current_price, current_market_cap, details, result, pair)
+        _evaluate_system_c(wallet, mint, current_price, current_market_cap, details, result, pair, score)
        # _open_paper_trade_b(wallet, mint, current_price, current_market_cap, result["rug_score"], score)
 
     except Exception as e:
@@ -2166,7 +2166,10 @@ def _open_paper_trade(wallet, mint, current_price, current_market_cap, rug_score
         put_conn(conn)
 
 
-def _evaluate_system_c(wallet, mint, current_price, current_market_cap, details, result, pair):
+def _evaluate_system_c(wallet, mint, current_price, current_market_cap, details, result, pair, score):
+    if score != 100:
+        return
+
     pc_h6 = details.get("pc_h6")
     pc_5m = details.get("pc_5m")
 
