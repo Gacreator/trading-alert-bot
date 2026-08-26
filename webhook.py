@@ -1428,7 +1428,7 @@ def get_twitter_signal(mint, symbol, max_tweets=15, max_age_minutes=60):
 
             author = tweet.get("author", {}) or {}
             followers = author.get("followers", 0) or 0
-            if followers >= 10000:
+            if followers >= 5000:
                 handle = author.get("userName")
                 if handle:
                     kol_handles.append(handle)
@@ -1909,6 +1909,11 @@ def _compute_early_stage_score(mint, symbol, pair):
     twitter_signal = get_twitter_signal(mint, symbol)
 
     top1_pct = holder_data.get("top1_pct") if holder_data else None
+
+    info = pair.get("info", {}) or {}
+    has_logo = bool(info.get("imageUrl"))
+    if not has_logo:
+        return {"early_score": 0, "rug_pass": False, "holder_pass": False, "twitter_pass": False, "no_logo": True}
 
     rug_pass = rug_score is not None and rug_score <= 30
     holder_pass = top1_pct is not None and top1_pct < 7
@@ -2857,7 +2862,7 @@ def run_pump_check(run_id):
                     EARLY_STAGE_WALLET
                     and wallet == EARLY_STAGE_WALLET
                     and not momentum_alerted
-                    and 5000 <= current_market_cap < 20000
+                    and 5000 <= current_market_cap < 100000
                     and (buy_count or 0) <= 2
                     and score < 85
                     and score > 0
