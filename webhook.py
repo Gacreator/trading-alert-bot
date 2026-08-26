@@ -2168,6 +2168,10 @@ def _open_paper_trade(wallet, mint, current_price, current_market_cap, rug_score
 
 def _evaluate_system_c(wallet, mint, current_price, current_market_cap, details, result, pair):
     pc_h6 = details.get("pc_h6")
+    pc_5m = details.get("pc_5m")
+
+    if pc_5m is None or pc_5m <= 0:
+        return
 
     rug_pass = result["rug_score"] is not None and result["rug_score"] <= 30
     holder_pass = result["top1_pct"] is not None and result["top1_pct"] < 7
