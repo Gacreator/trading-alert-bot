@@ -2187,8 +2187,6 @@ def _evaluate_system_c(wallet, mint, current_price, current_market_cap, details,
         mc_tier = "better"
     elif current_market_cap < 100000:
         mc_tier = "good"
-    elif current_market_cap < 500000:
-        mc_tier = "acceptable"
     else:
         return
 
@@ -2203,19 +2201,10 @@ def _evaluate_system_c(wallet, mint, current_price, current_market_cap, details,
         and twitter_signal.get("has_kol")
         and (twitter_signal.get("avg_kol_sentiment") or 0) > 0.2
     )
-    twitter_strong = bool(
-        twitter_signal
-        and twitter_signal.get("has_kol")
-        and (twitter_signal.get("avg_kol_sentiment") or 0) > 0.2
-    )
-    tiktok_strong = bool(tiktok_signal and tiktok_signal.get("total_plays", 0) >= 500_000)
+    tiktok_strong = bool(tiktok_signal and tiktok_signal.get("total_plays", 0) >= 1_000_000)
 
-    if TWITTERAPI_KEY:
-        if not (twitter_strong and tiktok_strong):
-            return
-    else:
-        if not tiktok_strong:
-            return
+    if not (twitter_strong or tiktok_strong):
+        return
 
     had_twitter = twitter_strong
     had_tiktok = tiktok_strong
