@@ -3153,8 +3153,7 @@ def check_pumps():
 @app.route("/check-paper-trades-fast", methods=["GET", "POST"])
 def check_paper_trades_fast():
     try:
-        _check_system_c_trades()
-        return "checked", 200
+        return "disabled to reduce compute usage", 200
     except Exception as e:
         return f"check_paper_trades_fast error: {e}", 500
 
