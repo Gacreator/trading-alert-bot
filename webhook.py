@@ -1111,6 +1111,34 @@ def get_prior_scan_snapshot(mint):
         put_conn(conn)
 
 
+def get_prior_scan_snapshot_batch(mints):
+    """Fetch latest snapshot for many mints in one query."""
+    if not mints:
+        return {}
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            WITH latest AS (
+                SELECT token_mint, liquidity_delta_pct, pc_5m,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY token_mint
+                           ORDER BY scanned_at DESC
+                       ) as rn
+                FROM token_scan_log
+                WHERE token_mint = ANY(%s)
+            )
+            SELECT token_mint, liquidity_delta_pct, pc_5m
+            FROM latest
+            WHERE rn = 1
+        """, (list(mints),))
+        rows = c.fetchall()
+        c.close()
+        return {m: (ld, pc) for m, ld, pc in rows}
+    finally:
+        put_conn(conn)
+
+        
 def liquidity_trend_label(current_delta, prior_delta):
     if current_delta is None or prior_delta is None:
         return "⚪ Liquidity trend: not enough history yet to judge consistency."
@@ -1810,6 +1838,47 @@ def get_buy_trajectory(wallet, mint):
             return "flat"
     finally:
         put_conn(conn)
+
+
+def get_buy_trajectory_batch(wallet_mint_pairs):
+    """Fetch buy trajectories for many (wallet, mint) pairs in one query."""
+    if not wallet_mint_pairs:
+        return {}
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        mints = list({m for w, m in wallet_mint_pairs})
+        c.execute("""
+            SELECT wallet, token_mint, price, buy_number
+            FROM wallet_buy_events
+            WHERE token_mint = ANY(%s)
+            ORDER BY wallet, token_mint, buy_number ASC
+        """, (mints,))
+        rows = c.fetchall()
+        c.close()
+
+        pairs_set = set(wallet_mint_pairs)
+        from collections import defaultdict
+        grouped = defaultdict(list)
+        for w, m, price, bn in rows:
+            if (w, m) in pairs_set and price is not None:
+                grouped[(w, m)].append(float(price))
+
+        result = {}
+        for pair, prices in grouped.items():
+            if len(prices) < 2:
+                result[pair] = None
+                continue
+            first, last = prices[0], prices[-1]
+            if last > first * 1.05:
+                result[pair] = "rising"
+            elif last < first * 0.95:
+                result[pair] = "falling"
+            else:
+                result[pair] = "flat"
+        return result
+    finally:
+        put_conn(conn)      
 
 
 def _gate_check_one_token(item):
@@ -2775,6 +2844,10 @@ def run_pump_check(run_id):
         mints = [row[1] for row in rows]
         pairs_by_mint = get_dexscreener_batches_ratelimited(mints, batch_size=30)
 
+        all_pairs = list({(row[0], row[1]) for row in rows})
+        prior_snapshots = get_prior_scan_snapshot_batch(mints)
+        trajectories = get_buy_trajectory_batch(all_pairs)
+
         for i, (wallet, mint, price_at_first_buy, pumped_alerted, momentum_alerted,
                 prev_liquidity, price_at_recommendation, pumped_since_rec_alerted,
                 recommended_at, market_cap_at_recommendation, buy_count) in enumerate(rows):
@@ -2832,9 +2905,9 @@ def run_pump_check(run_id):
                     except (TypeError, ValueError, ZeroDivisionError):
                         liquidity_delta_pct = None
 
-                prior_liq_delta, prior_pc_5m = get_prior_scan_snapshot(mint)
-                current_trajectory = get_buy_trajectory(wallet, mint)
-
+                prior_liq_delta, prior_pc_5m = prior_snapshots.get(mint, (None, None))
+                current_trajectory = trajectories.get((wallet, mint))
+                
                 score, details = score_momentum(pair, liquidity_delta_pct, prior_liq_delta, current_trajectory)
                 current_liquidity = details.get("liquidity")
 
