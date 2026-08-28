@@ -2017,10 +2017,8 @@ def _apply_gate_result(result):
 
         twitter_mention_count = twitter_signal.get("mention_count") if twitter_signal else None
         twitter_has_kol = twitter_signal.get("has_kol") if twitter_signal else None
-        twitter_avg_sentiment = twitter_signal.get("avg_sentiment") if twitter_signal else None
         tiktok_video_count = tiktok_signal.get("video_count") if tiktok_signal else None
         tiktok_total_plays = tiktok_signal.get("total_plays") if tiktok_signal else None
-        tiktok_total_likes = tiktok_signal.get("total_likes") if tiktok_signal else None
         via_early_stage_boost = bool(details.get("was_boosted"))
 
         social_note = ""
@@ -2031,8 +2029,6 @@ def _apply_gate_result(result):
             social_note += "\n"
         if tiktok_video_count:
             social_note += f"🎵 TikTok: {tiktok_video_count} videos, {tiktok_total_plays:,} plays\n"
-        if trend_match:
-            social_note += f"📈 Trend match: {trend_match}\n"
         if via_early_stage_boost:
             social_note += f"🐦⚡ Recommended via Early-Stage Twitter Boost\n"
 
@@ -2050,15 +2046,6 @@ def _apply_gate_result(result):
                 has_logo = %s,
                 has_website = %s,
                 has_social = %s,
-                twitter_mention_count = %s,
-                twitter_has_kol = %s,
-                twitter_avg_sentiment = %s,
-                tiktok_video_count = %s,
-                tiktok_total_plays = %s,
-                tiktok_total_likes = %s,
-                trend_match = %s,
-                via_early_stage_boost = %s,
-                score_at_recommendation = %s,
                 price_at_recommendation = %s,
                 recommended_at = NOW(),
                 market_cap_at_recommendation = %s,
@@ -2079,10 +2066,7 @@ def _apply_gate_result(result):
             WHERE wallet=%s AND token_mint=%s
             """,
             (token_name, token_symbol, has_logo, has_website, has_social,
-             twitter_mention_count, twitter_has_kol, twitter_avg_sentiment,
-             tiktok_video_count, tiktok_total_plays, tiktok_total_likes, trend_match,
-             via_early_stage_boost,
-             score, current_price, current_market_cap, result["rug_score"],
+             current_price, current_market_cap, result["rug_score"],
              result["top1_pct"], len(cluster_wallets), current_buy_count,
              liquidity_trend_pts, liquidity_level_pts, price_window_pts, volume_sanity_pts,
              buy_trajectory, clean_tier, conv_tier, too_perfect_flag, result["sellable_str"],
