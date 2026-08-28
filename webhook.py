@@ -3089,7 +3089,7 @@ def run_pump_check(run_id):
                 _apply_gate_result(result)
 
         # _check_paper_trades()
-        _check_buy_count_growth()
+        # _check_buy_count_growth()
         # _check_system_c_trades()
         #_check_paper_trades_b()
 
