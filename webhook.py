@@ -2847,6 +2847,7 @@ def run_pump_check(run_id):
         all_pairs = list({(row[0], row[1]) for row in rows})
         prior_snapshots = get_prior_scan_snapshot_batch(mints)
         trajectories = get_buy_trajectory_batch(all_pairs)
+        print(f"Batch prefetch: {len(prior_snapshots)} snapshots, {len(trajectories)} trajectories (from {len(mints)} mints, {len(all_pairs)} pairs)")
 
         for i, (wallet, mint, price_at_first_buy, pumped_alerted, momentum_alerted,
                 prev_liquidity, price_at_recommendation, pumped_since_rec_alerted,
