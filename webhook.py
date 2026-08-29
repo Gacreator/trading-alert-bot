@@ -2837,6 +2837,8 @@ def run_pump_check(run_id):
                    market_cap_at_recommendation, buy_count
             FROM wallet_token_history
             WHERE first_seen_at > NOW() - (INTERVAL '1 hour' * %s)
+              AND (decline_alert_fired IS NOT TRUE OR decline_alert_fired IS NULL)
+              AND (max_drawdown_seen < 0.8 OR max_drawdown_seen IS NULL)
         """, (SCAN_WINDOW_HOURS,))
         rows = c.fetchall()
         print(f"Checking {len(rows)} tokens for pumps/momentum...")
