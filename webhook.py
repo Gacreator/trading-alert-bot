@@ -121,7 +121,7 @@ _dex_rate_lock = threading.Semaphore(MAX_CONCURRENT_DEXSCREENER)
 
 _connection_pool = pg_pool.ThreadedConnectionPool(
     minconn=2,
-    maxconn=50,  # ← was 20
+    maxconn=15,  # ← was 50
     dsn=DATABASE_URL,
     connect_timeout=10,
     keepalives=1,
@@ -1900,18 +1900,11 @@ def _gate_check_one_token(item):
     base_token = pair.get("baseToken", {}) or {}
     symbol = base_token.get("symbol")
 
-    with ThreadPoolExecutor(max_workers=5) as gate_executor:
-        rug_future = gate_executor.submit(get_rugcheck_data, mint)
-        holder_future = gate_executor.submit(get_top_holder_concentration, mint, pair.get("pairAddress"))
-        sellable_future = gate_executor.submit(check_sellable_via_jupiter, mint)
-        twitter_future = gate_executor.submit(get_twitter_signal, mint, symbol) if _twitter_call_allowed() else None
-        tiktok_future = gate_executor.submit(get_tiktok_signal, symbol) if symbol else None
-
-        rug_score, rug_liq_flags = rug_future.result()
-        holder_data = holder_future.result()
-        sellable_result = sellable_future.result()
-        twitter_signal = twitter_future.result()
-        tiktok_signal = tiktok_future.result() if tiktok_future else None
+    rug_score, rug_liq_flags = get_rugcheck_data(mint)
+    holder_data = get_top_holder_concentration(mint, pair.get("pairAddress"))
+    sellable_result = check_sellable_via_jupiter(mint)
+    twitter_signal = get_twitter_signal(mint, symbol) if _twitter_call_allowed() else None
+    tiktok_signal = get_tiktok_signal(symbol) if symbol else None
 
     top1_pct = holder_data.get("top1_pct") if holder_data else None
     vol_h1_to_liq_ratio = details.get("vol_h1_to_liq_ratio", 0)
