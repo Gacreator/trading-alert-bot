@@ -116,9 +116,8 @@ SOLANA_ADDRESS_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 
 _check_pumps_lock = threading.Lock()
 _check_pumps_lock_time = None
-#_check_pumps_run_id = None
+_check_pumps_run_id = None
 _dex_rate_lock = threading.Semaphore(MAX_CONCURRENT_DEXSCREENER)
-_webhook_lock = threading.Lock()
 
 _connection_pool = pg_pool.ThreadedConnectionPool(
     minconn=2,
@@ -3176,12 +3175,15 @@ def run_pump_check(run_id):
             except Exception:
                 pass
 
-        global _check_pumps_lock_time
-        try:
-            _check_pumps_lock.release()
-        except RuntimeError:
-            pass
-        _check_pumps_lock_time = None
+        global _check_pumps_run_id
+        if _check_pumps_run_id == run_id:
+            _check_pumps_run_id = None
+            try:
+                _check_pumps_lock.release()
+            except RuntimeError:
+                pass
+        else:
+            print(f"⚠️ run_pump_check ({run_id}) finished after being force-released — skipping release to avoid stealing the new owner's lock")
 
 
 @app.route("/check-pumps", methods=["GET", "POST"])
