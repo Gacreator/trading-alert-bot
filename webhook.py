@@ -114,10 +114,11 @@ QUEEN_TOOLS = [
 
 SOLANA_ADDRESS_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 
-_check_pumps_lock = threading.Semaphore(5)
+_check_pumps_lock = threading.Lock()
 _check_pumps_lock_time = None
-_check_pumps_run_id = None
+#_check_pumps_run_id = None
 _dex_rate_lock = threading.Semaphore(MAX_CONCURRENT_DEXSCREENER)
+_webhook_lock = threading.Lock()
 
 _connection_pool = pg_pool.ThreadedConnectionPool(
     minconn=2,
@@ -772,7 +773,7 @@ def get_dexscreener_batch(mints):
     joined = ",".join(mints)
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{joined}"
-        resp = requests.get(url, timeout=8)
+        resp = requests.get(url, timeout=4)
 
         if resp.status_code == 429:
             print(f"⚠️ DexScreener batch 429 for {len(mints)} mints")
@@ -1683,44 +1684,53 @@ def webhook():
     if incoming_secret != WEBHOOK_SECRET:
         return "unauthorized", 401
 
-    data = request.json
-    if not data:
-        return "no data", 400
+    acquired = _webhook_lock.acquire(blocking=False)
+    if not acquired:
+        print("Webhook already processing, returning 503 to Helius")
+        return "busy", 503
 
-    transactions = data if isinstance(data, list) else [data]
+    try:
+        data = request.json
+        if not data:
+            return "no data", 400
 
-    # ── COLLECT ALL UNIQUE MINTS FIRST ──
-    all_mints = set()
-    wallet_mint_pairs = []
-    for tx in transactions:
-        if not isinstance(tx, dict):
-            continue
-        for wallet in TRACKED_WALLETS:
-            mints = extract_wallet_buys(tx, wallet)
-            for mint in mints:
-                all_mints.add(mint)
-                wallet_mint_pairs.append((wallet, mint))
+        transactions = data if isinstance(data, list) else [data]
 
-    # ── BATCH FETCH PRICES ONCE ──
-    prices_by_mint = {}
-    mints_list = list(all_mints)
-    for i in range(0, len(mints_list), 30):
-        batch = mints_list[i:i + 30]
-        with _dex_rate_lock:
-            batch_result = get_dexscreener_batch(batch)
-            for m, p in batch_result.items():
-                if p and p.get("priceUsd"):
-                    try:
-                        prices_by_mint[m] = float(p["priceUsd"])
-                    except (TypeError, ValueError):
-                        pass
-            time.sleep(0.6)
+        # ── COLLECT ALL UNIQUE MINTS FIRST ──
+        all_mints = set()
+        wallet_mint_pairs = []
+        for tx in transactions:
+            if not isinstance(tx, dict):
+                continue
+            for wallet in TRACKED_WALLETS:
+                mints = extract_wallet_buys(tx, wallet)
+                for mint in mints:
+                    all_mints.add(mint)
+                    wallet_mint_pairs.append((wallet, mint))
 
-    # ── PROCESS RECORDING WITH CACHED PRICES ──
-    for wallet, mint in wallet_mint_pairs:
-        check_and_record_buy(wallet, mint, prices_by_mint.get(mint))
+        # ── BATCH FETCH PRICES ONCE ──
+        prices_by_mint = {}
+        mints_list = list(all_mints)
+        for i in range(0, len(mints_list), 30):
+            batch = mints_list[i:i + 30]
+            with _dex_rate_lock:
+                batch_result = get_dexscreener_batch(batch)
+                for m, p in batch_result.items():
+                    if p and p.get("priceUsd"):
+                        try:
+                            prices_by_mint[m] = float(p["priceUsd"])
+                        except (TypeError, ValueError):
+                            pass
+                time.sleep(0.6)
 
-    return "ok", 200
+        # ── PROCESS RECORDING WITH CACHED PRICES ──
+        for wallet, mint in wallet_mint_pairs:
+            check_and_record_buy(wallet, mint, prices_by_mint.get(mint))
+
+        return "ok", 200
+
+    finally:
+        _webhook_lock.release()
 
 
 def check_and_record_buy(wallet, mint, price=None):
@@ -3167,20 +3177,17 @@ def run_pump_check(run_id):
             except Exception:
                 pass
 
-        global _check_pumps_run_id
-        if _check_pumps_run_id == run_id:
-            _check_pumps_run_id = None
-            try:
-                _check_pumps_lock.release()
-            except RuntimeError:
-                pass
-        else:
-            print(f"⚠️ run_pump_check ({run_id}) finished after being force-released — skipping release to avoid stealing the new owner's lock")
+        global _check_pumps_lock_time
+        try:
+            _check_pumps_lock.release()
+        except RuntimeError:
+            pass
+        _check_pumps_lock_time = None
 
 
 @app.route("/check-pumps", methods=["GET", "POST"])
 def check_pumps():
-    global _check_pumps_lock_time, _check_pumps_run_id
+    global _check_pumps_lock_time
 
     acquired = _check_pumps_lock.acquire(blocking=False)
     if not acquired:
@@ -3195,11 +3202,8 @@ def check_pumps():
             print("check-pumps already running, skipping this trigger")
             return "already running", 200
 
-    run_id = uuid.uuid4()
     _check_pumps_lock_time = time.time()
-    _check_pumps_run_id = run_id
-
-    threading.Thread(target=run_pump_check, args=(run_id,), daemon=True).start()
+    threading.Thread(target=run_pump_check, daemon=True).start()
     return "started", 200
 
 
