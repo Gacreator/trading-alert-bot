@@ -1684,51 +1684,52 @@ def webhook():
     if incoming_secret != WEBHOOK_SECRET:
         return "unauthorized", 401
 
+    data = request.json
+    if not data:
+        return "no data", 400
+
+    transactions = data if isinstance(data, list) else [data]
+
+    # ── FAST EXTRACTION (no lock, no IO) ──
+    all_mints = set()
+    wallet_mint_pairs = []
+    for tx in transactions:
+        if not isinstance(tx, dict):
+            continue
+        for wallet in TRACKED_WALLETS:
+            mints = extract_wallet_buys(tx, wallet)
+            for mint in mints:
+                all_mints.add(mint)
+                wallet_mint_pairs.append((wallet, mint))
+
+    if not wallet_mint_pairs:
+        return "ok", 200
+
+    # ── FETCH PRICES OUTSIDE LOCK (this is the slow part) ──
+    prices_by_mint = {}
+    mints_list = list(all_mints)
+    for i in range(0, len(mints_list), 30):
+        batch = mints_list[i:i + 30]
+        with _dex_rate_lock:
+            batch_result = get_dexscreener_batch(batch)
+            for m, p in batch_result.items():
+                if p and p.get("priceUsd"):
+                    try:
+                        prices_by_mint[m] = float(p["priceUsd"])
+                    except (TypeError, ValueError):
+                        pass
+            time.sleep(0.6)
+
+    # ── QUICK DB WRITE UNDER LOCK ──
     acquired = _webhook_lock.acquire(blocking=False)
     if not acquired:
         print("Webhook already processing, returning 503 to Helius")
         return "busy", 503
 
     try:
-        data = request.json
-        if not data:
-            return "no data", 400
-
-        transactions = data if isinstance(data, list) else [data]
-
-        # ── COLLECT ALL UNIQUE MINTS FIRST ──
-        all_mints = set()
-        wallet_mint_pairs = []
-        for tx in transactions:
-            if not isinstance(tx, dict):
-                continue
-            for wallet in TRACKED_WALLETS:
-                mints = extract_wallet_buys(tx, wallet)
-                for mint in mints:
-                    all_mints.add(mint)
-                    wallet_mint_pairs.append((wallet, mint))
-
-        # ── BATCH FETCH PRICES ONCE ──
-        prices_by_mint = {}
-        mints_list = list(all_mints)
-        for i in range(0, len(mints_list), 30):
-            batch = mints_list[i:i + 30]
-            with _dex_rate_lock:
-                batch_result = get_dexscreener_batch(batch)
-                for m, p in batch_result.items():
-                    if p and p.get("priceUsd"):
-                        try:
-                            prices_by_mint[m] = float(p["priceUsd"])
-                        except (TypeError, ValueError):
-                            pass
-                time.sleep(0.6)
-
-        # ── PROCESS RECORDING WITH CACHED PRICES ──
         for wallet, mint in wallet_mint_pairs:
             check_and_record_buy(wallet, mint, prices_by_mint.get(mint))
-
         return "ok", 200
-
     finally:
         _webhook_lock.release()
 
