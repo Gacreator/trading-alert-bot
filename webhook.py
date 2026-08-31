@@ -3145,11 +3145,9 @@ def run_pump_check(run_id):
                 deduped.append(item)
             qualifying_tokens = deduped
 
-            print(f"Gate-checking {len(qualifying_tokens)} qualifying tokens concurrently...")
-            with ThreadPoolExecutor(max_workers=min(len(qualifying_tokens), 3)) as outer_executor:
-                gate_results = list(outer_executor.map(_gate_check_one_token, qualifying_tokens))
-
-            for result in gate_results:
+            print(f"Gate-checking {len(qualifying_tokens)} qualifying tokens sequentially...")
+            for item in qualifying_tokens:
+                result = _gate_check_one_token(item)
                 _apply_gate_result(result)
 
         # _check_paper_trades()
