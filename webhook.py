@@ -1689,7 +1689,7 @@ def webhook():
 
     transactions = data if isinstance(data, list) else [data]
 
-    # ── FAST EXTRACTION (no lock, no IO) ──
+    # ── COLLECT ALL UNIQUE MINTS FIRST ──
     all_mints = set()
     wallet_mint_pairs = []
     for tx in transactions:
@@ -1701,10 +1701,7 @@ def webhook():
                 all_mints.add(mint)
                 wallet_mint_pairs.append((wallet, mint))
 
-    if not wallet_mint_pairs:
-        return "ok", 200
-
-    # ── FETCH PRICES OUTSIDE LOCK (this is the slow part) ──
+    # ── BATCH FETCH PRICES ONCE ──
     prices_by_mint = {}
     mints_list = list(all_mints)
     for i in range(0, len(mints_list), 30):
@@ -1719,18 +1716,11 @@ def webhook():
                         pass
             time.sleep(0.6)
 
-    # ── QUICK DB WRITE UNDER LOCK ──
-    acquired = _webhook_lock.acquire(blocking=False)
-    if not acquired:
-        print("Webhook already processing, returning 503 to Helius")
-        return "busy", 503
+    # ── PROCESS RECORDING WITH CACHED PRICES ──
+    for wallet, mint in wallet_mint_pairs:
+        check_and_record_buy(wallet, mint, prices_by_mint.get(mint))
 
-    try:
-        for wallet, mint in wallet_mint_pairs:
-            check_and_record_buy(wallet, mint, prices_by_mint.get(mint))
-        return "ok", 200
-    finally:
-        _webhook_lock.release()
+    return "ok", 200
 
 
 def check_and_record_buy(wallet, mint, price=None):
@@ -3144,9 +3134,11 @@ def run_pump_check(run_id):
                 deduped.append(item)
             qualifying_tokens = deduped
 
-            print(f"Gate-checking {len(qualifying_tokens)} qualifying tokens sequentially...")
-            for item in qualifying_tokens:
-                result = _gate_check_one_token(item)
+            print(f"Gate-checking {len(qualifying_tokens)} qualifying tokens concurrently...")
+            with ThreadPoolExecutor(max_workers=min(len(qualifying_tokens), 3)) as outer_executor:
+                gate_results = list(outer_executor.map(_gate_check_one_token, qualifying_tokens))
+
+            for result in gate_results:
                 _apply_gate_result(result)
 
         # _check_paper_trades()
@@ -3188,7 +3180,7 @@ def run_pump_check(run_id):
 
 @app.route("/check-pumps", methods=["GET", "POST"])
 def check_pumps():
-    global _check_pumps_lock_time
+    global _check_pumps_lock_time, _check_pumps_run_id
 
     acquired = _check_pumps_lock.acquire(blocking=False)
     if not acquired:
@@ -3203,8 +3195,11 @@ def check_pumps():
             print("check-pumps already running, skipping this trigger")
             return "already running", 200
 
+    run_id = uuid.uuid4()
     _check_pumps_lock_time = time.time()
-    threading.Thread(target=run_pump_check, daemon=True).start()
+    _check_pumps_run_id = run_id
+
+    threading.Thread(target=run_pump_check, args=(run_id,), daemon=True).start()
     return "started", 200
 
 
