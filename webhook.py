@@ -772,7 +772,7 @@ def get_dexscreener_batch(mints):
     joined = ",".join(mints)
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{joined}"
-        resp = requests.get(url, timeout=4)
+        resp = requests.get(url, timeout=8)
 
         if resp.status_code == 429:
             print(f"⚠️ DexScreener batch 429 for {len(mints)} mints")
