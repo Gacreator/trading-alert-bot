@@ -131,7 +131,6 @@ _connection_pool = pg_pool.ThreadedConnectionPool(
 )
 _vader = SentimentIntensityAnalyzer()
 _twitter_cache = {}
-_twitter_cache_ttl = 14400  # 4 hours
 _twitter_daily_count = {"date": None, "count": 0}
 _wallet_twitter_cooldown = {}
 _tiktok_cache = {}
@@ -1410,7 +1409,7 @@ def get_twitter_signal(mint, symbol, max_tweets=15, max_age_minutes=60):
     now = time.time()
     if mint in _twitter_cache:
         cached_at, result = _twitter_cache[mint]
-        if now - cached_at < _twitter_cache_ttl:
+        if now - cached_at < 1800:
             return result
 
     if not TWITTERAPI_KEY:
