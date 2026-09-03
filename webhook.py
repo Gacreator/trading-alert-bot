@@ -131,6 +131,7 @@ _connection_pool = pg_pool.ThreadedConnectionPool(
 )
 _vader = SentimentIntensityAnalyzer()
 _twitter_cache = {}
+_twitter_cache_ttl = 14400  # 4 hours
 _twitter_daily_count = {"date": None, "count": 0}
 _wallet_twitter_cooldown = {}
 _tiktok_cache = {}
@@ -1409,7 +1410,7 @@ def get_twitter_signal(mint, symbol, max_tweets=15, max_age_minutes=60):
     now = time.time()
     if mint in _twitter_cache:
         cached_at, result = _twitter_cache[mint]
-        if now - cached_at < 1800:
+        if now - cached_at < _twitter_cache_ttl:
             return result
 
     if not TWITTERAPI_KEY:
@@ -1968,7 +1969,7 @@ def _gate_check_one_token(item):
 def _compute_early_stage_score(mint, symbol, pair):
     rug_score, rug_liq_flags = get_rugcheck_data(mint)
     holder_data = get_top_holder_concentration(mint, pair.get("pairAddress"))
-    twitter_signal = get_twitter_signal(mint, symbol)
+    twitter_signal = get_twitter_signal(mint, symbol) if _twitter_call_allowed() else None
 
     top1_pct = holder_data.get("top1_pct") if holder_data else None
 
@@ -2929,7 +2930,7 @@ def run_pump_check(run_id):
                         twitter_eligible = False
                         print(f"🪦 Early-stage skip {mint}: buy/sell {buy_sell_ratio:.1f}")
 
-                if twitter_eligible:
+                if twitter_eligible and _twitter_call_allowed():
                     base_token = pair.get("baseToken", {}) or {}
                     symbol = base_token.get("symbol")
                     early_result = _compute_early_stage_score(mint, symbol, pair)
