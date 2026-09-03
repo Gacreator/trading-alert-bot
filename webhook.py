@@ -139,13 +139,28 @@ _price_cache_ttl = 60  # seconds
 
 def _twitter_call_allowed(max_per_day=200):
     today = datetime.date.today().isoformat()
-    if _twitter_daily_count["date"] != today:
-        _twitter_daily_count["date"] = today
-        _twitter_daily_count["count"] = 0
-    if _twitter_daily_count["count"] >= max_per_day:
-        return False
-    _twitter_daily_count["count"] += 1
-    return True
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO daily_api_counters (api_name, count, date)
+            VALUES ('twitter', 1, %s)
+            ON CONFLICT (api_name) DO UPDATE
+            SET count = CASE 
+                WHEN daily_api_counters.date != %s THEN 1
+                ELSE daily_api_counters.count + 1
+            END,
+            date = %s
+            RETURNING count
+        """, (today, today, today))
+        new_count = c.fetchone()[0]
+        conn.commit()
+        return new_count <= max_per_day
+    except Exception as e:
+        print(f"Twitter limit DB error: {e}")
+        return False   # fail closed
+    finally:
+        put_conn(conn)
 
 
 def _wallet_twitter_allowed(wallet, cooldown_seconds=120):
@@ -462,6 +477,13 @@ def init_db():
             )
         """)
         c.execute("CREATE INDEX IF NOT EXISTS idx_paper_trades_b_status ON paper_trades_b (status)")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS daily_api_counters (
+                api_name TEXT PRIMARY KEY,
+                count INTEGER DEFAULT 0,
+                date TEXT
+            )
+        """)
 
         conn.commit()
         c.close()
